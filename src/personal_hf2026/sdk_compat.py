@@ -1,3 +1,6 @@
+# 修改时间：2026-09-14（Redis 端口一致性修复）
+# 修改目的：让引擎和个人控制器使用命令行指定的同一 Redis 地址。
+# 修改内容：仅在本轮待写出的场景副本同步 Redis host 和 port。
 # 修改时间：2026-09-14（迁移收尾）
 # 修改目的：使个人实验在回退后的官方底座上保留正常结束和可靠引擎就绪。
 # 修改内容：在个人 Runner 补齐结束接口、引擎就绪与自有 Redis 和可选网页生命周期。
@@ -99,6 +102,12 @@ class IdleCompatibleCoopDecoyRunner(CoopDecoyRunner):
         if cfg.sim_binary:
             cfg.sim_binary = str(Path(cfg.sim_binary).resolve())
         super().__init__(cfg, agent_cls, log=log)
+
+    def prepare_scenario(self):
+        super().prepare_scenario()
+        # 官方启动流程随后将此内存副本写入 output，不改输入场景文件。
+        simulation = self._scenario_cfg.setdefault("simulation", {})
+        simulation.update(redis_host=self.cfg.redis_host, redis_port=self.cfg.redis_port)
 
     def run(self):
         previous = Path.cwd()
