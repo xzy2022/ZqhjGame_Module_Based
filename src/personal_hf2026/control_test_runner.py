@@ -1,4 +1,7 @@
 # 修改时间：2026-09-14
+# 修改目的：允许从命令行选择打开当前实验的官方网页实时观测。
+# 修改内容：增加可视化参数并在实验生命周期内管理只读网页服务。
+# 修改时间：2026-09-14
 # 修改目的：让个人实验脱离官方仓库的后续修改并支持独立运行。
 # 修改内容：统一模块、SDK、运行资源及输出路径并保留实验行为。
 # 修改时间：2026-09-12
@@ -188,6 +191,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-start-sim", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--visualize", action="store_true", help="打开官方网页只读实时观测，结束实验时关闭服务")
+    parser.add_argument("--visualization-port", type=int, default=0, help="网页 HTTP 端口，默认 0 自动分配空闲端口")
     return parser
 
 
@@ -231,6 +236,11 @@ def main(argv=None) -> int:
     cfg.noise_sigma_m = 0.0
     agent_cls = _load_agent_class(args.agent)
     runner = IdealPerceptionCoopDecoyRunner(cfg, agent_cls)
+    if args.visualize and not args.dry_run:
+        from .web_visualization import WebVisualization
+        # 兼容 Runner 先准备 Redis，再进入网页上下文，最后开始仿真。
+        runner.visualization = WebVisualization(
+            args.redis_host, redis_port, args.output, args.visualization_port)
     evaluation = runner.run()
     if hasattr(runner, "v1_summary"):
         # 摘要区分行为完成与评分器实际摧毁数量。
