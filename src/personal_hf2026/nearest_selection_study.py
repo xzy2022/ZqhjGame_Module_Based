@@ -1,4 +1,7 @@
 # 修改时间：2026-09-14
+# 修改目的：让专项锁定实验同样在指定运行底座中启动引擎。
+# 修改内容：使用本仓库兼容 Runner 统一引擎工作目录。
+# 修改时间：2026-09-14
 # 修改目的：让个人实验脱离官方仓库的后续修改并支持独立运行。
 # 修改内容：统一模块、SDK、运行资源及输出路径并保留实验行为。
 # 修改时间：2026-09-13
@@ -27,7 +30,7 @@ import subprocess
 from competition.sdk.core.agent import Agent
 from competition.sdk.core.commands import fly_to, point_gimbal, set_gimbal_fov, set_speed
 from competition.sdk.core.runner import ScenarioConfig
-from competition.sdk.scenarios.coop_decoy.runner import CoopDecoyRunner
+from .sdk_compat import IdleCompatibleCoopDecoyRunner as CoopDecoyRunner
 from .control_test_runner import _angular_offset_deg, _bearing_deg, _ground_distance_m
 
 

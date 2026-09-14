@@ -1,4 +1,7 @@
 # 修改时间：2026-09-14
+# 修改目的：确保相对运行底座路径在切换工作目录后仍能正确定位 UE。
+# 修改内容：在视觉 Runner 构造时将运行底座和模型路径转换为绝对路径。
+# 修改时间：2026-09-14
 # 修改目的：让个人实验脱离官方仓库的后续修改并支持独立运行。
 # 修改内容：统一模块、SDK、运行资源及输出路径并保留实验行为。
 # 修改时间：2026-09-13（采集收尾）
@@ -125,7 +128,7 @@ class TimedPhotoCache:
 class VisualStudyRunner(StudyRunner):
     def __init__(self, cfg, output, runtime_root, weights, log, collect_dataset=False):
         super().__init__(cfg, PersonalV2Agent, output, log)
-        self.runtime_root, self.weights = Path(runtime_root), Path(weights)
+        self.runtime_root, self.weights = Path(runtime_root).resolve(), Path(weights).resolve()
         self.shadows, self.twins = {}, {}
         self.camera = None
         self.collect_dataset = collect_dataset
