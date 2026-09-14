@@ -1,4 +1,7 @@
 # 修改时间：2026-09-14
+# 修改目的：让批处理父子进程分别保留实际导入来源证据。
+# 修改内容：支持审计文件路径中的字面量 {pid} 替换为当前进程编号。
+# 修改时间：2026-09-14
 # 修改目的：从独立仓库调用指定官方 SDK 并分离二进制运行目录。
 # 修改内容：设置模块搜索路径、继承环境及引擎位置后运行个人模块。
 """run.cmd [--sim-root SDK目录] [--runtime-root 发行目录] 模块 [模块参数]。"""
@@ -36,7 +39,7 @@ def main():
     finally:
         audit = os.environ.get("HF2026_IMPORT_AUDIT")
         if audit:
-            destination = Path(audit).resolve()
+            destination = Path(audit.replace("{pid}", str(os.getpid()))).resolve()
             destination.parent.mkdir(parents=True, exist_ok=True)
             modules = {name: str(Path(item.__file__).resolve())
                        for name, item in sys.modules.copy().items()
