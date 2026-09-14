@@ -1,0 +1,104 @@
+{
+  "_comment": "uav_search_track_car example scenario — 1 FixedWingUAV + 1 TargetVehicle. Mirrors root config.json style.",
+  "config_version": "1.0",
+  "simulation": {
+    "tick_rate_hz": 60,
+    "time_scale": 1,
+    "redis_host": "127.0.0.1",
+    "start_time_str": "2026-06-26 08:00:00",
+    "redis_command_channel": "sim:commands",
+    "redis_state_channel": "sim:state",
+    "auto_start": false,
+    "_comment_seed": "Spec 037：seed>0 时引擎侧选路/锚定确定可复现；0=真随机。runner 每局按前端种子覆写",
+    "engine_route_spawn": true,
+    "redis_port": 6379
+  },
+  "weather": {
+    "type": "Rain"
+  },
+  "perception": {
+    "max_detection_range_m": 3000,
+    "full_accuracy_range_m": 1000
+  },
+  "entities": [
+    {
+      "id": "10001",
+      "name": "target",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.002,
+        "initial_longitude": 125.002,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "waypoints": [
+              {
+                "lat": 27.002,
+                "lon": 125.007,
+                "alt": 0
+              },
+              {
+                "lat": 26.999,
+                "lon": 125.01,
+                "alt": 0
+              },
+              {
+                "lat": 27.001,
+                "lon": 125.015,
+                "alt": 0
+              }
+            ],
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 10001
+          }
+        }
+      }
+    },
+    {
+      "id": "10002",
+      "name": "uav",
+      "type": "FixedWingUAV",
+      "enabled": true,
+      "params": {
+        "_comment_anchor": "Spec 037：出生由引擎锚定到真目标路线起点 300-600m 环内（seed 派生）。下方静态 initial_* 仅为 fallback，运行时被覆盖",
+        "spawn_anchor": {
+          "near": "target_route_start",
+          "min_dist_m": 300,
+          "max_dist_m": 600
+        },
+        "initial_latitude": 27,
+        "initial_longitude": 125,
+        "initial_altitude": 500,
+        "initial_heading": 0
+      },
+      "components": {
+        "kinematics": {
+          "type": "KinematicsComponent",
+          "enabled": true,
+          "params": {
+            "min_speed": 15,
+            "max_speed": 40,
+            "max_bank_angle_deg": 45,
+            "max_climb_rate_ms": 10
+          }
+        },
+        "gimbal_tracking": {
+          "type": "GimbalTrackingComponent",
+          "enabled": true,
+          "params": {
+            "pan_rate_limit_dps": 60,
+            "tilt_rate_limit_dps": 45,
+            "auto_track": false,
+            "fov": 30
+          }
+        }
+      }
+    }
+  ]
+}

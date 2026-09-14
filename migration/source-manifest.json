@@ -1,0 +1,387 @@
+{
+  "official_base": "6fc47caeb3ec95eca3f919e4e73335d8d7856265",
+  "source_head": "384b6f0b7c86ffe370a3d0ab23df3394205269a2",
+  "source_branch": "master",
+  "scope": "Current master working files; separate unmerged vehicle-discovery reference archive",
+  "files": [
+    {
+      "source": "AGENTS.md",
+      "destination": "AGENTS.md",
+      "source_sha256": "9b837d9e219eb80e6063a69231851a8f317e13608c77a3e42d822d4b4a689c20",
+      "destination_sha256": "431954dbea4069660dd946e7d037f323ce800d68ca234930c8d102703edb742d"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/__init__.py",
+      "destination": "src/personal_hf2026/__init__.py",
+      "source_sha256": "c9199fbcbe6af9c39f3659c42c56eba1f042f26ed2bf2039b2354ce297980b2c",
+      "destination_sha256": "20de57728f32ad3cef1bb9d479c5a9e53109a0cba8246bbeb0441bc1c1d0265d"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/analyze_timing.py",
+      "destination": "src/personal_hf2026/analyze_timing.py",
+      "source_sha256": "4debdeb5216b1acaa6111e61dd7d5d1f9232875077b91ffcd409ec6fa527a521",
+      "destination_sha256": "6bf8979129068eb413ba97a06dedbaaa90ca78d2315384fe4a9bb44ae3a6cb57"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/analyze_visual_shadow.py",
+      "destination": "src/personal_hf2026/analyze_visual_shadow.py",
+      "source_sha256": "af324c0d8ebe769365d8c5f0a11a610fde2906ccea9fb6f998a3c796cd95b445",
+      "destination_sha256": "d66903146e9f05be2c02cdc474bc82ce34ac925f102655b762b00b0e717fbc55"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/capture_dataset.py",
+      "destination": "src/personal_hf2026/capture_dataset.py",
+      "source_sha256": "e040c31a4a184484c360b8b21dab235a79e226d6de054cc87d58bf00f5a1027f",
+      "destination_sha256": "d11ee241808b94fb0703421b6078961f964ca3d88ec567bfae7657ff8b5a7f80"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/competition_flight.py",
+      "destination": "src/personal_hf2026/competition_flight.py",
+      "source_sha256": "4ca028f14d04cfe66aa073c79d6dee35c3cd60a400852b84694d8e32766b3ddf",
+      "destination_sha256": "571f13088d0085e23351a5a2b2fa05a8c64d83d8438aec8f786ddd5f2c9e32b4"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/control_test_runner.py",
+      "destination": "src/personal_hf2026/control_test_runner.py",
+      "source_sha256": "025467204da6f8ec81cc07876d8b26d3f8598f48bdb34940b6d5208e9b56b143",
+      "destination_sha256": "d41bd49ec9dc6aa9c1eabdb735730423e69e570793ce0cc7fb6dfe538b2b740e"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/coop_clock.py",
+      "destination": "src/personal_hf2026/coop_clock.py",
+      "source_sha256": "cf2d6eb45e4bce6fd6ba9fbfe859e2073fc6a70ea9d80b9ed3d46420663e60c8",
+      "destination_sha256": "19f17020b2bfbd0c559f01223db563860cce87a1890f144a8acbbc80a0710f3f"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/coordination.py",
+      "destination": "src/personal_hf2026/coordination.py",
+      "source_sha256": "b0b3ea3d2ac89dc43c04ae1f56c5178200679b3d86e0198bfcbd3b4cd6854144",
+      "destination_sha256": "17d520ca6cd95c80b8916092386e52ef64814b9d1ad79297daeafdaee7602ec9"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/dataset_capture.py",
+      "destination": "src/personal_hf2026/dataset_capture.py",
+      "source_sha256": "0a641d5448c2a3a9ca94a3d8269b874be6b12c471f00cfb591ab773882310e90",
+      "destination_sha256": "f819e9fd3dd418293ef48887057b9c1ce495e25ebcce64299b070d0add15e292"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/dropout_capture.py",
+      "destination": "src/personal_hf2026/dropout_capture.py",
+      "source_sha256": "a267aa4c915fabcf3f8784f6d2b40889992fe01edf1fb6a0b53190f7cb2e76c3",
+      "destination_sha256": "a8f39c6c9845d450228d03c3f4665798ef9487c953fc55e002aceb2e7e0245b9"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/export_capture_dataset.py",
+      "destination": "src/personal_hf2026/export_capture_dataset.py",
+      "source_sha256": "bf60cf96da29296101ad51542313b43a89979d7081ebadda66c793e33eca4491",
+      "destination_sha256": "7782f15a8203e39679ade2c8628478e59ba3525dabba4a557527009f2caa7e66"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/gimbal_lock.py",
+      "destination": "src/personal_hf2026/gimbal_lock.py",
+      "source_sha256": "23e3bcd75f71453e5f63d38efcb9ebb82ba1ff5bbe75b9d9c31553336f64589c",
+      "destination_sha256": "02a9cb49472bc1cf6b952474ca0f60158af836f343557e4f8dc19a43938d7777"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/nearest_selection_study.py",
+      "destination": "src/personal_hf2026/nearest_selection_study.py",
+      "source_sha256": "5113df49dab3dc483a66777253b78ce16c869bfa174dd979210a5ba696df046b",
+      "destination_sha256": "c64ad98f3dbe66a9669dfbbdb5f0deb423cce93a01c74aa3d076f1cad378988e"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/oracle_identity.py",
+      "destination": "src/personal_hf2026/oracle_identity.py",
+      "source_sha256": "6069316d86f6420be487b3f80906d7a55a50ab609b8128d3a899483213fae964",
+      "destination_sha256": "b14bac6afc2f8e1ed85152765d974c688a6671343d2180a918f38a161d078a36"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/personal_v1.py",
+      "destination": "src/personal_hf2026/personal_v1.py",
+      "source_sha256": "dd4895a427fa73ed25dea8d4c784656caf68993aea1806dfdd231d97b5c311ab",
+      "destination_sha256": "c9626ef1c36fc373894732bb91a1a8b8cc101db4b43af03fc5d7c68a05bdde0e"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/personal_v2.py",
+      "destination": "src/personal_hf2026/personal_v2.py",
+      "source_sha256": "cdd93c4a1941a22e949ff31eb201eb72225e92fd43f2b427a3682265864682f4",
+      "destination_sha256": "0097473e17a04bb7bfe57fdbdd48181d87e1a84b4aabb4198ac4b19cc45da061"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/replay_visual_shadow.py",
+      "destination": "src/personal_hf2026/replay_visual_shadow.py",
+      "source_sha256": "08e54214f661973c0c8b456ed316f8dfe4f22cee5f37fc79630509ba18aee0bb",
+      "destination_sha256": "efd2a274e10cf2bed69eee1c2a20bc9ab74e5cc51f515d84959d0196636229dc"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/run_dataset_batch.py",
+      "destination": "src/personal_hf2026/run_dataset_batch.py",
+      "source_sha256": "0c69e461d3e3c1ef569a5f7bd0a356f075d456a6931e9e271bf18461b4abd53e",
+      "destination_sha256": "631194c935b45d9b3556f669edfeef1f8caa07e3412c22fe4eb625976175874d"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/run_timing_batch.py",
+      "destination": "src/personal_hf2026/run_timing_batch.py",
+      "source_sha256": "87f332a5664fd45a44d2a24957808bbfbe9f339e9edf2ec503a3c103243b3d02",
+      "destination_sha256": "b299da29b4fbbc7878aa3198a1da4916601dfdaedacce9edd749c4f9c8465ef0"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/search_filter.py",
+      "destination": "src/personal_hf2026/search_filter.py",
+      "source_sha256": "7b34cbbeea7950d811e05b4471412c7a5d9ea5e77680f3020fac24c08e5e3821",
+      "destination_sha256": "ef92792b2e867eac4da685cc58559b563ed40f4a343794208d002b019b611dd7"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/search_gimbal.py",
+      "destination": "src/personal_hf2026/search_gimbal.py",
+      "source_sha256": "ead64cae2f506facd51301cefb57ac0b13be669aad9be376c00ad5f9078cd60b",
+      "destination_sha256": "eb52679bee65a97fad5c28aa7bcb5bcab1d416b65c482e0da1bf259a72784447"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/search_route.py",
+      "destination": "src/personal_hf2026/search_route.py",
+      "source_sha256": "ca5c2a92aed1ae4ca54307a30b2f4768d4b50c032c2728f9f16c47c89cbd6e82",
+      "destination_sha256": "37b1872b9956ebedfc4196923c5fa17a6092b385846d3201cd4540cc65a27377"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/survey_search.py",
+      "destination": "src/personal_hf2026/survey_search.py",
+      "source_sha256": "e438bd0066f06e0cc527c47665fb568b13fcfb9df5dcd1a3ce0711ef6018922a",
+      "destination_sha256": "2a24d30d14e401aba47ccd5294f146e97e52c84b7aa6348baada691befac4d77"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tests/test_capture_dataset.py",
+      "destination": "src/personal_hf2026/tests/test_capture_dataset.py",
+      "source_sha256": "5323c2af93af68124f290f1fbe263c240d63f7fc5cb1e1b60227e784daabf159",
+      "destination_sha256": "915d5d8ec526f3b6ca219bed3ea444644638c7d46747d4f174c513e2eaf6e0e6"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tests/test_invitation_rounds.py",
+      "destination": "src/personal_hf2026/tests/test_invitation_rounds.py",
+      "source_sha256": "f51d6dfd19bed23171bdb9db51d7a41bf05926cf065a3ea4a81ea1ef7d436f1c",
+      "destination_sha256": "b2786dfe1ea2b0154ba500239fdcd3b6ad8f6d372b5d6af70ca33c4f660cc581"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tests/test_search_retention.py",
+      "destination": "src/personal_hf2026/tests/test_search_retention.py",
+      "source_sha256": "8f884b99ba190df8167104ad7d5b3f14b85f3be7e305d40bc9022061c4f982b0",
+      "destination_sha256": "d1fea029a7137743941776e273dc2cfccce70263f0d88321b831a879d5baab1b"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tests/test_turn_association.py",
+      "destination": "src/personal_hf2026/tests/test_turn_association.py",
+      "source_sha256": "fa3cb2e9bc5d871bdcec087d84785f893cc6f9f47e6867c89659f3de3f9ddd7e",
+      "destination_sha256": "fa8d193b15c2a410ee5b3aa99a69eebfa9465d45a97c5d5b8e853cfe89a375ce"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tests/test_visual_shadow.py",
+      "destination": "src/personal_hf2026/tests/test_visual_shadow.py",
+      "source_sha256": "ccf418a3d33f970bbe48fd1911f483f11b406e689f0e27ca29780a3cb98b25c1",
+      "destination_sha256": "fb206e71f987dd1fd2aecaba7d02e31bec98ba5c6cdc0f32fec810fcf7f2498e"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/timing_study.py",
+      "destination": "src/personal_hf2026/timing_study.py",
+      "source_sha256": "245159f1c07cf1f33125349ea6ef0c4719e34bdaaab1d344f6ace31599c7af74",
+      "destination_sha256": "f167c1200ca9c091816b441f3497e06ecbbd8b5628fc93c2ec958ff30237b006"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/tracking.py",
+      "destination": "src/personal_hf2026/tracking.py",
+      "source_sha256": "99c9f3de530487a6ba664ca0c692c6abb3b1116fbc92a752c873f26e15b70ff0",
+      "destination_sha256": "77cbb5a730b747fdd994bb05770fa10238fb013f72f342c624e24a88a5b0ca76"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/v2_assets/README.md",
+      "destination": "assets/personal_v2/README.md",
+      "source_sha256": "cb7c6d2a9462ea21ed241b9b62fdec0af483aba1f75a007ea9e57ad12fcd8ece",
+      "destination_sha256": "c47af9e19ff78bb441966076904fe2fb5bda3c442dbf6135d776c5554918754c"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/v2_assets/vision.pt",
+      "destination": "assets/personal_v2/vision.pt",
+      "source_sha256": "819381fa5b383310592238f0cc61843c5ac808228bc4ec9d997295c9c822a0cf",
+      "destination_sha256": "819381fa5b383310592238f0cc61843c5ac808228bc4ec9d997295c9c822a0cf"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/visual_appearance.py",
+      "destination": "src/personal_hf2026/visual_appearance.py",
+      "source_sha256": "f04cfb42e64aec26ee04f0b5b7de55619a8786e363291080c461c596e4afc6c1",
+      "destination_sha256": "a96f3610cbecb2c67fc69b74d6649a27143d388b2f50be5a504030b7d835c1e6"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/visual_geometry.py",
+      "destination": "src/personal_hf2026/visual_geometry.py",
+      "source_sha256": "5e595036874f01e8bf501722ee808810e1dd7dc4202171e17962045889dafd4c",
+      "destination_sha256": "d76b249eb2771b90d3fc29f2ff65295185d2dbbb7e9053c8d88a418c06cd98fb"
+    },
+    {
+      "source": "competition/user_algorithms/coop_decoy/visual_shadow_study.py",
+      "destination": "src/personal_hf2026/visual_shadow_study.py",
+      "source_sha256": "5f2945e328a819d440064ece83cb82ec200a21b1b19884d2ad6bea786dab9a16",
+      "destination_sha256": "9f6eaa8d2a25ffb5720884b8b550d0a46f9029cf056c3c382012c1a4be971994"
+    },
+    {
+      "source": "docs/codex_read/排查性开发.md",
+      "destination": "docs/codex_read/排查性开发.md",
+      "source_sha256": "751c27253d123e0be6d54d114a62b2cd3f092c6773f8e0d14faf31c56be17480",
+      "destination_sha256": "751c27253d123e0be6d54d114a62b2cd3f092c6773f8e0d14faf31c56be17480"
+    },
+    {
+      "source": "docs/codex_read/更新队友仓库.md",
+      "destination": "docs/codex_read/更新队友仓库.md",
+      "source_sha256": "951c0980f4105f32f35aab5d6ca2d79cdb002ab9f655533a6ca0432b1d1d079c",
+      "destination_sha256": "a92e86e2bfd047f652f3de40462908616ccca4a01a380076ac15fa3c1da181a6"
+    },
+    {
+      "source": "docs/codex_read/测试的定义和原则.md",
+      "destination": "docs/codex_read/测试的定义和原则.md",
+      "source_sha256": "93f10dbd2e00c5d6f770994b32c298e719c78a34905d227d8c64d57862f92d2e",
+      "destination_sha256": "93f10dbd2e00c5d6f770994b32c298e719c78a34905d227d8c64d57862f92d2e"
+    },
+    {
+      "source": "docs/codex_read/研究性开发.md",
+      "destination": "docs/codex_read/研究性开发.md",
+      "source_sha256": "940221a5f9612764aaad0d40dc91c993e2d4c6c6cfa1e9e45f414cb0b62faa0d",
+      "destination_sha256": "940221a5f9612764aaad0d40dc91c993e2d4c6c6cfa1e9e45f414cb0b62faa0d"
+    },
+    {
+      "source": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.assets/真目标.jpeg",
+      "destination": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.assets/真目标.jpeg",
+      "source_sha256": "79b01e8e74bead59c03f3520285cef7fc7ee737b4d9b05ce297efc197a5d30b7",
+      "destination_sha256": "79b01e8e74bead59c03f3520285cef7fc7ee737b4d9b05ce297efc197a5d30b7"
+    },
+    {
+      "source": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.assets/诱饵.png",
+      "destination": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.assets/诱饵.png",
+      "source_sha256": "596f5f9d515ec7748b92a8992b6eda6dcb9768ea71076fbbd9dd98c2c7898d0b",
+      "destination_sha256": "596f5f9d515ec7748b92a8992b6eda6dcb9768ea71076fbbd9dd98c2c7898d0b"
+    },
+    {
+      "source": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.md",
+      "destination": "docs/codex_read/红枫2026无人集群自主协同智能算法挑战赛参赛手册.md",
+      "source_sha256": "a624a26c35f122da74987ebcd02cf537aaca1dc96cb91359f521ce7b43642b99",
+      "destination_sha256": "7c5f683ed58444a86ac56941bb7053ba8a339b7d36cac07e19dbc5516828e886"
+    },
+    {
+      "source": "docs/codex_read/评估启动方式.md",
+      "destination": "docs/codex_read/评估启动方式.md",
+      "source_sha256": "0a190f66b4dd545f831af5c6accc4457d3d83dd09e166a445151c93a2ea9836b",
+      "destination_sha256": "af8b956b208f9abbe59b7143efb4e5a0e21ebed97fed0b6e60d8977f37ab15c2"
+    },
+    {
+      "source": "docs/codex_read/评分细则.md",
+      "destination": "docs/codex_read/评分细则.md",
+      "source_sha256": "a2e250d6f2d591f1535b75d6d6e745a456506ae599a873dd3e4928e023c0b88b",
+      "destination_sha256": "193973ebea7460e5e056802977af379ae4e80f444113a39a06ea24617d5f38f5"
+    },
+    {
+      "source": "docs/codex_read/赛道二-多机协同识别介绍.md",
+      "destination": "docs/codex_read/赛道二-多机协同识别介绍.md",
+      "source_sha256": "a61bec6554aee3acfc4aa89a460f867b34e45ec7b8b1be164f3618cb59beece6",
+      "destination_sha256": "57dd75082bd69a1833824064bf9ff1acdeca3299f08adf5861390760a36d601a"
+    },
+    {
+      "source": "docs/human_read/AccuracySimulator理解.md",
+      "destination": "docs/human_read/AccuracySimulator理解.md",
+      "source_sha256": "39cdfd0ebc737e859b27e4fc8f86ccb6550be425ace3c10da04df616a6613f65",
+      "destination_sha256": "39cdfd0ebc737e859b27e4fc8f86ccb6550be425ace3c10da04df616a6613f65"
+    },
+    {
+      "source": "docs/human_read/PersonalV2-视觉旁路说明.md",
+      "destination": "docs/human_read/PersonalV2-视觉旁路说明.md",
+      "source_sha256": "edf961db5c55cee7686b58fc03082c29ea40d77e662a20618d374d4ab2c89227",
+      "destination_sha256": "0c4fdebfa4ca91b6d160bbf8c0473131d09eb0bee8cc09761a1799d7c1a16786"
+    },
+    {
+      "source": "docs/human_read/个人基线版本更新.md",
+      "destination": "docs/human_read/个人基线版本更新.md",
+      "source_sha256": "7806dea699267e293c4f298dda01df1370bc8923a82542e259f42cc2ab2569aa",
+      "destination_sha256": "40d6bc767f74c566ae46626781512de479344406de1e88018017f391af12f128"
+    },
+    {
+      "source": "docs/human_read/代码修改成果.md",
+      "destination": "docs/human_read/代码修改成果.md",
+      "source_sha256": "18b68b1f8b97d9ed74a9cba5e2ab363332632c2b310a923d6567546c923f8b26",
+      "destination_sha256": "18b68b1f8b97d9ed74a9cba5e2ab363332632c2b310a923d6567546c923f8b26"
+    },
+    {
+      "source": "docs/human_read/几类坐标.md",
+      "destination": "docs/human_read/几类坐标.md",
+      "source_sha256": "823a45a386c74afac9604ae315f7f3912d75af8a059d546206e422b7434bbec2",
+      "destination_sha256": "823a45a386c74afac9604ae315f7f3912d75af8a059d546206e422b7434bbec2"
+    },
+    {
+      "source": "docs/human_read/初步规划.md",
+      "destination": "docs/human_read/初步规划.md",
+      "source_sha256": "faa50b9d0e14499cebd88d7ff7996d5f480154566f24e0ca2e243af18d387ea3",
+      "destination_sha256": "faa50b9d0e14499cebd88d7ff7996d5f480154566f24e0ca2e243af18d387ea3"
+    },
+    {
+      "source": "docs/human_read/协同跟踪时间累计.md",
+      "destination": "docs/human_read/协同跟踪时间累计.md",
+      "source_sha256": "4b9722f10274dbd2e9e5ae54a1b061585375b493c93a1db9535084637a9b1180",
+      "destination_sha256": "4b9722f10274dbd2e9e5ae54a1b061585375b493c93a1db9535084637a9b1180"
+    },
+    {
+      "source": "docs/human_read/启动方式-多天气采集.md",
+      "destination": "docs/human_read/启动方式-多天气采集.md",
+      "source_sha256": "5c0100ee7fca7b22968d1f046d6be8965fa42ee6032764f85ddeeb0914b37c4d",
+      "destination_sha256": "81edd5f972b43aa6b089137a8755b46dbd16ac26eec879ebfc5d4d3e78a1515a"
+    },
+    {
+      "source": "docs/human_read/启动方式-官方版.md",
+      "destination": "docs/human_read/启动方式-官方版.md",
+      "source_sha256": "8dbb5680b32de2beed073289c11ac6219716bd06f51e5e7292f467ff05309424",
+      "destination_sha256": "20eb664e01cd206bfe5e11378e80e38b0943d17c2ae25e29763bc0e58ca03f68"
+    },
+    {
+      "source": "docs/human_read/启动方式-自用.md",
+      "destination": "docs/human_read/启动方式-自用.md",
+      "source_sha256": "d8467ac585f73b41787dcf5da529e9e7591adca36d0f4668792cc33b5e691011",
+      "destination_sha256": "ee4dd6ac6eed1aab010627041299ea55ac9acece21db80c999b13c7b546f6c83"
+    },
+    {
+      "source": "docs/human_read/启动方式-队友.md",
+      "destination": "docs/human_read/启动方式-队友.md",
+      "source_sha256": "b8fe52373b272fd8d0d780db9b05b26f9bba9985b6a40d427237e4ab1154ed22",
+      "destination_sha256": "2ab65225eec0175bdebf1ebeb5106c032492f2f5e65f48f93a916776e74d24cd"
+    },
+    {
+      "source": "docs/human_read/官方基线代码理解.md",
+      "destination": "docs/human_read/官方基线代码理解.md",
+      "source_sha256": "479c988fb26d5a5e19598f8539a376defe0d6de939d27b668bfdb10c336e34c2",
+      "destination_sha256": "1a08216dfd9661609e254b3467ace5f243e2800c7fec11c40eb7346e98993b14"
+    },
+    {
+      "source": "docs/human_read/真目标和诱饵区分.md",
+      "destination": "docs/human_read/真目标和诱饵区分.md",
+      "source_sha256": "b71352ae4d2c423e1bf39291bda10455f4a20b64fc5acf9396f9ce09b506cd11",
+      "destination_sha256": "cbcfa23e42531d9637339f36d35e938992d538ee3546552b4e15a6546531a1d0"
+    },
+    {
+      "source": "docs/human_read/轨迹规划.md",
+      "destination": "docs/human_read/轨迹规划.md",
+      "source_sha256": "37b89b92231c4ea11cf1c55fb57b115c5d952840688413a4618bb5f6aaa7e0f8",
+      "destination_sha256": "37b89b92231c4ea11cf1c55fb57b115c5d952840688413a4618bb5f6aaa7e0f8"
+    },
+    {
+      "source": "docs/安装.md",
+      "destination": "docs/安装.md",
+      "source_sha256": "c2448fe30b7f8d790087a4f24bcaeb86afd8629a0cd00454f838f09222d2476e",
+      "destination_sha256": "c2448fe30b7f8d790087a4f24bcaeb86afd8629a0cd00454f838f09222d2476e"
+    },
+    {
+      "source": "docs/研发路线.md",
+      "destination": "docs/研发路线.md",
+      "source_sha256": "9dab2e90c179d899874b063728fb6be758fbb539acfd51af96138c5dc7ccfc24",
+      "destination_sha256": "9dab2e90c179d899874b063728fb6be758fbb539acfd51af96138c5dc7ccfc24"
+    }
+  ],
+  "official_sdk_change": {
+    "source": "competition/sdk/core/runner.py",
+    "replacement": "src/personal_hf2026/sdk_compat.py",
+    "reference_patch": "migration/official-runner-reference.patch"
+  },
+  "configurations": "migration/configuration-sources.json",
+  "research_reference": "references/vehicle_discovery/README-migration.md"
+}

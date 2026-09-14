@@ -1,0 +1,31 @@
+diff --git a/competition/sdk/core/runner.py b/competition/sdk/core/runner.py
+index 4a55317..ad30c81 100644
+--- a/competition/sdk/core/runner.py
++++ b/competition/sdk/core/runner.py
+@@ -1,3 +1,6 @@
++# 修改时间：2026-09-13
++# 修改目的：允许专用采集在引擎暂停或失联时检查中止条件并正常释放进程。
++# 修改内容：增加默认不结束的空转检查接口，由数据采集子类按需覆盖。
+ """RunnerBase — the platform runtime that drives the control loop.
+ 
+ Responsibilities (FR-008): start/stop the C++ engine, connect Redis,
+@@ -376,6 +379,10 @@ class RunnerBase:
+         """个人测试可在本周期结算后结束；默认继续运行。"""
+         return False
+ 
++    def should_finish_when_idle(self, agents) -> bool:
++        """默认保持暂停行为；专用采集可在停更时检查正常中止条件。"""
++        return False
++
+     # ── main loop ─────────────────────────────────────────────────────
+ 
+     def run(self) -> dict:
+@@ -534,6 +541,8 @@ class RunnerBase:
+                     should_idle, stall_count = _should_idle(
+                         stall_count, ws.sim_time, last.sim_time)
+                     if should_idle:
++                        if self.should_finish_when_idle(agents):
++                            break
+                         time.sleep(STALL_POLL_INTERVAL)
+                         last = ws
+                         next_tick = time.monotonic()  # pause 期不计入控制节拍

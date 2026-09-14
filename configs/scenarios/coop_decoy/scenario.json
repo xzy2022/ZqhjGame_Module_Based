@@ -1,0 +1,613 @@
+{
+  "_comment": "017 multi-uav-coop-decoy scenario — 3 FixedWingUAV + 3 TargetVehicle + 15 DecoyVehicle. Decoys are dispersed on a grid around the search area. Per spec FR-020/FR-024.",
+  "config_version": "1.0",
+  "simulation": {
+    "tick_rate_hz": 60,
+    "time_scale": 1,
+    "redis_host": "127.0.0.1",
+    "redis_command_channel": "sim:commands",
+    "redis_state_channel": "sim:state",
+    "auto_start": false,
+    "redis_port": 6379
+  },
+  "entities": [
+    {
+      "id": "20001",
+      "name": "uav_alpha",
+      "type": "FixedWingUAV",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27,
+        "initial_longitude": 124.995,
+        "initial_altitude": 500,
+        "initial_heading": 0
+      },
+      "components": {
+        "kinematics": {
+          "type": "KinematicsComponent",
+          "enabled": true,
+          "params": {
+            "min_speed": 15,
+            "max_speed": 40,
+            "max_bank_angle_deg": 45,
+            "max_climb_rate_ms": 10
+          }
+        },
+        "gimbal_tracking": {
+          "type": "GimbalTrackingComponent",
+          "enabled": true,
+          "params": {
+            "pan_rate_limit_dps": 60,
+            "tilt_rate_limit_dps": 45,
+            "auto_track": false,
+            "fov": 30
+          }
+        },
+        "comm": {
+          "type": "CommComponent",
+          "enabled": true,
+          "params": {}
+        }
+      }
+    },
+    {
+      "id": "20002",
+      "name": "uav_bravo",
+      "type": "FixedWingUAV",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27,
+        "initial_longitude": 125.005,
+        "initial_altitude": 500,
+        "initial_heading": 120
+      },
+      "components": {
+        "kinematics": {
+          "type": "KinematicsComponent",
+          "enabled": true,
+          "params": {
+            "min_speed": 15,
+            "max_speed": 40,
+            "max_bank_angle_deg": 45,
+            "max_climb_rate_ms": 10
+          }
+        },
+        "gimbal_tracking": {
+          "type": "GimbalTrackingComponent",
+          "enabled": true,
+          "params": {
+            "pan_rate_limit_dps": 60,
+            "tilt_rate_limit_dps": 45,
+            "auto_track": false,
+            "fov": 30
+          }
+        },
+        "comm": {
+          "type": "CommComponent",
+          "enabled": true,
+          "params": {}
+        }
+      }
+    },
+    {
+      "id": "20003",
+      "name": "uav_charlie",
+      "type": "FixedWingUAV",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.995,
+        "initial_longitude": 125,
+        "initial_altitude": 500,
+        "initial_heading": 240
+      },
+      "components": {
+        "kinematics": {
+          "type": "KinematicsComponent",
+          "enabled": true,
+          "params": {
+            "min_speed": 15,
+            "max_speed": 40,
+            "max_bank_angle_deg": 45,
+            "max_climb_rate_ms": 10
+          }
+        },
+        "gimbal_tracking": {
+          "type": "GimbalTrackingComponent",
+          "enabled": true,
+          "params": {
+            "pan_rate_limit_dps": 60,
+            "tilt_rate_limit_dps": 45,
+            "auto_track": false,
+            "fov": 30
+          }
+        },
+        "comm": {
+          "type": "CommComponent",
+          "enabled": true,
+          "params": {}
+        }
+      }
+    },
+    {
+      "id": "10001",
+      "name": "target_1",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.005,
+        "initial_longitude": 124.998,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "waypoints": [
+              {
+                "lat": 27.005,
+                "lon": 124.998,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 27.0005,
+                "lon": 124.998,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 26.996,
+                "lon": 124.998,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 27.0005,
+                "lon": 124.998,
+                "alt": 0,
+                "t": 0
+              }
+            ],
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 10001
+          }
+        }
+      }
+    },
+    {
+      "id": "10002",
+      "name": "target_2",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.998,
+        "initial_longitude": 125.01,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "waypoints": [
+              {
+                "lat": 26.998,
+                "lon": 125.01,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 26.998,
+                "lon": 125.004,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 27.002,
+                "lon": 125.001,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 27.004,
+                "lon": 125.006,
+                "alt": 0,
+                "t": 0
+              }
+            ],
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 10002
+          }
+        }
+      }
+    },
+    {
+      "id": "10003",
+      "name": "target_3",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.002,
+        "initial_longitude": 124.99,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "waypoints": [
+              {
+                "lat": 27.002,
+                "lon": 124.99,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 26.996,
+                "lon": 124.994,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 26.999,
+                "lon": 125.002,
+                "alt": 0,
+                "t": 0
+              },
+              {
+                "lat": 27.004,
+                "lon": 124.997,
+                "alt": 0,
+                "t": 0
+              }
+            ],
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 10003
+          }
+        }
+      }
+    },
+    {
+      "id": "30001",
+      "name": "decoy_01",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.003,
+        "initial_longitude": 125.003,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30001
+          }
+        }
+      }
+    },
+    {
+      "id": "30002",
+      "name": "decoy_02",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.003,
+        "initial_longitude": 124.997,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30002
+          }
+        }
+      }
+    },
+    {
+      "id": "30003",
+      "name": "decoy_03",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.001,
+        "initial_longitude": 125.008,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30003
+          }
+        }
+      }
+    },
+    {
+      "id": "30004",
+      "name": "decoy_04",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.997,
+        "initial_longitude": 125.002,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30004
+          }
+        }
+      }
+    },
+    {
+      "id": "30005",
+      "name": "decoy_05",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27,
+        "initial_longitude": 124.993,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30005
+          }
+        }
+      }
+    },
+    {
+      "id": "30006",
+      "name": "decoy_06",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.006,
+        "initial_longitude": 125,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30006
+          }
+        }
+      }
+    },
+    {
+      "id": "30007",
+      "name": "decoy_07",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.994,
+        "initial_longitude": 124.998,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30007
+          }
+        }
+      }
+    },
+    {
+      "id": "30008",
+      "name": "decoy_08",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.004,
+        "initial_longitude": 125.012,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30008
+          }
+        }
+      }
+    },
+    {
+      "id": "30009",
+      "name": "decoy_09",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.996,
+        "initial_longitude": 125.011,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30009
+          }
+        }
+      }
+    },
+    {
+      "id": "30010",
+      "name": "decoy_10",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.008,
+        "initial_longitude": 124.995,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30010
+          }
+        }
+      }
+    },
+    {
+      "id": "30011",
+      "name": "decoy_11",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.992,
+        "initial_longitude": 125.005,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30011
+          }
+        }
+      }
+    },
+    {
+      "id": "30012",
+      "name": "decoy_12",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.002,
+        "initial_longitude": 124.988,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30012
+          }
+        }
+      }
+    },
+    {
+      "id": "30013",
+      "name": "decoy_13",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.999,
+        "initial_longitude": 125.015,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30013
+          }
+        }
+      }
+    },
+    {
+      "id": "30014",
+      "name": "decoy_14",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.01,
+        "initial_longitude": 125.003,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30014
+          }
+        }
+      }
+    },
+    {
+      "id": "30015",
+      "name": "decoy_15",
+      "type": "DecoyVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 26.99,
+        "initial_longitude": 124.997,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 10,
+            "speed_jitter": 1.5,
+            "speed_jitter_seed": 30015
+          }
+        }
+      }
+    }
+  ],
+  "weather": {
+    "type": "Rain"
+  },
+  "perception": {
+    "max_detection_range_m": 3000,
+    "full_accuracy_range_m": 1000
+  }
+}

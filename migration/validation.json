@@ -1,0 +1,160 @@
+{
+  "date": "2026-09-14",
+  "baseline_commit": "6fc47caeb3ec95eca3f919e4e73335d8d7856265",
+  "source_head": "384b6f0b7c86ffe370a3d0ab23df3394205269a2",
+  "baseline_sdk_files_verified": 46,
+  "baseline_sdk_all_exact": true,
+  "native_runtime_tracked_diff_since_base": "",
+  "capture_config_semantically_equals_base": true,
+  "original_head_preserved": true,
+  "original_dirty_sha256_preserved": {
+    ".gitignore": true,
+    "competition/scenarios/adversarial_swarm/scenario.json": true,
+    "competition/scenarios/coop_decoy/scenario.json": true,
+    "competition/scenarios/search_track/scenario.json": true,
+    "ue-renderer/Windows/testwl/Content/Config/capture_config.json": true
+  },
+  "original_local_exclude_added": "/output/module-migration-20260914*/",
+  "migrated_source_files": 62,
+  "copied_docs": 26,
+  "copied_docs_byte_identical": 13,
+  "main_empty_commit": "9b65b4c",
+  "integration_branch": "codex/migration-integration",
+  "remote_configured": false,
+  "python_dependencies": {
+    "redis": "8.1.0",
+    "psutil": "7.2.2",
+    "Pillow": "12.3.0",
+    "numpy": "2.5.3",
+    "opencv-python": "5.0.0.93",
+    "torch": "2.14.0+cpu"
+  },
+  "import_audits": [
+    {
+      "path": "E:\\datasets\\_for_codex\\module-migration-20260914-validation\\v1-imports.json",
+      "module": "personal_hf2026.timing_study",
+      "modules": 44,
+      "unexpected_paths": {}
+    },
+    {
+      "path": "E:\\datasets\\_for_codex\\module-migration-20260914-validation\\v2-imports.json",
+      "module": "personal_hf2026.visual_shadow_study",
+      "modules": 50,
+      "unexpected_paths": {}
+    },
+    {
+      "path": "D:\\Workspace\\00_MyRepo\\red_m_competiton\\hf2026-sim-windows\\output\\module-migration-20260914\\capture-imports-60864.json",
+      "module": "personal_hf2026.run_dataset_batch",
+      "modules": 1,
+      "unexpected_paths": {}
+    },
+    {
+      "path": "D:\\Workspace\\00_MyRepo\\red_m_competiton\\hf2026-sim-windows\\output\\module-migration-20260914\\capture-imports-70320.json",
+      "module": "personal_hf2026.dataset_capture",
+      "modules": 52,
+      "unexpected_paths": {}
+    }
+  ],
+  "v1": {
+    "requested_duration_s": 200,
+    "observed_end_s": 199.93333333338524,
+    "records": 6438,
+    "exit_code": 0,
+    "total_score": 24.65,
+    "n_destroyed": 1,
+    "scorer_passed": false,
+    "output": "E:\\datasets\\_for_codex\\module-migration-20260914-validation\\v1-200s",
+    "perception": "ideal_positions"
+  },
+  "v2": {
+    "requested_duration_s": 200,
+    "observed_end_s": 199.95000000005166,
+    "exit_code": 0,
+    "control_equivalence": {
+      "ticks": 6303,
+      "mismatches": 0
+    },
+    "processed_frames": {
+      "20001": 350,
+      "20002": 350,
+      "20003": 350
+    },
+    "frame_age_s": {
+      "n": 1050,
+      "median": 0.16666633333079517,
+      "p95": 0.21666666666715173,
+      "max": 0.30000033333635656
+    },
+    "evaluation": {
+      "total_score": 24.65,
+      "n_destroyed": 1,
+      "n_reports": 25,
+      "targeting_rmse_m": 0.17425065848903495,
+      "passed": false
+    },
+    "boxes_unresolved_by_audit": 33,
+    "output": "E:\\datasets\\_for_codex\\module-migration-20260914-validation\\v2-200s",
+    "mode": "V1 control with visual shadow"
+  },
+  "capture": {
+    "status": "completed",
+    "requested_duration_s": 20,
+    "actual_duration_s": 19.91666666666788,
+    "exit_code": 0,
+    "images": 902,
+    "frames_by_uid": {
+      "20001": 300,
+      "20002": 301,
+      "20003": 301
+    },
+    "dimensions": {
+      "1024x768": 902
+    },
+    "frame_errors": 0,
+    "missing_images": [],
+    "image_sha256_errors": [],
+    "independently_decoded_images": 902,
+    "decode_errors": 0,
+    "valid_pose_fraction": 1.0,
+    "maximum_frame_gap_s": 0.4000000000014552,
+    "moving_vehicles_by_class": {
+      "TargetVehicle": 3,
+      "DecoyVehicle": 15
+    },
+    "output": "E:\\datasets\\_for\\_codex\\module-migration-20260914-batch\\preflight\\migration-smoke-01",
+    "control_mode": "oracle_identity",
+    "perception": "ideal_positions",
+    "visibility": "unverified",
+    "overwrite_refusal_exit": 2,
+    "overwrite_refusal_summary_unchanged": true
+  },
+  "batch": {
+    "manifest": "E:\\datasets\\_for\\_codex\\module-migration-20260914-batch\\manifest.json",
+    "d_budget_gib": 0.01,
+    "e_budget_gib": 4,
+    "selected_disk": "E",
+    "requested_runs": 1
+  },
+  "failed_initial_attempt": {
+    "output": "D:\\Workspace\\00_MyRepo\\red_m_competiton\\hf2026-sim-windows\\output\\module-migration-20260914\\v1-200s",
+    "cause": "D disk full; excluded from successful validation",
+    "recovered_lfs_temp_gib": 30.29755210876465,
+    "cleanup_manifest": "E:\\datasets\\_for_codex\\module-migration-20260914-validation\\lfs-temporary-cleanup.json",
+    "inferred_trigger": "Unignored baseline CSV scanned by Git/LFS; process parent chain was not observed"
+  },
+  "checks": {
+    "pip_check": "passed",
+    "git_lfs_fsck": "passed",
+    "windows_powershell_51_document_bootstrap": "passed",
+    "no_new_logic_tests": true,
+    "original_datasets_not_used_as_output": true,
+    "owned_simulation_processes_remaining": 0
+  },
+  "limits": [
+    "200 second V1/V2 scored 1 of 3 destroys; scorer passed=false.",
+    "V2 visual inference is an observation-only shadow, not visual closed-loop control; no validated recognition accuracy.",
+    "Capture tested one Clear_Skies 20 second round; six-weather production and all analysis entry points were not exhaustively run.",
+    "Vehicle discovery branch is archived as reference with original imports; it is not a runnable migrated module.",
+    "Official native resources are reused; baseline SDK and route/config data were independently checked."
+  ]
+}
