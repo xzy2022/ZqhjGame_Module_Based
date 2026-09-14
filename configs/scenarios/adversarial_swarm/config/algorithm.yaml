@@ -1,0 +1,12 @@
+# 赛题三 adversarial_swarm 感知层配置 (spec 032)
+# 与赛题一 search_track/config/algorithm.yaml 字段完全一致。
+perception:
+  photo_mode: auto            # auto(默认,非 dry_run 自动拉取 UE 渲染的 PNG 相机帧，10 机需多 GPU 渲染池)/on/off
+  accuracy: 0.85              # AccuracySimulator 检出概率（train 模式默认算法）
+  noise_sigma_m: 50.0         # 位置噪声标准差（米）
+  yolo:                       # YoloDetector 参数（eval 模式默认算法）
+    model_path: "models/target_vehicle_yolov8s.pt"
+    imgsz: 1024
+    conf: 0.25
+    camera_hfov_deg: 60.0
+    camera_vfov_deg: 45.0

@@ -1,0 +1,50 @@
+[
+  {
+    "source": "competition/scenarios/adversarial_swarm/config/algorithm.yaml",
+    "destination": "configs/scenarios/adversarial_swarm/config/algorithm.yaml",
+    "sha256": "165e05cb44afae10e4b9ca1dfb9ae462edf316e31018229d6c8f01f73756b3d4",
+    "uncommitted": false
+  },
+  {
+    "source": "competition/scenarios/adversarial_swarm/scenario.json",
+    "destination": "configs/scenarios/adversarial_swarm/scenario.json",
+    "sha256": "f8e9df1dc44b524fcf33bcea4b92bcc8a309ea4b4c36e2c5e64254e6146339f6",
+    "uncommitted": true
+  },
+  {
+    "source": "competition/scenarios/coop_decoy/config/algorithm.yaml",
+    "destination": "configs/scenarios/coop_decoy/config/algorithm.yaml",
+    "sha256": "f879e37cabdccf2f95c6a03a6649b0a06a4b3ac2d28984c87b1c18586e45f125",
+    "uncommitted": false
+  },
+  {
+    "source": "competition/scenarios/coop_decoy/scenario.json",
+    "destination": "configs/scenarios/coop_decoy/scenario.json",
+    "sha256": "f91bef16eca35b9f15a691604fb187eab3e5820d8e9697df1f9cafa9a4ede8a7",
+    "uncommitted": true
+  },
+  {
+    "source": "competition/scenarios/coop_decoy/static-decoys.json",
+    "destination": "configs/scenarios/coop_decoy/static-decoys.json",
+    "sha256": "7af326fdd77f12b613fc4c90c1e0ad353f03a0b556e2571a9fa45095826685f6",
+    "uncommitted": false
+  },
+  {
+    "source": "competition/scenarios/search_track/config/algorithm.yaml",
+    "destination": "configs/scenarios/search_track/config/algorithm.yaml",
+    "sha256": "971717b234927fa4e7c48cfa1779cc6d46d871cf60604a3cff12dab1e27588a9",
+    "uncommitted": false
+  },
+  {
+    "source": "competition/scenarios/search_track/scenario.json",
+    "destination": "configs/scenarios/search_track/scenario.json",
+    "sha256": "91fde9b76a51586f345d3599c7fab5db5ba23a714191b3ae200d5c031154056a",
+    "uncommitted": true
+  },
+  {
+    "source": "ue-renderer/Windows/testwl/Content/Config/capture_config.json",
+    "destination": "configs/renderers/capture_config.json",
+    "sha256": "edf777aba72443b7fbd235d7258eaa50fc80d3325a1e7a7a83cc4205c638565c",
+    "uncommitted": true
+  }
+]

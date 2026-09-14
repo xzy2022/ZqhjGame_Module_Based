@@ -1,0 +1,25 @@
+{
+  "_comment": "capture_config.json — 拍照/视口运行时配置（Shipping 包命令行不可用，从此文件读取）",
+  "render_mode": "service",
+  "redis": {
+    "host": "127.0.0.1",
+    "port": 6379
+  },
+  "save_image": {
+    "_comment": "image_format: png(默认)/jpeg(jpeg 走 q100 近无损，编码更快、体积更小，视觉近无损)",
+    "enabled": false,
+    "output_dir": "",
+    "image_format": "jpeg"
+  },
+  "viewport_mode": "minimal",
+  "scenario_override": "",
+  "perf": {
+    "_comment": "dump_stats=true 时（仅 Development/-game）开 stat unit/scenerendering/gpu/initviews HUD，Shipping 编译期剔除",
+    "dump_stats": false
+  },
+  "render": {
+    "_comment": "max_view_distance: 场景捕获最大渲染距离(cm); max_aircraft: 本实例最大渲染飞机数(随 renderer_online 上报给 bridge)",
+    "max_view_distance": 300000,
+    "max_aircraft": 3
+  }
+}
