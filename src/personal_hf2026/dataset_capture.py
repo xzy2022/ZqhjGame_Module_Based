@@ -1,3 +1,6 @@
+# 修改时间：2026-09-14（旧版底座兼容）
+# 修改目的：确保旧版 SDK 启动采集时不会把已有网页或 UE 当作引擎就绪。
+# 修改内容：改用本仓库维护的引擎就绪兼容入口。
 # 修改时间：2026-09-14
 # 修改目的：让个人实验脱离官方仓库的后续修改并支持独立运行。
 # 修改内容：统一模块、SDK、运行资源及输出路径并保留实验行为。
@@ -91,7 +94,7 @@ class DatasetCaptureRunner(StudyRunner):
 
     def _start_engine(self):
         # 已在启动前生成并核查最终副本，避免父入口再次随机化或吞掉准备错误。
-        from competition.sdk._vendored.sim_runner import start_sim
+        from .sdk_compat import start_sim
         return start_sim(self.cfg.sim_binary, self.cfg.scenario_path, log=self.log,
                          redis_host=self.cfg.redis_host, redis_port=self.cfg.redis_port,
                          stderr_file=str(self.output / "engine.log"))
