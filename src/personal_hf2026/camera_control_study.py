@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16
+# 修改目的：把控制阶跃与三目标搜索几何放进同一轮 60Hz 真实仿真实验。
+# 修改内容：接入三目标专项场景、30度中心包络阶段及逐拍光轴覆盖证据。
+# 修改时间：2026-09-16
 # 修改目的：实测相机变焦和云台姿态命令从发出到实际状态到达及稳定所需的时间。
 # 修改内容：增加单机短时阶跃 Runner、逐拍命令与观测记录，并生成机器摘要和中文报告。
 """相机 FOV 与云台姿态阶跃专项实验；仅用于本地真实仿真诊断。"""
@@ -6,12 +9,12 @@
 from __future__ import annotations
 
 import argparse
-import copy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
 from pathlib import Path
+import statistics
 import subprocess
 import time
 
@@ -19,12 +22,14 @@ from competition.sdk.core.agent import Agent
 from competition.sdk.core.commands import point_gimbal, set_gimbal_fov, set_speed
 from competition.sdk.core.runner import ScenarioConfig
 
-from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SCENARIO_ROOT
+from .control_test_runner import _angular_offset_deg, _bearing_deg, _ground_distance_m
+from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT
 from .sdk_compat import IdleCompatibleCoopDecoyRunner as CoopDecoyRunner
 
 
 UAV_UID = "20001"
-TARGET_UID = "10001"
+TARGET_UIDS = ("10001", "10002", "10003")
+CAMERA_SCENARIO = PROJECT_ROOT / "configs/scenarios/camera_control_probe/scenario.json"
 
 
 @dataclass(frozen=True)
@@ -34,18 +39,21 @@ class Stage:
     pan_deg: float
     tilt_deg: float
     fov_deg: float
+    aim_uid: str | None = None
 
 
 STAGES = (
-    Stage("基准姿态_FOV48", 0.0, 0.0, -66.0, 48.0),
-    Stage("仅变焦_48到10", 1.0, 0.0, -66.0, 10.0),
-    Stage("角点A", 3.0, -18.0, -58.0, 10.0),
-    Stage("角点B", 5.0, 18.0, -58.0, 10.0),
-    Stage("角点C", 7.0, 0.0, -78.0, 10.0),
-    Stage("角点A_第二轮", 9.0, -18.0, -58.0, 10.0),
-    Stage("角点B_第二轮", 11.0, 18.0, -58.0, 10.0),
-    Stage("角点C_第二轮", 13.0, 0.0, -78.0, 10.0),
-    Stage("仅变焦_10到48", 15.0, 0.0, -66.0, 48.0),
+    Stage("基准中心_FOV48", 0.0, 0.0, -45.0, 48.0),
+    Stage("仅变焦_48到10", 2.0, 0.0, -45.0, 10.0),
+    Stage("目标A", 3.0, 0.0, -31.0, 10.0, "10001"),
+    Stage("目标B", 5.0, -19.231456, -50.500938, 10.0, "10002"),
+    Stage("目标C", 7.0, 19.231456, -50.500938, 10.0, "10003"),
+    Stage("目标A_第二轮", 9.0, 0.0, -31.0, 10.0, "10001"),
+    Stage("目标B_第二轮", 11.0, -19.231456, -50.500938, 10.0, "10002"),
+    Stage("目标C_第二轮", 13.0, 19.231456, -50.500938, 10.0, "10003"),
+    Stage("三目标中心_FOV30", 15.0, 0.0, -45.0, 30.0),
+    Stage("三目标中心_FOV48", 17.0, 0.0, -45.0, 48.0),
+    Stage("中心复测_48到10", 19.0, 0.0, -45.0, 10.0),
 )
 
 
@@ -62,26 +70,27 @@ def _angle_error_deg(actual: float, desired: float) -> float:
     return (actual - desired + 180.0) % 360.0 - 180.0
 
 
-def _make_scenario() -> dict:
-    """从已有赛题二场景抽取一架无人机和一辆静止真车。"""
-    source_path = SCENARIO_ROOT / "static-decoys.json"
-    source = json.loads(source_path.read_text(encoding="utf-8"))
-    uav = copy.deepcopy(next(entity for entity in source["entities"]
-                             if str(entity["id"]) == UAV_UID))
-    target = copy.deepcopy(next(entity for entity in source["entities"]
-                                if str(entity["id"]) == TARGET_UID))
-    uav["components"]["gimbal_tracking"]["params"].update(
-        fov=STAGES[0].fov_deg, auto_track=False)
-    target["components"]["trajectory"]["params"].update(
-        speed=0.0, speed_jitter=0.0, waypoints=[])
-    simulation = dict(source["simulation"], seed=0, time_scale=1, auto_start=False)
+def _target_geometry(aircraft, target, actual: dict) -> dict:
+    """按引擎真实位姿计算目标方向、光轴夹角和当前 FOV 覆盖。"""
+    ground = _ground_distance_m(aircraft.lat, aircraft.lon, target.lat, target.lon)
+    azimuth = _bearing_deg(aircraft.lat, aircraft.lon, target.lat, target.lon)
+    elevation = math.degrees(math.atan2(target.alt - aircraft.alt, max(ground, 1e-6)))
+    camera_azimuth = (aircraft.heading + actual["pan_deg"]) % 360.0
+    axis_error = _angular_offset_deg(
+        camera_azimuth, actual["tilt_deg"], azimuth, elevation)
     return {
-        "config_version": source.get("config_version", "1.0"),
-        "simulation": simulation,
-        "entities": [uav, target],
-        "weather": {"type": "Clear_Skies"},
-        "perception": source.get("perception", {}),
+        "azimuth_deg": azimuth,
+        "relative_pan_deg": _angle_error_deg(azimuth, aircraft.heading),
+        "elevation_deg": elevation,
+        "ground_distance_m": ground,
+        "axis_error_deg": axis_error,
+        "inside_fov": axis_error < actual["fov_deg"] / 2.0,
     }
+
+
+def _make_scenario() -> dict:
+    """读取单机三静止目标场景；运行输出仍保存一份实际使用副本。"""
+    return json.loads(CAMERA_SCENARIO.read_text(encoding="utf-8"))
 
 
 class CameraStepAgent(Agent):
@@ -102,6 +111,7 @@ class CameraStepAgent(Agent):
         self.stage_index, self.stage = _stage_at(self.elapsed_s)
         self.elapsed_s += dt
         return [
+            set_speed(0.0),
             point_gimbal(self.stage.pan_deg, self.stage.tilt_deg),
             set_gimbal_fov(self.stage.fov_deg),
         ]
@@ -124,8 +134,10 @@ class CameraControlRunner(CoopDecoyRunner):
         pass
 
     def inject_startup(self, client, first):
-        # 车辆只用于满足赛题二 Runner 的评分结构，本实验中始终静止。
-        client.publish(TARGET_UID, set_speed(0.0))
+        # 重申单机和三车静止；逐拍真实速度仍会落盘，验证引擎是否接受零速。
+        client.publish(UAV_UID, set_speed(0.0))
+        for uid in TARGET_UIDS:
+            client.publish(uid, set_speed(0.0))
 
     def make_agent_for(self, entity_type, entity_uid, world_state):
         self.controller = CameraStepAgent(entity_uid)
@@ -156,6 +168,11 @@ class CameraControlRunner(CoopDecoyRunner):
             "tilt_deg": actual["tilt_deg"] - desired["tilt_deg"],
             "fov_deg": actual["fov_deg"] - desired["fov_deg"],
         }
+        targets = {
+            uid: _target_geometry(aircraft, ws.targets[uid], actual)
+            for uid in TARGET_UIDS if uid in ws.targets
+        }
+        aim = targets.get(stage.aim_uid) if stage.aim_uid else None
         commands = [asdict(command) for uid, command in all_cmds if uid == UAV_UID]
         row = {
             "tick": len(self.rows),
@@ -167,9 +184,21 @@ class CameraControlRunner(CoopDecoyRunner):
             "stage_index": self.controller.stage_index,
             "stage": stage.name,
             "stage_nominal_start_s": stage.start_s,
+            "aim_uid": stage.aim_uid,
             "desired": desired,
             "actual": actual,
             "error": errors,
+            "aircraft": {
+                "lat": aircraft.lat,
+                "lon": aircraft.lon,
+                "alt": aircraft.alt,
+                "heading_deg": aircraft.heading,
+                "speed_mps": aircraft.speed,
+            },
+            "targets": targets,
+            "aim_axis_error_deg": aim["axis_error_deg"] if aim else None,
+            "all_targets_inside_fov": bool(targets) and all(
+                target["inside_fov"] for target in targets.values()),
             "commands": commands,
         }
         self.trace.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -248,12 +277,31 @@ def _summarize(rows: list[dict], tolerances: dict, stable_window_s: float) -> di
                 if stable_confirm else None),
             "final_error": samples[-1]["error"],
             "peak_observed_rate": _peak_rates(samples),
+            "aim_uid": stage.aim_uid,
+            "aim_axis_error_deg": ({
+                "min": min(row["aim_axis_error_deg"] for row in samples),
+                "max": max(row["aim_axis_error_deg"] for row in samples),
+                "final": samples[-1]["aim_axis_error_deg"],
+            } if stage.aim_uid else None),
+            "aim_centered_sample_ratio": (
+                sum(row["aim_axis_error_deg"] <= 0.5 for row in samples) / len(samples)
+                if stage.aim_uid else None),
+            "all_targets_inside_fov_ratio": (
+                sum(row["all_targets_inside_fov"] for row in samples) / len(samples)),
             "status": "stable" if stable_confirm else ("arrived" if arrival else "not_arrived"),
         }
         stage_results.append(result)
     transitions = [item for item in stage_results[1:] if item.get("samples")]
     stable = [item for item in transitions if item["status"] == "stable"]
     settle_values = [item["stable_confirm_latency_sim_s"] for item in stable]
+    sample_intervals = [after["sim_time"] - before["sim_time"]
+                        for before, after in zip(rows, rows[1:])
+                        if after["sim_time"] > before["sim_time"]]
+    first_aircraft = rows[0]["aircraft"] if rows else None
+    max_aircraft_displacement = (max(_ground_distance_m(
+        first_aircraft["lat"], first_aircraft["lon"],
+        row["aircraft"]["lat"], row["aircraft"]["lon"]) for row in rows)
+        if rows else None)
     return {
         "schema_version": 1,
         "measurement": "engine_observed_gimbal_step_response",
@@ -264,6 +312,18 @@ def _summarize(rows: list[dict], tolerances: dict, stable_window_s: float) -> di
                                  if rows else None),
         "tolerances_deg": tolerances,
         "stable_window_s": stable_window_s,
+        "sample_interval_sim_s": ({
+            "min": min(sample_intervals),
+            "median": statistics.median(sample_intervals),
+            "max": max(sample_intervals),
+        } if sample_intervals else None),
+        "aircraft_motion": ({
+            "max_horizontal_displacement_m": max_aircraft_displacement,
+            "speed_range_mps": [min(row["aircraft"]["speed_mps"] for row in rows),
+                                max(row["aircraft"]["speed_mps"] for row in rows)],
+            "heading_range_deg": [min(row["aircraft"]["heading_deg"] for row in rows),
+                                  max(row["aircraft"]["heading_deg"] for row in rows)],
+        } if rows else None),
         "stages": stage_results,
         "transition_count": len(transitions),
         "stable_transition_count": len(stable),
@@ -316,6 +376,13 @@ def _write_report(output: Path, summary: dict) -> None:
         lines.append(
             "本轮存在未稳定阶跃，不能据此确认 10° FOV 多目标循环的最小驻留时间。"
         )
+    center_30 = next((item for item in summary["stages"]
+                      if item["name"] == "三目标中心_FOV30"), None)
+    if center_30:
+        lines.append(
+            f"30°中心阶段三目标同时位于引擎几何 FOV 的样本比例为 "
+            f"{center_30['all_targets_inside_fov_ratio']:.1%}。"
+        )
     lines.extend([
         "",
         "该结论不包含截图链路、视觉检测和目标重捕获延迟；是否采用 10° 循环或 30° "
@@ -330,7 +397,7 @@ def _write_report(output: Path, summary: dict) -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=float, default=20.0,
-                        help="仿真时长（秒），默认 20；完整固定阶跃序列至少需要 17 秒")
+                        help="仿真时长（秒），默认 20；完整固定阶跃序列至少需要 20 秒")
     parser.add_argument("--output", default=str(OUTPUT_ROOT / "camera-control-study"),
                         help="新输出目录；必须位于项目外的 ../output 下")
     parser.add_argument("--redis-host", default="127.0.0.1")
@@ -347,8 +414,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.duration < 17.0:
-        parser.error("--duration 至少为 17 秒，才能覆盖完整阶跃序列")
+    if args.duration < 20.0:
+        parser.error("--duration 至少为 20 秒，才能覆盖完整阶跃序列")
     if min(args.pan_tolerance, args.tilt_tolerance,
            args.fov_tolerance, args.stable_window) <= 0:
         parser.error("误差阈值和稳定窗口必须大于 0")
@@ -369,7 +436,8 @@ def main(argv=None) -> int:
     metadata = {
         "duration_s": args.duration,
         "stages": [asdict(stage) for stage in STAGES],
-        "scenario_source": str(SCENARIO_ROOT / "static-decoys.json"),
+        "scenario_source": str(CAMERA_SCENARIO),
+        "control_rate_hz": 60.0,
         "runner_sha256": hashlib.sha256(source).hexdigest(),
         "engine_sha256": hashlib.sha256(Path(args.sim_binary).read_bytes()).hexdigest(),
         "git_branch": subprocess.check_output(
@@ -381,6 +449,7 @@ def main(argv=None) -> int:
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     cfg = ScenarioConfig(
         "coop_decoy", str(scenario_path), args.duration,
+        control_rate_hz=60.0,
         redis_host=args.redis_host, redis_port=args.redis_port,
         output_dir=str(output), sim_binary=str(Path(args.sim_binary).resolve()),
         start_sim_flag=True, photo_mode="off", seed=0, quiet=args.quiet,
