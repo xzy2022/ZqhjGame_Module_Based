@@ -59,7 +59,7 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
   --output "..\output\tmp\module_based\capture-$stamp"
 ```
 
-逐条运行并等待上一轮结束；V2 和采集入口自行管理本轮 UE。V2 仍由 V1 控制，视觉仅在旁路观察；采集使用 `oracle_identity` 与 `ideal_positions`，可见性未经人工标注。已有输出不会用作新的采集目录。FOV30 采集会额外记录飞机姿态、协同状态、`camera_calibration.json` 和 `dataset/coop_pairs.jsonl`；相机参数仍是基于未验证假设的推导值。
+逐条运行并等待上一轮结束；V2 和采集入口自行管理本轮 UE。V2 仍由 V1 控制，视觉仅在旁路观察；采集使用 `oracle_identity` 与 `ideal_positions`，可见性未经人工标注。已有输出不会用作新的采集目录。FOV30 采集会额外记录飞机姿态、协同状态、`camera_calibration.json` 和 `dataset/coop_pairs.jsonl`；相机参数仍是基于未验证假设的推导值。`dataset/samples.jsonl.capture_pose` 将同一 `sim:state` tick 的飞机经纬高、roll/pitch/yaw 和云台 pan/tilt/FOV 作为一个原子快照按照片源时间就近对齐，并保留对齐时间差；它不是已标定的相机外参。
 
 已有 FOV30 批次可直接导出严格的双机 pair 数据集，不需要重新采集。下面命令处理 `runs` 下的全部 run；默认剔除任一侧缺框、缺位姿/姿态/真值、时间差超过 0.1 秒以及触边框的 pair：
 

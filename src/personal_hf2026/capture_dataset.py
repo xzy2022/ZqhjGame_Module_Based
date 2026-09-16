@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：让每张采集图像携带同一世界状态时刻的完整机体与云台姿态。
+# 修改内容：对齐 capture_pose 原子快照并统计完整率，同时保留原有 source_pose 和 aircraft_attitude。
+# 修改时间：2026-09-16。
 # 修改目的：让模块化采集索引携带飞机姿态、协同状态和双视角配对。
 # 修改内容：关联姿态与身份日志，生成 coop_pairs.jsonl，并写入推导相机参数。
 # 修改时间：2026-09-14。
@@ -21,7 +24,11 @@ from pathlib import Path
 
 from PIL import Image
 
-from .camera_metadata import CameraCalibrationWriter, add_frame_attitude
+from .camera_metadata import (
+    CameraCalibrationWriter,
+    add_frame_attitude,
+    add_frame_capture_pose,
+)
 from .cooperation_metadata import (
     align_frame_cooperation,
     annotate_dual_view_candidates,
@@ -96,13 +103,13 @@ def bracket(history, times, source):
             history[i] if i < len(history) else None)
 
 
-def aligned_attitude(history, times, source, max_delta_s=0.25):
-    """选择最接近照片源时间的原始姿态，并保留时间差而不伪造插值姿态。"""
+def aligned_pose_state(history, times, source, max_delta_s=0.25):
+    """选择最接近照片源时间的原始状态，并保留时间差而不伪造插值。"""
     before, after = bracket(history, times, source)
     if before is None and after is None:
         return None, None, None, None
     if before is after:
-        return before["aircraft_attitude"], "exact", 0.0, 0.0
+        return before, "exact", 0.0, 0.0
     candidates = [row for row in (before, after) if row is not None]
     selected = min(candidates, key=lambda row: abs(float(row["sim_time"]) - source))
     delta = float(selected["sim_time"]) - source
@@ -110,7 +117,7 @@ def aligned_attitude(history, times, source, max_delta_s=0.25):
            if before is not None and after is not None else None)
     if abs(delta) > max_delta_s:
         return None, None, delta, gap
-    return selected["aircraft_attitude"], "nearest_state", delta, gap
+    return selected, "nearest_state", delta, gap
 
 
 def build_index(output):
@@ -187,19 +194,36 @@ def build_index(output):
                    observation_before=before, observation_after=after,
                    first_agent_delivery=delivery, reference=reference,
                    cooperation=align_frame_cooperation(source, before, after))
-        attitude, attitude_alignment, attitude_delta, attitude_gap = aligned_attitude(
+        pose_state, pose_alignment, pose_delta, pose_gap = aligned_pose_state(
             attitude_histories[uid], attitude_times.get(uid, []), source)
-        if attitude is not None:
-            row = add_frame_attitude(row, attitude, attitude_alignment)
+        if pose_state is not None and pose_state.get("capture_pose") is not None:
+            row = add_frame_capture_pose(row, pose_state, pose_alignment)
+        elif pose_state is not None and pose_state.get("aircraft_attitude") is not None:
+            row = add_frame_attitude(
+                row, pose_state["aircraft_attitude"], pose_alignment)
+            row.update(capture_pose=None, capture_pose_alignment=None,
+                       capture_pose_state_sim_time=None,
+                       capture_pose_state_timestamp=None)
         else:
-            row.update(aircraft_attitude=None, aircraft_attitude_alignment=None)
-        row["aircraft_attitude_time_delta_s"] = attitude_delta
-        row["aircraft_attitude_bracket_gap_s"] = attitude_gap
+            row.update(aircraft_attitude=None, aircraft_attitude_alignment=None,
+                       capture_pose=None, capture_pose_alignment=None,
+                       capture_pose_state_sim_time=None,
+                       capture_pose_state_timestamp=None)
+        row["aircraft_attitude_time_delta_s"] = pose_delta
+        row["aircraft_attitude_bracket_gap_s"] = pose_gap
+        row["capture_pose_time_delta_s"] = pose_delta
+        row["capture_pose_bracket_gap_s"] = pose_gap
         calibration.observe_frame(frame["width"], frame["height"])
         samples.append(row)
         counts["frames"] += 1
         counts["with_source_pose"] += sample is not None
-        counts["with_aircraft_attitude"] += attitude is not None
+        counts["with_aircraft_attitude"] += bool(
+            pose_state and pose_state.get("aircraft_attitude") is not None)
+        counts["with_capture_pose"] += bool(
+            pose_state and pose_state.get("capture_pose") is not None)
+        counts["with_complete_capture_pose"] += bool(
+            pose_state and (pose_state.get("capture_pose") or {}).get("value_status")
+            == "recorded_from_engine_state")
         counts["with_reference"] += reference is not None
         counts["delivered_to_agent"] += delivery is not None
         counts["stale_at_first_delivery"] += bool(delivery and delivery["frame_age_s"] > 1.5)
@@ -234,6 +258,13 @@ def build_index(output):
                   cooperation_pair_max_delta_s=0.1,
                   camera_calibration="camera_calibration.json",
                   aircraft_attitude_source="world_state.entities[uid].raw.platform.attitude",
+                  capture_pose_sources={
+                      "aircraft_position": "world_state.entities[uid].raw.platform.position",
+                      "aircraft_attitude": "world_state.entities[uid].raw.platform.attitude",
+                      "gimbal_state": "world_state.entities[uid].raw.gimbal_tracking",
+                  },
+                  capture_pose_history="attitudes.jsonl",
+                  capture_pose_alignment="nearest recorded sim:state; no pose interpolation",
                   scope="unique_frames_received_by_cache_not_every_rendered_frame")
     (output / "dataset/summary.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     return result

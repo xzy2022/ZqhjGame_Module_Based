@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：为采集帧补充同一 sim:state 时刻的完整机体与云台姿态。
+# 修改内容：原子记录位置、三轴姿态和云台 pan/tilt/FOV，并保留旧姿态字段兼容性。
+# 修改时间：2026-09-16。
 # 修改目的：为高分辨率 GT-crop 采集补充飞机姿态与相机针孔参数元数据。
 # 修改内容：提供世界状态姿态提取、逐帧字段组装和单轮相机标定文件写入接口。
 """采集元数据辅助模块。
@@ -16,6 +19,8 @@ from typing import Any, Mapping
 
 
 ATTITUDE_SOURCE = "world_state.entities[uid].raw.platform.attitude"
+POSITION_SOURCE = "world_state.entities[uid].raw.platform.position"
+GIMBAL_SOURCE = "world_state.entities[uid].raw.gimbal_tracking"
 
 
 def _entity_raw(entity: Any) -> Mapping[str, Any]:
@@ -27,6 +32,45 @@ def _entity_raw(entity: Any) -> Mapping[str, Any]:
     return raw if isinstance(raw, Mapping) else {}
 
 
+def _number(mapping: Mapping[str, Any], key: str) -> float | None:
+    """读取原始数值；缺字段时保留 None，不采用 SDK 的零值回退。"""
+    value = mapping.get(key)
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _status(values: Mapping[str, Any], keys: tuple[str, ...]) -> str:
+    return ("recorded_from_engine_state" if all(values[key] is not None for key in keys)
+            else "missing_schema_fields")
+
+
+def aircraft_position(entity: Any) -> dict[str, Any]:
+    """直接从 sim:state 的 platform.position 读取经纬高。"""
+    raw = _entity_raw(entity)
+    platform = raw.get("platform", {})
+    platform = platform if isinstance(platform, Mapping) else {}
+    position = platform.get("position", {})
+    position = position if isinstance(position, Mapping) else {}
+    values = {
+        "lat": _number(position, "latitude"),
+        "lon": _number(position, "longitude"),
+        "alt": _number(position, "altitude"),
+    }
+    values.update(
+        horizontal_unit="degree",
+        altitude_unit="meter",
+        source=POSITION_SOURCE,
+        value_status=_status(values, ("lat", "lon", "alt")),
+        altitude_reference_status="unverified",
+    )
+    return values
+
+
 def aircraft_attitude(entity: Any) -> dict[str, Any]:
     """从官方状态 schema 对应路径提取 roll/pitch/yaw，不用零值掩盖缺失。"""
     raw = _entity_raw(entity)
@@ -34,29 +78,75 @@ def aircraft_attitude(entity: Any) -> dict[str, Any]:
     platform = platform if isinstance(platform, Mapping) else {}
     attitude = platform.get("attitude", {})
     attitude = attitude if isinstance(attitude, Mapping) else {}
-    values = {key: float(attitude[key]) if key in attitude else None
-              for key in ("roll", "pitch", "yaw")}
+    values = {key: _number(attitude, key) for key in ("roll", "pitch", "yaw")}
     values.update(
         unit="degree",
         source=ATTITUDE_SOURCE,
-        value_status=("recorded_from_engine_state" if all(values[key] is not None
-                      for key in ("roll", "pitch", "yaw")) else "missing_schema_fields"),
+        value_status=_status(values, ("roll", "pitch", "yaw")),
         coordinate_convention_status="unverified",
     )
     return values
 
 
-def world_state_attitude_sample(world_state: Any, uid: str) -> dict[str, Any]:
-    """生成可随观测历史记录的姿态样本，供照片源时间离线对齐。"""
+def gimbal_state(entity: Any) -> dict[str, Any]:
+    """直接从 sim:state 的 gimbal_tracking 读取云台角和 FOV。"""
+    raw = _entity_raw(entity)
+    gimbal = raw.get("gimbal_tracking", {})
+    gimbal = gimbal if isinstance(gimbal, Mapping) else {}
+    fov_key = "fov" if gimbal.get("fov") is not None else "fov_deg"
+    values = {
+        "pan": _number(gimbal, "pan_angle"),
+        "tilt": _number(gimbal, "tilt_angle"),
+        "fov": _number(gimbal, fov_key),
+    }
+    values.update(
+        unit="degree",
+        source=GIMBAL_SOURCE,
+        source_fields={"pan": "pan_angle", "tilt": "tilt_angle", "fov": fov_key},
+        value_status=_status(values, ("pan", "tilt", "fov")),
+        coordinate_convention_status="unverified",
+    )
+    return values
+
+
+def capture_pose(entity: Any) -> dict[str, Any]:
+    """生成同一个世界状态 tick 内的机体位置、姿态与云台状态。"""
+    position = aircraft_position(entity)
+    attitude = aircraft_attitude(entity)
+    gimbal = gimbal_state(entity)
+    groups = (position, attitude, gimbal)
+    return {
+        "aircraft_position": position,
+        "aircraft_attitude": attitude,
+        "gimbal_state": gimbal,
+        "source": "sim:state",
+        "value_status": ("recorded_from_engine_state" if all(
+            group["value_status"] == "recorded_from_engine_state" for group in groups)
+            else "missing_schema_fields"),
+        "camera_extrinsics_status": "unknown",
+    }
+
+
+def world_state_pose_sample(world_state: Any, uid: str) -> dict[str, Any]:
+    """生成完整姿态样本，供照片源时间离线对齐。"""
     entities = getattr(world_state, "entities", {})
     entity = entities.get(uid) if isinstance(entities, Mapping) else None
     if entity is None:
         raise KeyError(f"world_state 中不存在实体 {uid}")
+    pose = capture_pose(entity)
+    timestamp = getattr(world_state, "timestamp", None)
     return {
         "uid": str(uid),
         "sim_time": float(getattr(world_state, "sim_time")),
-        "aircraft_attitude": aircraft_attitude(entity),
+        "state_timestamp": float(timestamp) if timestamp is not None else None,
+        "capture_pose": pose,
+        "aircraft_attitude": pose["aircraft_attitude"],
     }
+
+
+def world_state_attitude_sample(world_state: Any, uid: str) -> dict[str, Any]:
+    """兼容旧调用名；返回值已包含完整 capture_pose。"""
+    return world_state_pose_sample(world_state, uid)
 
 
 def add_frame_attitude(frame_row: Mapping[str, Any], attitude: Mapping[str, Any],
@@ -65,6 +155,18 @@ def add_frame_attitude(frame_row: Mapping[str, Any], attitude: Mapping[str, Any]
     row = dict(frame_row)
     row["aircraft_attitude"] = dict(attitude)
     row["aircraft_attitude_alignment"] = str(alignment)
+    return row
+
+
+def add_frame_capture_pose(frame_row: Mapping[str, Any], state_row: Mapping[str, Any],
+                           alignment: str) -> dict[str, Any]:
+    """把同一原始状态样本的完整姿态与兼容字段加入 samples.jsonl。"""
+    row = add_frame_attitude(
+        frame_row, state_row["aircraft_attitude"], alignment)
+    row["capture_pose"] = dict(state_row["capture_pose"])
+    row["capture_pose_alignment"] = str(alignment)
+    row["capture_pose_state_sim_time"] = float(state_row["sim_time"])
+    row["capture_pose_state_timestamp"] = state_row.get("state_timestamp")
     return row
 
 

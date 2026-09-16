@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：在原图采集时保存同一 sim:state tick 的完整机体与云台姿态。
+# 修改内容：扩展状态历史、元数据和完成摘要，记录位置、三轴姿态及云台 pan/tilt/FOV。
+# 修改时间：2026-09-16。
 # 修改目的：把 FOV30 双机协同标签和飞机姿态迁入模块化采集入口。
 # 修改内容：保存姿态与协同快照，允许 20/50/150/200 秒并默认使用 FOV30。
 # 修改时间：2026-09-14（旧版底座兼容）
@@ -30,7 +33,7 @@ import psutil
 from competition.sdk.core.perception import DetectionResolver
 from competition.sdk.core.runner import ScenarioConfig
 from competition.sdk.core.scenario_randomizer import randomize_scenario
-from .camera_metadata import world_state_attitude_sample
+from .camera_metadata import world_state_pose_sample
 from .capture_dataset import build_index, rows
 from .cooperation_metadata import COOPERATION_CONTRACT, capture_agent_cooperation
 from .control_test_runner import MultiTargetIdealDetector, _ground_distance_m
@@ -116,8 +119,8 @@ class DatasetCaptureRunner(StudyRunner):
 
     def _extract_truth(self, ws, uid):
         self.world_times[uid] = ws.sim_time
-        attitude = world_state_attitude_sample(ws, uid)
-        self.attitudes.write(json.dumps(attitude, ensure_ascii=False, allow_nan=False) + "\n")
+        pose = world_state_pose_sample(ws, uid)
+        self.attitudes.write(json.dumps(pose, ensure_ascii=False, allow_nan=False) + "\n")
         detections, audit = oracle_detections(ws, uid)
         self.identity_by_uid[uid] = audit
         return detections
@@ -384,6 +387,12 @@ def main(argv=None):
                 cooperation_contract=COOPERATION_CONTRACT,
                 aircraft_attitude_source="world_state.entities[uid].raw.platform.attitude",
                 aircraft_attitude_usage="offline_label_only_not_exposed_to_agent",
+                capture_pose_sources={
+                    "aircraft_position": "world_state.entities[uid].raw.platform.position",
+                    "aircraft_attitude": "world_state.entities[uid].raw.platform.attitude",
+                    "gimbal_state": "world_state.entities[uid].raw.gimbal_tracking",
+                },
+                capture_pose_usage="offline_label_only_not_exposed_to_agent",
                 camera_calibration_policy="derived_after_capture_from_actual_dimensions_and_observed_fov")
             write_json(output / "metadata.json", metadata)
             cfg = ScenarioConfig("coop_decoy", str(layout), args.duration, output_dir=str(output),
@@ -434,6 +443,9 @@ def main(argv=None):
                     summary["frame_errors"] = runner.camera.error_count if runner.camera else 0
                     summary["identity"] = dict(runner.identity_counts)
                     summary["valid_pose_fraction"] = index["counts"]["with_source_pose"] / max(1, index["counts"]["frames"])
+                    summary["valid_capture_pose_fraction"] = (
+                        index["counts"]["with_complete_capture_pose"]
+                        / max(1, index["counts"]["frames"]))
                     if summary["status"] == "completed" and any(not index["frames_by_uid"].get(uid) for uid in ("20001", "20002", "20003")):
                         summary.update(status="failed", stop_reason="missing_uav_images")
                     if summary["frame_errors"] or summary["missing_images"]:
