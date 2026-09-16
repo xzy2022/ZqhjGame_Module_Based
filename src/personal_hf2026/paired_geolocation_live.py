@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：让实时研究评估保留并返回全部满足门控的双机定位结果。
+# 修改内容：移除每会话每目标仅一次的锁，批量返回本帧估计并明确记录限额与正式上报边界。
+# 修改时间：2026-09-16。
 # 修改目的：用协同阶段 Redis 真实框实时评估既有双机经纬度与高度估计算法。
 # 修改内容：实现严格主从配对、三度夹角门控、紧凑限额 JSONL 与最终误差汇总。
 """实时双机定位评估核心；Redis 读取和 UE 生命周期由 runner 管理。"""
@@ -132,7 +135,7 @@ def _metric(values: list[float]) -> dict[str, float | int | None]:
 
 
 class LivePairedGeolocationEvaluator:
-    """累积实时帧，只写通过三度门控的首次会话对象估计。"""
+    """累积实时帧，写出并返回所有通过三度门控的一对一帧估计。"""
 
     def __init__(
         self,
@@ -161,7 +164,6 @@ class LivePairedGeolocationEvaluator:
         self._latest: dict[tuple[str, str], dict[str, Any]] = {}
         self._seen_pair_frames: set[tuple[Any, ...]] = set()
         self._used_frames: set[tuple[str, int, float]] = set()
-        self._reported: set[tuple[tuple[str, int, int], str]] = set()
         self._counts: Counter[str] = Counter()
         self._failure_reasons: Counter[str] = Counter()
         self._written_bytes = 0
@@ -176,8 +178,13 @@ class LivePairedGeolocationEvaluator:
                 raise RuntimeError("评估器已经关闭")
             self._allowed_uids = {str(uid) for uid in uids}
 
-    def observe_frame(self, uid: str, redis_frame: Mapping[str, Any], context: Mapping[str, Any]) -> dict | None:
-        """接收一张已原子读取的 Redis 帧；成功上报时返回写出的紧凑记录。"""
+    def observe_frame(
+        self,
+        uid: str,
+        redis_frame: Mapping[str, Any],
+        context: Mapping[str, Any],
+    ) -> list[dict[str, Any]]:
+        """接收一张原子读取的 Redis 帧，返回本次形成的全部研究估计记录。"""
         with self._lock:
             if self._closed_summary is not None:
                 raise RuntimeError("评估器已经关闭")
@@ -185,7 +192,7 @@ class LivePairedGeolocationEvaluator:
             self._counts["frames_observed"] += 1
             if self._allowed_uids is not None and uid not in self._allowed_uids:
                 self._counts["frames_uid_not_allowed"] += 1
-                return None
+                return []
             try:
                 active = bool(context.get("active"))
                 phase = str(context.get("phase"))
@@ -195,7 +202,7 @@ class LivePairedGeolocationEvaluator:
                 if not (active and phase == ACTIVE_PHASE and role in (MASTER, FOLLOWER)
                         and session_id is not None and partner_uid != uid):
                     self._counts["frames_outside_strict_cooperation"] += 1
-                    return None
+                    return []
                 self._counts["frames_strict_cooperation"] += 1
                 frame_no = int(redis_frame["frame_no"])
                 source_sim_time = _finite(redis_frame["source_sim_time"])
@@ -205,10 +212,10 @@ class LivePairedGeolocationEvaluator:
                 detections = _detections(redis_frame.get("detections", []))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError, OSError):
                 self._counts["frames_invalid"] += 1
-                return None
+                return []
             if not detections:
                 self._counts["frames_without_valid_detection"] += 1
-                return None
+                return []
 
             truths = context.get("truth_by_target_id")
             truths = truths if isinstance(truths, Mapping) else {}
@@ -232,14 +239,15 @@ class LivePairedGeolocationEvaluator:
                 "world_truth_time_delta_s": self._optional_finite(
                     context.get("world_truth_time_delta_s")),
             }
-            result = None
+            records = []
             for detection in detections:
                 candidate = dict(candidate_base, detection=detection,
                                  truth=_truth(truths.get(detection["target_id"])))
                 self._latest[(uid, detection["target_id"])] = candidate
-                if result is None:
-                    result = self._try_pair(candidate)
-            return result
+                record = self._try_pair(candidate)
+                if record is not None:
+                    records.append(record)
+            return records
 
     def _try_pair(self, current: Mapping[str, Any]) -> dict | None:
         detection = current["detection"]
@@ -273,11 +281,6 @@ class LivePairedGeolocationEvaluator:
         if any(token in self._used_frames for token in frame_tokens):
             self._counts["pairs_rejected_frame_already_used"] += 1
             return None
-        report_key = (current["session_id"], detection["target_id"])
-        if report_key in self._reported:
-            self._counts["pairs_after_session_target_report"] += 1
-            return None
-
         by_role = {current["role"]: current, other["role"]: other}
         master, follower = by_role[MASTER], by_role[FOLLOWER]
         if (master["width"], master["height"], master["pose"]["gimbal_fov_deg"]) != (
@@ -319,8 +322,11 @@ class LivePairedGeolocationEvaluator:
 
         truth = master.get("truth") or follower.get("truth")
         error = self._error(estimated, truth, local_frame) if truth is not None else None
-        record = self._record(master, follower, detection, estimated, truth, error, delta)
-        self._reported.add(report_key)
+        estimate_index = self._counts["estimates_produced"] + 1
+        record = self._record(
+            master, follower, detection, estimated, truth, error, delta,
+            estimate_index,
+        )
         self._counts["estimates_produced"] += 1
         for key in self._geometry:
             self._geometry[key].append(float(estimated["geometry"][key]))
@@ -366,7 +372,7 @@ class LivePairedGeolocationEvaluator:
     def _record(self, master: Mapping[str, Any], follower: Mapping[str, Any],
                 detection: Mapping[str, Any], estimated: Mapping[str, Any],
                 truth: Mapping[str, float] | None, error: Mapping[str, float] | None,
-                source_delta_s: float) -> dict[str, Any]:
+                source_delta_s: float, estimate_index: int) -> dict[str, Any]:
         def view(candidate: Mapping[str, Any]) -> dict[str, Any]:
             return {
                 "uid": candidate["uid"],
@@ -381,7 +387,8 @@ class LivePairedGeolocationEvaluator:
             }
 
         record = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "estimate_index": estimate_index,
             "session_id": list(master["session_id"]),
             "target_id": detection["target_id"],
             "class": detection["class"],
@@ -421,7 +428,7 @@ class LivePairedGeolocationEvaluator:
             if final_status == "completed" and self._counts["estimates_produced"] == 0:
                 final_status = "completed_with_no_estimate"
             summary = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": final_status,
                 "error": str(error) if error is not None else None,
                 "algorithm": {
@@ -437,12 +444,18 @@ class LivePairedGeolocationEvaluator:
                     "identity_source": "redis_frame.detections.target_id",
                     "class_source": "redis_frame.detections.class",
                     "max_source_time_delta_s": self.max_pair_delta_s,
-                    "reports_per_session_target": 1,
+                    "estimate_policy": "all_qualifying_one_to_one_frame_pairs",
+                },
+                "reporting": {
+                    "formal_report_target_emitted_by_evaluator": False,
+                    "observe_frame_returns_all_new_estimates": True,
+                    "runner_must_count_formal_report_target_commands_separately": True,
                 },
                 "limits": {
                     "max_records": self.max_records,
                     "max_output_bytes": self.max_output_bytes,
                     "written_bytes": self._written_bytes,
+                    "estimates_produced_includes_records_suppressed_by_limits": True,
                 },
                 "counts": dict(sorted(self._counts.items())),
                 "failure_reasons": dict(sorted(self._failure_reasons.items())),
