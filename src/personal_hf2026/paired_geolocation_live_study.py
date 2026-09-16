@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：为实时双机定位补齐可离线审计的图像接收与状态取样时刻。
+# 修改内容：记录 Redis 首次读取、本机单调时钟、上下文发布及姿态真值样本时间。
+# 修改时间：2026-09-16。
 # 修改目的：为双机图像定位提供可控的 UE 短测入口。
 # 修改内容：接线专属 UE、Redis 新帧、协同上下文、输出约束和幂等收尾。
 """20 秒 UE 短测：仅在协同阶段评估双机 bbox 中心射线定位。"""
@@ -59,12 +62,16 @@ class RedisFrameBridge:
         key = max(keys, key=lambda item: int(item.rsplit(b":", 1)[1]))
         image, source_time, detections = self.client.hmget(
             key, "image", "sim_time", "detections")
+        redis_read_unix_s = time.time()
+        redis_read_monotonic_s = time.monotonic()
         if not image or source_time is None:
             return None
         frame_no = int(key.rsplit(b":", 1)[1])
         return {
             "frame_no": frame_no,
             "source_sim_time": float(source_time),
+            "redis_read_unix_s": redis_read_unix_s,
+            "redis_read_monotonic_s": redis_read_monotonic_s,
             "image": image,
             "detections": json.loads(detections) if detections else [],
         }
@@ -216,6 +223,10 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
                         "gimbal_fov_deg": own.gimbal_fov_deg,
                     },
                     "world_sim_time": world.get("world_sim_time"),
+                    "pose_sample_sim_time": world.get("world_sim_time"),
+                    "truth_sample_sim_time": world.get("world_sim_time"),
+                    "context_published_unix_s": time.time(),
+                    "context_published_monotonic_s": time.monotonic(),
                     "time_alignment": "nearest_current_state_unverified",
                     "aircraft_attitude": world.get("aircraft_attitude"),
                     "truth_by_target_id": world.get("truth_by_target_id", {}),
