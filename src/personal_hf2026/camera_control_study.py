@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16
+# 修改目的：修正首轮暴露的仿真时序漂移和静态名义光轴失配。
+# 修改内容：按真实 sim_time 推进阶段、去重状态帧，并逐帧重算三目标与中心光轴命令。
+# 修改时间：2026-09-16
 # 修改目的：把控制阶跃与三目标搜索几何放进同一轮 60Hz 真实仿真实验。
 # 修改内容：接入三目标专项场景、30度中心包络阶段及逐拍光轴覆盖证据。
 # 修改时间：2026-09-16
@@ -19,7 +22,7 @@ import subprocess
 import time
 
 from competition.sdk.core.agent import Agent
-from competition.sdk.core.commands import point_gimbal, set_gimbal_fov, set_speed
+from competition.sdk.core.commands import point_gimbal, set_gimbal_fov, set_heading, set_speed
 from competition.sdk.core.runner import ScenarioConfig
 
 from .control_test_runner import _angular_offset_deg, _bearing_deg, _ground_distance_m
@@ -42,7 +45,7 @@ class Stage:
     aim_uid: str | None = None
 
 
-STAGES = (
+NOMINAL_STAGES = (
     Stage("基准中心_FOV48", 0.0, 0.0, -45.0, 48.0),
     Stage("仅变焦_48到10", 2.0, 0.0, -45.0, 10.0),
     Stage("目标A", 3.0, 0.0, -31.0, 10.0, "10001"),
@@ -57,30 +60,76 @@ STAGES = (
 )
 
 
-def _stage_at(elapsed_s: float) -> tuple[int, Stage]:
+def _stage_at(elapsed_s: float, stages: tuple[Stage, ...]) -> tuple[int, Stage]:
     index = 0
-    for candidate, stage in enumerate(STAGES):
+    for candidate, stage in enumerate(stages):
         if elapsed_s + 1e-9 < stage.start_s:
             break
         index = candidate
-    return index, STAGES[index]
+    return index, stages[index]
 
 
 def _angle_error_deg(actual: float, desired: float) -> float:
     return (actual - desired + 180.0) % 360.0 - 180.0
 
 
-def _target_geometry(aircraft, target, actual: dict) -> dict:
-    """按引擎真实位姿计算目标方向、光轴夹角和当前 FOV 覆盖。"""
+def _target_direction(aircraft, target) -> tuple[float, float, float]:
+    """返回目标绝对方位、俯仰和相对当前机头的 pan。"""
     ground = _ground_distance_m(aircraft.lat, aircraft.lon, target.lat, target.lon)
     azimuth = _bearing_deg(aircraft.lat, aircraft.lon, target.lat, target.lon)
     elevation = math.degrees(math.atan2(target.alt - aircraft.alt, max(ground, 1e-6)))
+    return azimuth, elevation, _angle_error_deg(azimuth, aircraft.heading)
+
+
+def _center_direction(directions: list[tuple[float, float]]) -> tuple[float, float]:
+    """用三条视线单位向量的归一化均值给出共同包络中心。"""
+    east = sum(math.cos(math.radians(elevation)) * math.sin(math.radians(azimuth))
+               for azimuth, elevation in directions)
+    north = sum(math.cos(math.radians(elevation)) * math.cos(math.radians(azimuth))
+                for azimuth, elevation in directions)
+    up = sum(math.sin(math.radians(elevation)) for _, elevation in directions)
+    azimuth = math.degrees(math.atan2(east, north)) % 360.0
+    elevation = math.degrees(math.atan2(up, math.hypot(east, north)))
+    return azimuth, elevation
+
+
+def _build_stages(aircraft, targets: dict) -> tuple[Stage, ...]:
+    """从当前真实位姿生成三目标和包络中心的下一拍命令。"""
+    directions = {uid: _target_direction(aircraft, targets[uid])
+                  for uid in TARGET_UIDS if uid in targets}
+    if len(directions) != len(TARGET_UIDS):
+        return NOMINAL_STAGES
+    center_azimuth, center_elevation = _center_direction(
+        [(value[0], value[1]) for value in directions.values()])
+    center_pan = _angle_error_deg(center_azimuth, aircraft.heading)
+    a_pan, a_tilt = directions["10001"][2], directions["10001"][1]
+    b_pan, b_tilt = directions["10002"][2], directions["10002"][1]
+    c_pan, c_tilt = directions["10003"][2], directions["10003"][1]
+    return (
+        Stage("基准中心_FOV48", 0.0, center_pan, center_elevation, 48.0),
+        Stage("仅变焦_48到10", 2.0, center_pan, center_elevation, 10.0),
+        Stage("目标A", 3.0, a_pan, a_tilt, 10.0, "10001"),
+        Stage("目标B", 5.0, b_pan, b_tilt, 10.0, "10002"),
+        Stage("目标C", 7.0, c_pan, c_tilt, 10.0, "10003"),
+        Stage("目标A_第二轮", 9.0, a_pan, a_tilt, 10.0, "10001"),
+        Stage("目标B_第二轮", 11.0, b_pan, b_tilt, 10.0, "10002"),
+        Stage("目标C_第二轮", 13.0, c_pan, c_tilt, 10.0, "10003"),
+        Stage("三目标中心_FOV30", 15.0, center_pan, center_elevation, 30.0),
+        Stage("三目标中心_FOV48", 17.0, center_pan, center_elevation, 48.0),
+        Stage("中心复测_48到10", 19.0, center_pan, center_elevation, 10.0),
+    )
+
+
+def _target_geometry(aircraft, target, actual: dict) -> dict:
+    """按引擎真实位姿计算目标方向、光轴夹角和当前 FOV 覆盖。"""
+    ground = _ground_distance_m(aircraft.lat, aircraft.lon, target.lat, target.lon)
+    azimuth, elevation, relative_pan = _target_direction(aircraft, target)
     camera_azimuth = (aircraft.heading + actual["pan_deg"]) % 360.0
     axis_error = _angular_offset_deg(
         camera_azimuth, actual["tilt_deg"], azimuth, elevation)
     return {
         "azimuth_deg": azimuth,
-        "relative_pan_deg": _angle_error_deg(azimuth, aircraft.heading),
+        "relative_pan_deg": relative_pan,
         "elevation_deg": elevation,
         "ground_distance_m": ground,
         "axis_error_deg": axis_error,
@@ -96,22 +145,24 @@ def _make_scenario() -> dict:
 class CameraStepAgent(Agent):
     """按固定时序重复发送云台和 FOV 命令，不使用检测结果反馈。"""
 
-    def __init__(self, my_uid: str):
+    def __init__(self, my_uid: str, stages: tuple[Stage, ...], hold_heading: float):
         super().__init__(my_uid)
+        self.stages = stages
+        self.hold_heading = hold_heading
         self.elapsed_s = 0.0
         self.stage_index = 0
-        self.stage = STAGES[0]
+        self.stage = stages[0]
 
     def reset(self):
         self.elapsed_s = 0.0
         self.stage_index = 0
-        self.stage = STAGES[0]
+        self.stage = self.stages[0]
 
     def decide(self, obs, dt):
-        self.stage_index, self.stage = _stage_at(self.elapsed_s)
-        self.elapsed_s += dt
+        self.stage_index, self.stage = _stage_at(self.elapsed_s, self.stages)
         return [
             set_speed(0.0),
+            set_heading(self.hold_heading),
             point_gimbal(self.stage.pan_deg, self.stage.tilt_deg),
             set_gimbal_fov(self.stage.fov_deg),
         ]
@@ -127,6 +178,7 @@ class CameraControlRunner(CoopDecoyRunner):
             "w", encoding="utf-8", buffering=1)
         self.rows: list[dict] = []
         self.controller: CameraStepAgent | None = None
+        self.stages = NOMINAL_STAGES
         self.first_wall_monotonic: float | None = None
 
     def prepare_scenario(self):
@@ -140,17 +192,28 @@ class CameraControlRunner(CoopDecoyRunner):
             client.publish(uid, set_speed(0.0))
 
     def make_agent_for(self, entity_type, entity_uid, world_state):
-        self.controller = CameraStepAgent(entity_uid)
+        aircraft = world_state.uavs[entity_uid]
+        self.stages = _build_stages(aircraft, world_state.targets)
+        self.controller = CameraStepAgent(
+            entity_uid, self.stages, hold_heading=aircraft.heading)
         return self.controller
 
     def _observe_scoring(self, evaluator, ws, sim_t0, destroyed, all_cmds=()):
         super()._observe_scoring(evaluator, ws, sim_t0, destroyed, all_cmds)
         if self.controller is None:
             return
+        aircraft = ws.uavs[UAV_UID]
+        next_stages = _build_stages(aircraft, ws.targets)
+        sim_elapsed = float(max(0.0, ws.sim_time - sim_t0))
+        # Agent 看不到裁判内部 sim_time；专项 Runner 只用它校准下一拍实验排程。
+        self.controller.elapsed_s = sim_elapsed
+        if self.rows and ws.sim_time <= self.rows[-1]["sim_time"] + 1e-9:
+            self.controller.stages = next_stages
+            self.stages = next_stages
+            return
         now_monotonic = time.perf_counter()
         if self.first_wall_monotonic is None:
             self.first_wall_monotonic = now_monotonic
-        aircraft = ws.uavs[UAV_UID]
         gimbal = aircraft.raw.get("gimbal_tracking", {}) or {}
         actual = {
             "pan_deg": float(gimbal.get("pan_angle", 0.0)),
@@ -177,7 +240,7 @@ class CameraControlRunner(CoopDecoyRunner):
         row = {
             "tick": len(self.rows),
             "sim_time": float(ws.sim_time),
-            "sim_elapsed_s": float(ws.sim_time - sim_t0),
+            "sim_elapsed_s": sim_elapsed,
             "wall_time_unix_s": time.time(),
             "wall_time_monotonic_s": now_monotonic,
             "wall_elapsed_s": now_monotonic - self.first_wall_monotonic,
@@ -203,6 +266,8 @@ class CameraControlRunner(CoopDecoyRunner):
         }
         self.trace.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.rows.append(row)
+        self.controller.stages = next_stages
+        self.stages = next_stages
 
 
 def _within(row: dict, tolerances: dict) -> bool:
@@ -225,9 +290,10 @@ def _peak_rates(rows: list[dict]) -> dict:
     return peaks
 
 
-def _summarize(rows: list[dict], tolerances: dict, stable_window_s: float) -> dict:
+def _summarize(rows: list[dict], stages: tuple[Stage, ...],
+               tolerances: dict, stable_window_s: float) -> dict:
     stage_results = []
-    for index, stage in enumerate(STAGES):
+    for index, stage in enumerate(stages):
         samples = [row for row in rows if row["stage_index"] == index]
         if not samples:
             stage_results.append({"index": index, "name": stage.name, "samples": 0,
@@ -246,7 +312,7 @@ def _summarize(rows: list[dict], tolerances: dict, stable_window_s: float) -> di
                     break
             else:
                 run_start = None
-        previous = STAGES[index - 1] if index else stage
+        previous = stages[index - 1] if index else stage
         changed_axes = [axis for axis, before, after in (
             ("pan", previous.pan_deg, stage.pan_deg),
             ("tilt", previous.tilt_deg, stage.tilt_deg),
@@ -435,7 +501,8 @@ def main(argv=None) -> int:
     (output / "runner_snapshot.py").write_bytes(source)
     metadata = {
         "duration_s": args.duration,
-        "stages": [asdict(stage) for stage in STAGES],
+        "stage_schedule": [asdict(stage) for stage in NOMINAL_STAGES],
+        "stage_angles_source": "每拍引擎真实飞机与三目标位姿",
         "scenario_source": str(CAMERA_SCENARIO),
         "control_rate_hz": 60.0,
         "runner_sha256": hashlib.sha256(source).hexdigest(),
@@ -469,7 +536,8 @@ def main(argv=None) -> int:
             "tilt_deg": args.tilt_tolerance,
             "fov_deg": args.fov_tolerance,
         }
-        summary = _summarize(runner.rows, tolerances, args.stable_window)
+        summary = _summarize(
+            runner.rows, runner.stages, tolerances, args.stable_window)
         (output / "summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         _write_report(output, summary)
