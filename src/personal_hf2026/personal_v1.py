@@ -1,3 +1,6 @@
+# 修改时间：2026-09-16。
+# 修改目的：让实时双机定位只在稳定协同阶段使用离线评测对应的三十度视场角。
+# 修改内容：搜索和协同初始化保持四十八度，进入 COOP_ACTIVE 后切换三十度，退出后恢复四十八度。
 # 修改时间：2026-09-14。
 # 修改目的：将个人算法迁移为独立 Git 仓库中的可安装模块。
 # 修改内容：复制现有算法并调整包导入及模型路径，保持算法逻辑不变。
@@ -89,6 +92,7 @@ class PersonalV1Agent(CoopDistributedAgent):
     COOP_DURATION_S = 22.0
     COOP_REACQUIRE_TIMEOUT_S = 5.0
     SEARCH_FOV_DEG = 48.0
+    COOP_ACTIVE_FOV_DEG = 30.0
     TARGET_REPORT_PERIOD_S = 1.0
     COMPETITION_UPDATE_PERIOD_S = 0.5
     COMPETITION_OFFSET_STEP_MPS = 5.0
@@ -419,6 +423,9 @@ class PersonalV1Agent(CoopDistributedAgent):
             commands.append(report_target(*local.position))
 
         if self._coordinator.phase in (CoopCoordinator.INIT, CoopCoordinator.ACTIVE):
+            active_fov = (self.COOP_ACTIVE_FOV_DEG
+                          if self._coordinator.phase == CoopCoordinator.ACTIVE
+                          else self.SEARCH_FOV_DEG)
             # 歧义和空检测不能指定新竞争者，交由飞行控制器短时沿用方向历史。
             primary_position = self._gimbal_lock.primary_association.competitor_position
             heading = self._competition_flight.heading(
@@ -442,7 +449,7 @@ class PersonalV1Agent(CoopDistributedAgent):
             return commands + [
                 fly_to(*waypoint, speed=self._coop_flight_speed, loiter_radius=0.0,
                        turn_direction="right" if turn >= 0.0 else "left"),
-                point_gimbal(pan, tilt), set_gimbal_fov(self.SEARCH_FOV_DEG),
+                point_gimbal(pan, tilt), set_gimbal_fov(active_fov),
             ]
 
         if self._candidate is not None:
