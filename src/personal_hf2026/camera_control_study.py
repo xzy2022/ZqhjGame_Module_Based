@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16
+# 修改目的：让动态光轴阶段按命令实际生效顺序统计响应而不混入一拍因果错位。
+# 修改内容：判稳改为当前状态对比上一唯一状态帧发送的命令，并保留同拍误差供审计。
+# 修改时间：2026-09-16
 # 修改目的：修正首轮暴露的仿真时序漂移和静态名义光轴失配。
 # 修改内容：按真实 sim_time 推进阶段、去重状态帧，并逐帧重算三目标与中心光轴命令。
 # 修改时间：2026-09-16
@@ -270,9 +273,23 @@ class CameraControlRunner(CoopDecoyRunner):
         self.stages = next_stages
 
 
-def _within(row: dict, tolerances: dict) -> bool:
-    return all(abs(row["error"][axis]) <= tolerances[axis]
-               for axis in ("pan_deg", "tilt_deg", "fov_deg"))
+def _response_error(rows: list[dict], index: int) -> dict | None:
+    """本状态只能响应上一状态帧发送的命令，首帧没有可比较命令。"""
+    if index <= 0:
+        return None
+    actual = rows[index]["actual"]
+    desired = rows[index - 1]["desired"]
+    return {
+        "pan_deg": _angle_error_deg(actual["pan_deg"], desired["pan_deg"]),
+        "tilt_deg": actual["tilt_deg"] - desired["tilt_deg"],
+        "fov_deg": actual["fov_deg"] - desired["fov_deg"],
+    }
+
+
+def _response_within(error: dict | None, tolerances: dict,
+                     axes: tuple[str, ...]) -> bool:
+    return error is not None and all(abs(error[axis]) <= tolerances[axis]
+                                     for axis in axes)
 
 
 def _peak_rates(rows: list[dict]) -> dict:
@@ -294,30 +311,40 @@ def _summarize(rows: list[dict], stages: tuple[Stage, ...],
                tolerances: dict, stable_window_s: float) -> dict:
     stage_results = []
     for index, stage in enumerate(stages):
-        samples = [row for row in rows if row["stage_index"] == index]
+        samples = [(position, row) for position, row in enumerate(rows)
+                   if row["stage_index"] == index]
         if not samples:
             stage_results.append({"index": index, "name": stage.name, "samples": 0,
                                   "status": "not_observed"})
             continue
-        started = samples[0]
-        arrival = next((row for row in samples if _within(row, tolerances)), None)
-        stable_enter = None
-        stable_confirm = None
-        run_start = None
-        for row in samples:
-            if _within(row, tolerances):
-                run_start = run_start or row
-                if row["sim_time"] - run_start["sim_time"] >= stable_window_s:
-                    stable_enter, stable_confirm = run_start, row
-                    break
-            else:
-                run_start = None
+        started_position, started = samples[0]
         previous = stages[index - 1] if index else stage
         changed_axes = [axis for axis, before, after in (
             ("pan", previous.pan_deg, stage.pan_deg),
             ("tilt", previous.tilt_deg, stage.tilt_deg),
             ("fov", previous.fov_deg, stage.fov_deg),
         ) if abs(after - before) > 1e-9]
+        response_axes = tuple(f"{axis}_deg" for axis in changed_axes) or (
+            "pan_deg", "tilt_deg", "fov_deg")
+        arrival = next(((position, row) for position, row in samples
+                        if _response_within(
+                            _response_error(rows, position), tolerances, response_axes)), None)
+        stable_enter = None
+        stable_confirm = None
+        run_start = None
+        for position, row in samples:
+            if _response_within(
+                    _response_error(rows, position), tolerances, response_axes):
+                run_start = run_start or (position, row)
+                if row["sim_time"] - run_start[1]["sim_time"] >= stable_window_s:
+                    stable_enter, stable_confirm = run_start, row
+                    break
+            else:
+                run_start = None
+        if arrival:
+            _, arrival = arrival
+        if stable_enter:
+            _, stable_enter = stable_enter
         result = {
             "index": index,
             "name": stage.name,
@@ -341,19 +368,20 @@ def _summarize(rows: list[dict], stages: tuple[Stage, ...],
             "stable_confirm_latency_wall_s": (
                 stable_confirm["wall_elapsed_s"] - started["wall_elapsed_s"]
                 if stable_confirm else None),
-            "final_error": samples[-1]["error"],
-            "peak_observed_rate": _peak_rates(samples),
+            "final_error": samples[-1][1]["error"],
+            "final_response_error": _response_error(rows, samples[-1][0]),
+            "peak_observed_rate": _peak_rates([row for _, row in samples]),
             "aim_uid": stage.aim_uid,
             "aim_axis_error_deg": ({
-                "min": min(row["aim_axis_error_deg"] for row in samples),
-                "max": max(row["aim_axis_error_deg"] for row in samples),
-                "final": samples[-1]["aim_axis_error_deg"],
+                "min": min(row["aim_axis_error_deg"] for _, row in samples),
+                "max": max(row["aim_axis_error_deg"] for _, row in samples),
+                "final": samples[-1][1]["aim_axis_error_deg"],
             } if stage.aim_uid else None),
             "aim_centered_sample_ratio": (
-                sum(row["aim_axis_error_deg"] <= 0.5 for row in samples) / len(samples)
+                sum(row["aim_axis_error_deg"] <= 0.5 for _, row in samples) / len(samples)
                 if stage.aim_uid else None),
             "all_targets_inside_fov_ratio": (
-                sum(row["all_targets_inside_fov"] for row in samples) / len(samples)),
+                sum(row["all_targets_inside_fov"] for _, row in samples) / len(samples)),
             "status": "stable" if stable_confirm else ("arrived" if arrival else "not_arrived"),
         }
         stage_results.append(result)
