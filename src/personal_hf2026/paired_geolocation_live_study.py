@@ -142,9 +142,15 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             with RedisRuntime(
                     self.runtime_root, self.cfg.redis_host, self.cfg.redis_port):
                 try:
-                    return self._run_with_idle_check()
-                finally:
-                    self.close()
+                    result = self._run_with_idle_check()
+                    if result.get("error"):
+                        self.close(status="failed", error=str(result["error"]))
+                    else:
+                        self.close()
+                    return result
+                except BaseException as exc:
+                    self.close(status="failed", error=repr(exc))
+                    raise
         finally:
             os.chdir(previous)
 
@@ -158,6 +164,7 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             lambda _message: None,
         )
         self.renderer.start(self._scenario_cfg, uids)
+        self.evaluator.start(uids)
         self.bridge = RedisFrameBridge(
             uids, self.cfg.redis_host, self.cfg.redis_port, self.evaluator)
         self.bridge.start()
@@ -224,7 +231,7 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
         # 功能短测总是跑满 duration；未进入协同由摘要如实记录。
         return False
 
-    def close(self):
+    def close(self, status="completed", error=None):
         if self._closed:
             return
         self._closed = True
@@ -236,7 +243,8 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             if resource is None:
                 continue
             try:
-                result = resource.close()
+                result = (resource.close(status=status, error=error)
+                          if name == "evaluator" else resource.close())
                 if name == "evaluator":
                     self.live_summary = result
             except BaseException as exc:
@@ -266,6 +274,7 @@ def _parser():
     parser.add_argument("--redis-port", type=int, default=6379)
     parser.add_argument("--angle-threshold-deg", type=float, default=3.0)
     parser.add_argument("--max-records", type=int, default=1000)
+    parser.add_argument("--max-output-bytes", type=int, default=8 * 1024 * 1024)
     return parser
 
 
@@ -283,8 +292,8 @@ def main(argv=None):
         parser.error("--duration 必须大于 0")
     if args.angle_threshold_deg <= 0:
         parser.error("--angle-threshold-deg 必须大于 0")
-    if args.max_records <= 0:
-        parser.error("--max-records 必须大于 0")
+    if args.max_records <= 0 or args.max_output_bytes <= 0:
+        parser.error("--max-records 和 --max-output-bytes 必须大于 0")
 
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
@@ -295,6 +304,8 @@ def main(argv=None):
         "seed": args.seed,
         "angle_threshold_deg": args.angle_threshold_deg,
         "max_records": args.max_records,
+        "max_output_bytes": args.max_output_bytes,
+        "time_alignment": "nearest_current_state_unverified",
         "redis": {"host": args.redis_host, "port": args.redis_port},
         "output": str(output),
         "git_branch": subprocess.check_output(
@@ -315,6 +326,7 @@ def main(argv=None):
         output,
         angle_threshold_deg=args.angle_threshold_deg,
         max_records=args.max_records,
+        max_output_bytes=args.max_output_bytes,
     )
     cfg = ScenarioConfig(
         "coop_decoy",
