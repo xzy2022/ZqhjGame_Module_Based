@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：让汇总分析严格匹配在线探针最终字段并正确识别零值姿态与日志截断。
+# 修改内容：补齐状态单调钟、重复轮询字段别名，按无人机计算轮询周期并读取探针摘要。
+# 修改时间：2026-09-16。
 # 修改目的：区分仿真钟差、同主机单调钟延迟和跨进程墙钟近似，避免误判曝光延迟。
 # 修改内容：兼容 frame_time_probe 四类事件并输出帧步长、管线分段、字段覆盖、截断与证据缺口。
 # 修改时间：2026-09-16。
@@ -212,7 +215,7 @@ def _field_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
         values: dict[str, list[Any]] = defaultdict(list)
         _all_named_values(row, values)
         for label, names in aliases.items():
-            if any(any(value is not None and value is not False for value in values.get(name, []))
+            if any(any(value is not None for value in values.get(name, []))
                    for name in names):
                 counts[label] += 1
     total = len(rows)
@@ -278,7 +281,8 @@ def _clock_mapping(state_samples: list[dict[str, Any]],
     for row in state_samples:
         uid = row.get("uid")
         world = _number(row.get("world_sim_time"))
-        captured = _first_number(row, ("captured_monotonic_s",))
+        captured = _first_number(row, (
+            "world_state_observed_monotonic_s", "captured_monotonic_s"))
         if uid is not None and world is not None and captured is not None:
             state_by_uid[str(uid)][world] = captured
     first_by_uid: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -368,23 +372,28 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ):
             _append(metrics, key, value)
 
-    poll_times = sorted(value for value in (
-        _first_number(row, ("poll_started_monotonic_s", "scan_started_monotonic_s",
-                            "captured_monotonic_s", "monotonic_s")) for row in polls)
-                        if value is not None)
+    poll_times_by_uid: dict[str, list[float]] = defaultdict(list)
     for row in polls:
+        poll_time = _first_number(row, (
+            "poll_started_monotonic_s", "scan_started_monotonic_s",
+            "captured_monotonic_s", "monotonic_s"))
+        if poll_time is not None:
+            poll_times_by_uid[str(row.get("uid", "unknown"))].append(poll_time)
         _append(metrics, "bridge_poll_key_count", row.get("key_count"))
         selected = row.get("selected")
         if isinstance(selected, (list, tuple, dict, set)):
             _append(metrics, "bridge_poll_selected_count", len(selected))
         else:
             _append(metrics, "bridge_poll_selected_count", selected)
-        duplicate_index = _number(row.get("duplicate_index"))
+        duplicate_index = _first_number(
+            row, ("duplicate_read_index", "duplicate_index"))
         if duplicate_index is not None:
             _append(metrics, "bridge_poll_duplicate_index", duplicate_index)
             positive_duplicate_polls += int(duplicate_index > 0)
-    for before, after in zip(poll_times, poll_times[1:]):
-        _append(metrics, "bridge_poll_interval_monotonic_s", after - before)
+    for poll_times in poll_times_by_uid.values():
+        ordered = sorted(poll_times)
+        for before, after in zip(ordered, ordered[1:]):
+            _append(metrics, "bridge_poll_interval_monotonic_s", after - before)
 
     first_index = _index_by_frame(first_seen)
     state_index = {
@@ -416,7 +425,8 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             world = _number(state.get("world_sim_time"))
             _append(metrics, "dispatch_state_world_minus_source_sim_s",
                     _difference(world, source))
-            captured_mono = _first_number(state, ("captured_monotonic_s",))
+            captured_mono = _first_number(state, (
+                "world_state_observed_monotonic_s", "captured_monotonic_s"))
             dispatch_mono = _first_number(row, ("dispatch_monotonic_s",))
             _append(metrics, "state_capture_to_context_dispatch_monotonic_s",
                     _difference(dispatch_mono, captured_mono))
@@ -425,7 +435,9 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         _first_number(row, ("hmget_completed_monotonic_s", "first_seen_monotonic_s"))
         for row in first_seen) if value is not None)
     state_mono = sorted(value for value in (
-        _first_number(row, ("captured_monotonic_s",)) for row in state_samples)
+        _first_number(row, (
+            "world_state_observed_monotonic_s", "captured_monotonic_s"))
+        for row in state_samples)
                         if value is not None)
     return {
         "event_counts": dict(sorted(kinds.items())),
@@ -543,7 +555,8 @@ def _value_range(rows: Iterable[Mapping[str, Any]], names: Sequence[str]) -> dic
 
 def _truncation(summary: Mapping[str, Any], timing_rows: list[dict[str, Any]],
                 prediction_rows: list[dict[str, Any]],
-                probe_rows: list[dict[str, Any]]) -> dict[str, Any]:
+                probe_rows: list[dict[str, Any]],
+                probe_summary: Mapping[str, Any]) -> dict[str, Any]:
     counts = summary.get("counts", {}) if isinstance(summary.get("counts"), Mapping) else {}
     limits = summary.get("limits", {}) if isinstance(summary.get("limits"), Mapping) else {}
     suppressed = int(_number(counts.get("timing_records_suppressed_record_limit")) or 0)
@@ -553,6 +566,11 @@ def _truncation(summary: Mapping[str, Any], timing_rows: list[dict[str, Any]],
     max_records = int(_number(limits.get("max_records")) or 0)
     timing_truncated = suppressed > 0 or (max_records > 0 and timing_written >= max_records
                                          and candidates > timing_written)
+    probe_counts = (probe_summary.get("counts", {})
+                    if isinstance(probe_summary.get("counts"), Mapping) else {})
+    probe_suppressed = sum(
+        int(_number(probe_counts.get(name)) or 0)
+        for name in ("events_suppressed_record_limit", "events_suppressed_byte_limit"))
     return {
         "timing_stream_truncated": timing_truncated,
         "timing_rows_loaded": len(timing_rows),
@@ -565,11 +583,21 @@ def _truncation(summary: Mapping[str, Any], timing_rows: list[dict[str, Any]],
             "prediction_estimate_index": _value_range(prediction_rows, ("estimate_index",)),
             "probe_monotonic_s": _value_range(probe_rows, (
                 "hmget_completed_monotonic_s", "dispatch_monotonic_s",
-                "captured_monotonic_s", "scan_started_monotonic_s")),
+                "world_state_observed_monotonic_s", "captured_monotonic_s",
+                "scan_started_monotonic_s")),
         },
-        "probe_stream_truncation": (
-            "unknown_without_written_and_suppressed_counts" if probe_rows else
-            "not_applicable_probe_missing"),
+        "probe_stream_truncation": {
+            "status": ("truncated" if probe_suppressed else
+                       "complete_within_configured_limits" if probe_summary else
+                       "unknown_summary_missing" if probe_rows else
+                       "not_applicable_probe_missing"),
+            "events_written": int(
+                _number(probe_counts.get("events_written")) or len(probe_rows)),
+            "events_suppressed": probe_suppressed,
+            "max_records": _number(probe_summary.get("max_records")),
+            "max_output_bytes": _number(probe_summary.get("max_output_bytes")),
+            "written_bytes": _number(probe_summary.get("written_bytes")),
+        },
         "consequence": (
             "时间分布只覆盖日志上限前的候选；不能外推为全部成功估计或全程分布。"
             if timing_truncated else None),
@@ -580,18 +608,21 @@ def analyze(run_root: Path) -> dict[str, Any]:
     timing_path = run_root / "paired_geolocation_timing.jsonl"
     prediction_path = run_root / "paired_geolocation_predictions.jsonl"
     probe_path = run_root / "frame_time_probe.jsonl"
+    probe_summary_path = run_root / "frame_time_probe_summary.json"
     summary_path = run_root / "paired_geolocation_summary.json"
     timing_rows, timing_invalid = _read_rows(timing_path)
     prediction_rows, prediction_invalid = _read_rows(prediction_path)
     probe_rows, probe_invalid = _read_rows(probe_path)
     summary = _read_object(summary_path)
+    probe_summary = _read_object(probe_summary_path)
 
     accepted_keys = {_pair_key(row) for row in prediction_rows}
     accepted_timing = [row for row in timing_rows if _pair_key(row) in accepted_keys]
     timing_metrics = _timing_metrics(timing_rows if timing_rows else prediction_rows)
     accepted_metrics = _timing_metrics(accepted_timing if timing_rows else prediction_rows)
     probe = _probe_analysis(probe_rows)
-    truncation = _truncation(summary, timing_rows, prediction_rows, probe_rows)
+    truncation = _truncation(
+        summary, timing_rows, prediction_rows, probe_rows, probe_summary)
 
     same_sim_count = _metric(timing_metrics.get("view.world_minus_source_sim_s", []))["count"]
     probe_sim_count = probe["metrics"].get(
@@ -629,6 +660,8 @@ def analyze(run_root: Path) -> dict[str, Any]:
                                                 "invalid_rows": prediction_invalid},
             "frame_time_probe": {"path": str(probe_path), "rows": len(probe_rows),
                                  "invalid_rows": probe_invalid},
+            "frame_time_probe_summary": {
+                "path": str(probe_summary_path), "available": bool(probe_summary)},
             "paired_geolocation_summary": {"path": str(summary_path),
                                            "available": bool(summary)},
         },
