@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：让一次短 UE 运行可量化帧新鲜度、双机时差和姿态取样错配。
+# 修改内容：为候选配对写入受记录数与字节双重限制的紧凑时间审计日志。
+# 修改时间：2026-09-16。
 # 修改目的：用协同阶段 Redis 真实框实时评估既有双机经纬度与高度估计算法。
 # 修改内容：实现严格主从配对、三度夹角门控、紧凑限额 JSONL 与最终误差汇总。
 """实时双机定位评估核心；Redis 读取和 UE 生命周期由 runner 管理。"""
@@ -11,6 +14,7 @@ import math
 from pathlib import Path
 from statistics import fmean
 import threading
+import time
 from typing import Any, Mapping
 
 from PIL import Image
@@ -64,11 +68,17 @@ def _pose(value: Any) -> dict[str, float]:
     return {key: _finite(raw[key]) for key in POSE_FIELDS}
 
 
-def _attitude(value: Any, pose: Mapping[str, float]) -> dict[str, float]:
+def _attitude(value: Any, pose: Mapping[str, float]) -> dict[str, float | None]:
     raw = _plain_mapping(value)
     # 现有算法只读取 yaw；缺少引擎姿态时保留其既有 heading 约定，不假造 roll/pitch。
     yaw = raw.get("yaw", pose["heading_deg"])
-    return {"yaw": _finite(yaw)}
+    output = {"yaw": _finite(yaw)}
+    for key in ("roll", "pitch"):
+        try:
+            output[key] = _finite(raw[key]) if raw.get(key) is not None else None
+        except (TypeError, ValueError):
+            output[key] = None
+    return output
 
 
 def _dimensions(redis_frame: Mapping[str, Any]) -> tuple[int, int]:
@@ -154,8 +164,10 @@ class LivePairedGeolocationEvaluator:
             raise ValueError("记录数、字节上限必须为正，配对时间差不能为负")
         self.output.mkdir(parents=True, exist_ok=True)
         self.predictions_path = self.output / "paired_geolocation_predictions.jsonl"
+        self.timing_path = self.output / "paired_geolocation_timing.jsonl"
         self.summary_path = self.output / "paired_geolocation_summary.json"
         self._stream = self.predictions_path.open("x", encoding="utf-8", buffering=1)
+        self._timing_stream = self.timing_path.open("x", encoding="utf-8", buffering=1)
         self._lock = threading.RLock()
         self._allowed_uids: set[str] | None = None
         self._latest: dict[tuple[str, str], dict[str, Any]] = {}
@@ -165,6 +177,7 @@ class LivePairedGeolocationEvaluator:
         self._counts: Counter[str] = Counter()
         self._failure_reasons: Counter[str] = Counter()
         self._written_bytes = 0
+        self._timing_written_bytes = 0
         self._errors = {name: [] for name in ("horizontal_m", "vertical_abs_m", "three_d_m")}
         self._geometry = {name: [] for name in ("convergence_angle_deg", "ray_gap_m", "baseline_horizontal_m")}
         self._closed_summary: dict[str, Any] | None = None
@@ -179,6 +192,8 @@ class LivePairedGeolocationEvaluator:
     def observe_frame(self, uid: str, redis_frame: Mapping[str, Any], context: Mapping[str, Any]) -> dict | None:
         """接收一张已原子读取的 Redis 帧；成功上报时返回写出的紧凑记录。"""
         with self._lock:
+            evaluator_receive_unix_s = time.time()
+            evaluator_receive_monotonic_s = time.monotonic()
             if self._closed_summary is not None:
                 raise RuntimeError("评估器已经关闭")
             uid = str(uid)
@@ -231,6 +246,20 @@ class LivePairedGeolocationEvaluator:
                     context.get("pose_time_delta_s")),
                 "world_truth_time_delta_s": self._optional_finite(
                     context.get("world_truth_time_delta_s")),
+                "pose_sample_sim_time": self._optional_finite(
+                    context.get("pose_sample_sim_time")),
+                "truth_sample_sim_time": self._optional_finite(
+                    context.get("truth_sample_sim_time")),
+                "context_published_unix_s": self._optional_finite(
+                    context.get("context_published_unix_s")),
+                "context_published_monotonic_s": self._optional_finite(
+                    context.get("context_published_monotonic_s")),
+                "redis_read_unix_s": self._optional_finite(
+                    redis_frame.get("redis_read_unix_s")),
+                "redis_read_monotonic_s": self._optional_finite(
+                    redis_frame.get("redis_read_monotonic_s")),
+                "evaluator_receive_unix_s": evaluator_receive_unix_s,
+                "evaluator_receive_monotonic_s": evaluator_receive_monotonic_s,
             }
             result = None
             for detection in detections:
@@ -248,6 +277,7 @@ class LivePairedGeolocationEvaluator:
             self._counts["detections_waiting_for_partner"] += 1
             return None
         self._counts["candidate_pairs_seen"] += 1
+        self._write_timing_record(current, other)
         if not (other["active"] and other["phase"] == ACTIVE_PHASE
                 and other["session_id"] == current["session_id"]
                 and other["partner_uid"] == current["uid"]
@@ -351,6 +381,87 @@ class LivePairedGeolocationEvaluator:
         }
 
     @staticmethod
+    def _difference(later: Any, earlier: Any) -> float | None:
+        if later is None or earlier is None:
+            return None
+        return float(later) - float(earlier)
+
+    @classmethod
+    def _absolute_difference(cls, left: Any, right: Any) -> float | None:
+        difference = cls._difference(left, right)
+        return abs(difference) if difference is not None else None
+
+    def _write_timing_record(self, current: Mapping[str, Any], other: Mapping[str, Any]) -> None:
+        """记录配对发生时已有的时间事实；不把 Redis sim_time 宣称为曝光时刻。"""
+        matched_unix_s = time.time()
+        matched_monotonic_s = time.monotonic()
+
+        def view(candidate: Mapping[str, Any]) -> dict[str, Any]:
+            source = float(candidate["source_sim_time"])
+            pose_time = candidate.get("pose_sample_sim_time")
+            truth_time = candidate.get("truth_sample_sim_time")
+            redis_mono = candidate.get("redis_read_monotonic_s")
+            evaluator_mono = candidate.get("evaluator_receive_monotonic_s")
+            return {
+                "uid": candidate["uid"],
+                "role": candidate["role"],
+                "frame_no": candidate["frame_no"],
+                "source_sim_time": source,
+                "pose_sample_sim_time": pose_time,
+                "truth_sample_sim_time": truth_time,
+                "frame_age_sim_s": self._difference(pose_time, source),
+                "pose_time_mismatch_s": self._difference(pose_time, source),
+                "truth_time_mismatch_s": self._difference(truth_time, source),
+                "redis_read_unix_s": candidate.get("redis_read_unix_s"),
+                "evaluator_receive_unix_s": candidate.get("evaluator_receive_unix_s"),
+                "context_published_unix_s": candidate.get("context_published_unix_s"),
+                "redis_read_to_evaluator_s": self._difference(evaluator_mono, redis_mono),
+                "context_to_redis_read_wall_s": self._difference(
+                    candidate.get("redis_read_monotonic_s"),
+                    candidate.get("context_published_monotonic_s")),
+                "redis_read_to_pair_match_s": self._difference(matched_monotonic_s, redis_mono),
+                "source_pose": candidate["pose"],
+                "aircraft_attitude": candidate["aircraft_attitude"],
+            }
+
+        by_role = {current["role"]: current, other["role"]: other}
+        if set(by_role) == {MASTER, FOLLOWER}:
+            views = {"master": view(by_role[MASTER]), "follower": view(by_role[FOLLOWER])}
+        else:
+            views = {"current": view(current), "other": view(other)}
+        record = {
+            "schema_version": 1,
+            "kind": "candidate_pair_timing",
+            "session_id": list(current["session_id"]),
+            "target_id": current["detection"]["target_id"],
+            "matched_unix_s": matched_unix_s,
+            "source_time_delta_s": abs(
+                float(current["source_sim_time"]) - float(other["source_sim_time"])),
+            "redis_read_wall_delta_s": self._absolute_difference(
+                current.get("redis_read_unix_s"), other.get("redis_read_unix_s")),
+            "evaluator_receive_wall_delta_s": self._absolute_difference(
+                current.get("evaluator_receive_unix_s"),
+                other.get("evaluator_receive_unix_s")),
+            "views": views,
+            "semantics": {
+                "source_sim_time": "redis_renderer_sim_time_not_verified_exposure_time",
+                "frame_age_sim_s": "pose_sample_sim_time_minus_source_sim_time",
+                "wall_clock": "local_python_observation_only_not_camera_transport_latency",
+            },
+        }
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        encoded_size = len(line.encode("utf-8"))
+        if self._counts["timing_records_written"] >= self.max_records:
+            self._counts["timing_records_suppressed_record_limit"] += 1
+            return
+        if self._timing_written_bytes + encoded_size > self.max_output_bytes:
+            self._counts["timing_records_suppressed_byte_limit"] += 1
+            return
+        self._timing_stream.write(line)
+        self._timing_written_bytes += encoded_size
+        self._counts["timing_records_written"] += 1
+
+    @staticmethod
     def _error(estimated: Mapping[str, Any], truth: Mapping[str, float],
                local_frame: LocalFrame) -> dict[str, float]:
         truth_enu = local_frame.to_enu(truth["lat"], truth["lon"], truth["alt"])
@@ -417,6 +528,7 @@ class LivePairedGeolocationEvaluator:
             if self._closed_summary is not None:
                 return self._closed_summary
             self._stream.close()
+            self._timing_stream.close()
             final_status = str(status)
             if final_status == "completed" and self._counts["estimates_produced"] == 0:
                 final_status = "completed_with_no_estimate"
@@ -439,10 +551,20 @@ class LivePairedGeolocationEvaluator:
                     "max_source_time_delta_s": self.max_pair_delta_s,
                     "reports_per_session_target": 1,
                 },
+                "timing_observability": {
+                    "path": self.timing_path.name,
+                    "record_scope": "candidate_pairs_before_pair_rejection",
+                    "source_sim_time": "redis_renderer_sim_time_not_verified_exposure_time",
+                    "frame_age_formula": "pose_sample_sim_time - source_sim_time",
+                    "local_receive_clock": "time.time_at_redis_hmget_completion",
+                    "matching_clock": "time.monotonic_inside_evaluator",
+                    "camera_transport_latency_directly_measurable": False,
+                },
                 "limits": {
                     "max_records": self.max_records,
                     "max_output_bytes": self.max_output_bytes,
                     "written_bytes": self._written_bytes,
+                    "timing_written_bytes": self._timing_written_bytes,
                 },
                 "counts": dict(sorted(self._counts.items())),
                 "failure_reasons": dict(sorted(self._failure_reasons.items())),
