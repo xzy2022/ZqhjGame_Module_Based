@@ -74,5 +74,17 @@ $pairOutput = 'E:\datasets\fov30-red-m-0916-paired-strict'
 
 硬链接要求源图和输出目录位于同一磁盘卷。只处理一个 run 时加 `--run-names seed01-clear-skies-150s-fov30`；需要保留触边框时加 `--keep-edge`。训练/验证划分必须按输出标签中的 `run + session_id` 分组，不能随机拆相邻帧。
 
+同一批原始 run 也可以导出目标/诱饵分类数据集。分类裁剪是无绘制框的原始 RGB PNG；`samples.jsonl` 是不含 run、天气、无人机、目标 ID、框和地理信息的训练索引，`audit.jsonl` 只用于标签溯源和人工核验，不应送入分类模型：
+
+```powershell
+$classOutput = 'D:\Workspace\00_MyRepo\red_m_competiton\datasets\fov30-red-m-0916-target-decoy'
+.\ZqhjGame_Module_Based\run.cmd target_decoy_dataset `
+  --source-root 'E:\datasets\fov30-red-m-0916\runs' `
+  --output-root $classOutput `
+  --image-mode copy
+```
+
+源 run 与输出跨磁盘时必须使用 `--image-mode copy`；若输出也放在 E 盘，可改为 `--image-mode hardlink` 节省源图重复占用。默认沿用旧整理器的行为，触边框裁到图像范围后保留并在审计索引中标记；需要拒绝触边框时加 `--drop-edge`。只处理一个 run 时使用 `--run-names <run名>`，小批实际验证可再加 `--limit-per-run <记录数>`。训练/验证划分应按匿名 `group_id` 分组，避免同一物理车辆的相邻裁剪跨集合泄漏。
+
 非默认目录可在模块名前指定 `--sim-root <SDK目录> --runtime-root <完整发行包目录>`。当前兼容基准为官方 `79b91d2336b61fee901b1342fbdd99a83ee15f40`，保留 OpenSim 2.0.4 官方更新。
 
