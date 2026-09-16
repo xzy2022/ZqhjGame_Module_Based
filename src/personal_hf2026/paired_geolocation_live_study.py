@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：避免把诱饵估计或过期估计送入正式目标上报，并实测各协同阶段的 FOV 读回值。
+# 修改内容：上报队列增加真目标类别与半秒新鲜度门控，汇总 phase/FOV 计数。
+# 修改时间：2026-09-16。
 # 修改目的：让全部合格双机估计可记录，并按裁判一赫兹限制持续上报最新结果。
 # 修改内容：桥接估计候选、替换协同阶段旧单机上报并分别统计候选、命令和限额落盘。
 # 修改时间：2026-09-16。
@@ -153,6 +156,8 @@ class RedisFrameBridge:
 class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
     """只增加定位旁路的 Runner，不向 Agent 返回图像或真值。"""
 
+    MAX_FORMAL_REPORT_AGE_S = 0.5
+
     def __init__(self, cfg, output, runtime_root, evaluator):
         super().__init__(cfg, PersonalV1Agent, log=lambda _message: None)
         self.output = Path(output)
@@ -165,6 +170,7 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
         self.report_counts = Counter()
         self._pending_reports = {}
         self._last_report_sim_time = {}
+        self.phase_fov_counts = Counter()
         self._report_written_bytes = 0
         self._report_stream = (
             self.output / "paired_geolocation_reports.jsonl").open(
@@ -200,11 +206,14 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             return commands
         candidates = self.bridge.drain_report_candidates(entity_uid)
         for record in candidates:
+            self.report_counts["candidates_received"] += 1
+            if record.get("class") != "TargetVehicle":
+                self.report_counts["non_target_candidates_not_reported"] += 1
+                continue
             key = str(record["target_id"])
             if key in self._pending_reports:
                 self.report_counts["candidates_superseded_before_1hz"] += 1
             self._pending_reports[key] = record
-            self.report_counts["candidates_received"] += 1
 
         if coordinator.phase != coordinator.ACTIVE:
             for key, record in list(self._pending_reports.items()):
@@ -216,8 +225,15 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             return commands
 
         due = []
-        for target_id, record in self._pending_reports.items():
+        for target_id, record in list(self._pending_reports.items()):
             if str(record["views"]["master"]["uid"]) != str(entity_uid):
+                continue
+            newest_source_time = max(
+                float(view["source_sim_time"])
+                for view in record["views"].values())
+            if sim_time - newest_source_time > self.MAX_FORMAL_REPORT_AGE_S:
+                self._pending_reports.pop(target_id, None)
+                self.report_counts["stale_candidates_not_reported"] += 1
                 continue
             last = self._last_report_sim_time.get(target_id)
             if last is None or sim_time - last >= 1.0:
@@ -299,6 +315,8 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             if self.bridge is not None:
                 own = obs.self
                 coordinator = agent._coordinator
+                self.phase_fov_counts[
+                    f"{coordinator.phase}|{float(own.gimbal_fov_deg):.6g}"] += 1
                 world = self.world_context.get(entity_uid, {})
                 context = {
                     "active": coordinator.phase == coordinator.ACTIVE,
@@ -434,6 +452,9 @@ def main(argv=None):
         "time_alignment": "nearest_current_state_unverified",
         "formal_reporting": {
             "policy": "latest_qualifying_estimate_per_target_at_most_1hz",
+            "class_filter": "TargetVehicle",
+            "class_source": "research_only_redis_detection_class",
+            "max_estimate_age_s": PairedGeolocationLiveRunner.MAX_FORMAL_REPORT_AGE_S,
             "legacy_personal_v1_reports_suppressed_during_coop_active": True,
             "judge_acceptance_source": "evaluation_json_n_reports",
         },
@@ -489,6 +510,7 @@ def main(argv=None):
                 "records_written": counts.get("records_written", 0),
                 **dict(sorted(runner.report_counts.items())),
             },
+            observed_fov_by_phase=dict(sorted(runner.phase_fov_counts.items())),
         )
     except BaseException as exc:
         failure = exc
