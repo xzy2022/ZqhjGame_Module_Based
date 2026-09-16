@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16
+# 修改目的：避免把阶段切换前的旧状态误计为新命令已到达，并量化三目标包络需求。
+# 修改内容：到达统计排除首个发令帧，增加目标重捕获时延和实际所需最小 FOV。
+# 修改时间：2026-09-16
 # 修改目的：让动态光轴阶段按命令实际生效顺序统计响应而不混入一拍因果错位。
 # 修改内容：判稳改为当前状态对比上一唯一状态帧发送的命令，并保留同拍误差供审计。
 # 修改时间：2026-09-16
@@ -326,13 +329,14 @@ def _summarize(rows: list[dict], stages: tuple[Stage, ...],
         ) if abs(after - before) > 1e-9]
         response_axes = tuple(f"{axis}_deg" for axis in changed_axes) or (
             "pan_deg", "tilt_deg", "fov_deg")
-        arrival = next(((position, row) for position, row in samples
+        response_samples = samples if index == 0 else samples[1:]
+        arrival = next(((position, row) for position, row in response_samples
                         if _response_within(
                             _response_error(rows, position), tolerances, response_axes)), None)
         stable_enter = None
         stable_confirm = None
         run_start = None
-        for position, row in samples:
+        for position, row in response_samples:
             if _response_within(
                     _response_error(rows, position), tolerances, response_axes):
                 run_start = run_start or (position, row)
@@ -345,6 +349,11 @@ def _summarize(rows: list[dict], stages: tuple[Stage, ...],
             _, arrival = arrival
         if stable_enter:
             _, stable_enter = stable_enter
+        aim_arrival = next((row for _, row in response_samples
+                            if stage.aim_uid and row["aim_axis_error_deg"] <= 0.5), None)
+        envelope_radii = [max(target["axis_error_deg"]
+                              for target in row["targets"].values())
+                            for _, row in samples if row["targets"]]
         result = {
             "index": index,
             "name": stage.name,
@@ -380,8 +389,16 @@ def _summarize(rows: list[dict], stages: tuple[Stage, ...],
             "aim_centered_sample_ratio": (
                 sum(row["aim_axis_error_deg"] <= 0.5 for _, row in samples) / len(samples)
                 if stage.aim_uid else None),
+            "aim_reacquire_latency_sim_s": (
+                aim_arrival["sim_time"] - started["sim_time"] if aim_arrival else None),
             "all_targets_inside_fov_ratio": (
                 sum(row["all_targets_inside_fov"] for _, row in samples) / len(samples)),
+            "target_envelope": ({
+                "radius_deg_min": min(envelope_radii),
+                "radius_deg_max": max(envelope_radii),
+                "radius_deg_final": envelope_radii[-1],
+                "required_fov_deg_final": 2.0 * envelope_radii[-1],
+            } if envelope_radii else None),
             "status": "stable" if stable_confirm else ("arrived" if arrival else "not_arrived"),
         }
         stage_results.append(result)
@@ -475,7 +492,9 @@ def _write_report(output: Path, summary: dict) -> None:
     if center_30:
         lines.append(
             f"30°中心阶段三目标同时位于引擎几何 FOV 的样本比例为 "
-            f"{center_30['all_targets_inside_fov_ratio']:.1%}。"
+            f"{center_30['all_targets_inside_fov_ratio']:.1%}；本轮最终包络半径为 "
+            f"{center_30['target_envelope']['radius_deg_final']:.3f}°，"
+            f"对应至少 {center_30['target_envelope']['required_fov_deg_final']:.3f}° FOV。"
         )
     lines.extend([
         "",
