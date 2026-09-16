@@ -1,3 +1,6 @@
+# 修改时间：2026-09-16。
+# 修改目的：把 FOV30 双机协同标签和飞机姿态迁入模块化采集入口。
+# 修改内容：保存姿态与协同快照，允许 20/50/150/200 秒并默认使用 FOV30。
 # 修改时间：2026-09-14（旧版底座兼容）
 # 修改目的：确保旧版 SDK 启动采集时不会把已有网页或 UE 当作引擎就绪。
 # 修改内容：改用本仓库维护的引擎就绪兼容入口。
@@ -27,7 +30,9 @@ import psutil
 from competition.sdk.core.perception import DetectionResolver
 from competition.sdk.core.runner import ScenarioConfig
 from competition.sdk.core.scenario_randomizer import randomize_scenario
+from .camera_metadata import world_state_attitude_sample
 from .capture_dataset import build_index, rows
+from .cooperation_metadata import COOPERATION_CONTRACT, capture_agent_cooperation
 from .control_test_runner import MultiTargetIdealDetector, _ground_distance_m
 from .dropout_capture import StudyRenderer
 from .oracle_identity import OracleIdentityAgent, identify_position, oracle_detections
@@ -55,6 +60,7 @@ class DatasetCaptureRunner(StudyRunner):
         self.camera = None
         self.identity_by_uid = {}
         self.identities = (output / "identity.jsonl").open("w", encoding="utf-8", buffering=1)
+        self.attitudes = (output / "attitudes.jsonl").open("w", encoding="utf-8", buffering=1)
         self.resources = (output / "resources.jsonl").open("w", encoding="utf-8", buffering=1)
         (output / "dataset").mkdir()
         self.deliveries = (output / "dataset/deliveries.jsonl").open("w", encoding="utf-8", buffering=1)
@@ -110,6 +116,8 @@ class DatasetCaptureRunner(StudyRunner):
 
     def _extract_truth(self, ws, uid):
         self.world_times[uid] = ws.sim_time
+        attitude = world_state_attitude_sample(ws, uid)
+        self.attitudes.write(json.dumps(attitude, ensure_ascii=False, allow_nan=False) + "\n")
         detections, audit = oracle_detections(ws, uid)
         self.identity_by_uid[uid] = audit
         return detections
@@ -156,12 +164,19 @@ class DatasetCaptureRunner(StudyRunner):
             self.identity_counts["observations"] += 1
             self.identity_counts["unknown_detections"] += sum(r["identity"] == "unknown" and r["forwarded"]["detected"] for r in audit)
             self.identity_counts["native_decoy_primary"] += bool(audit and audit[0]["identity"] == "DecoyVehicle")
+            cooperation_state = capture_agent_cooperation(
+                agent,
+                accepted_target_id=(accepted_uid if accepted_kind == "TargetVehicle" else None),
+                accepted_target_source=("oracle_identity_offline"
+                                        if accepted_kind == "TargetVehicle" else None),
+            )
             self.identities.write(json.dumps(dict(uid=entity_uid, t=agent._t,
                 sim_time=self.world_times.get(entity_uid), state=agent._state,
                 role=agent._coordinator.role, observations=audit,
                 accepted_position=current, accepted_vehicle_id=accepted_uid,
                 accepted_identity=accepted_kind, acceptance_error=error,
                 previous_vehicle_id=previous_identity, identity_misbinding=misbinding,
+                cooperation_state=cooperation_state,
                 local_track_epoch=agent._track.epoch, primary_matches=agent._gimbal_lock.primary_matches)) + "\n")
             if agent.done_at is not None:
                 self.done_at.setdefault(entity_uid, agent.done_at)
@@ -227,7 +242,8 @@ class DatasetCaptureRunner(StudyRunner):
                 if self.renderer:
                     self.renderer.close()
             finally:
-                for stream in (self.trace, self.judge, self.identities, self.resources, self.deliveries):
+                for stream in (self.trace, self.judge, self.identities, self.attitudes,
+                               self.resources, self.deliveries):
                     stream.close()
 
 
@@ -304,8 +320,8 @@ def parser():
     p.add_argument("--runtime-root", default=RUNTIME_ROOT, type=Path)
     p.add_argument("--weather", choices=WEATHERS, required=True)
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--duration", type=int, choices=(20, 200), default=200)
-    p.add_argument("--fov", type=float, default=48.0)
+    p.add_argument("--duration", type=int, choices=(20, 50, 150, 200), default=150)
+    p.add_argument("--fov", type=float, default=30.0)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--layout", type=Path, default=ROOT / "configs/scenarios/coop_decoy/scenario.json")
     p.add_argument("--prepare-only", action="store_true", help="生成真实场景、路线与元数据，不连接 Redis 或启动仿真")
@@ -364,7 +380,11 @@ def main(argv=None):
                 code_commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
                 image_policy="original_received_bytes_unique_new_frames_existing_cache_frequency",
                 frame_time="source_sim_time_not_verified_exposure", twin_check="disabled_oracle_policy",
-                requested_weather=args.weather, requested_fov_deg=args.fov)
+                requested_weather=args.weather, requested_fov_deg=args.fov,
+                cooperation_contract=COOPERATION_CONTRACT,
+                aircraft_attitude_source="world_state.entities[uid].raw.platform.attitude",
+                aircraft_attitude_usage="offline_label_only_not_exposed_to_agent",
+                camera_calibration_policy="derived_after_capture_from_actual_dimensions_and_observed_fov")
             write_json(output / "metadata.json", metadata)
             cfg = ScenarioConfig("coop_decoy", str(layout), args.duration, output_dir=str(output),
                 sim_binary=str(runtime / "opensim-sim.exe"), start_sim_flag=True,
