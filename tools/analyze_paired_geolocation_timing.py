@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：在 Windows 上优先使用高分辨率 QueryPerformanceCounter 计算同进程延迟。
+# 修改内容：分析器优先读取 perf_counter_s，并仅在旧产物缺失时回退 monotonic_s。
+# 修改时间：2026-09-16。
 # 修改目的：让汇总分析严格匹配在线探针最终字段并正确识别零值姿态与日志截断。
 # 修改内容：补齐状态单调钟、重复轮询字段别名，按无人机计算轮询周期并读取探针摘要。
 # 修改时间：2026-09-16。
@@ -282,6 +285,7 @@ def _clock_mapping(state_samples: list[dict[str, Any]],
         uid = row.get("uid")
         world = _number(row.get("world_sim_time"))
         captured = _first_number(row, (
+            "world_state_observed_perf_counter_s",
             "world_state_observed_monotonic_s", "captured_monotonic_s"))
         if uid is not None and world is not None and captured is not None:
             state_by_uid[str(uid)][world] = captured
@@ -307,6 +311,7 @@ def _clock_mapping(state_samples: list[dict[str, Any]],
         for row in first_by_uid.get(uid, []):
             source = _number(row.get("source_sim_time"))
             first_mono = _first_number(row, (
+                "hmget_completed_perf_counter_s",
                 "hmget_completed_monotonic_s", "first_seen_monotonic_s"))
             mapped = _segmented_map(points, source) if source is not None else None
             if mapped is None or first_mono is None:
@@ -338,7 +343,7 @@ def _clock_mapping(state_samples: list[dict[str, Any]],
             "unmapped_frames": unmapped,
         }
     return {
-        "method": "同一 uid 的 state_sample 建立 world_sim_time 到 captured_monotonic_s 的相邻点分段线性映射；区间外沿最近一段外插。",
+        "method": "同一 uid 的 state_sample 建立 world_sim_time 到同进程高分辨率单调钟的相邻点分段线性映射；区间外沿最近一段外插。新产物优先 perf_counter_s，旧产物回退 monotonic_s。",
         "meaning": "renderer source time 到 Python 首见的条件估计；前提是 source_sim_time 与 world_sim_time 同域且映射在局部有效。不是曝光到 Redis 延迟。",
         "renderer_source_time_to_python_first_seen_conditional_estimate_s": _metric(all_estimates),
         "affine_fit_residual_s": _metric(all_residuals),
@@ -352,6 +357,8 @@ def _clock_mapping(state_samples: list[dict[str, Any]],
 
 def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     kinds = Counter(_event_kind(row) for row in rows)
+    metadata = next(
+        (row for row in rows if _event_kind(row) == "probe_metadata"), {})
     first_seen = [row for row in rows if _event_kind(row) == "frame_first_seen"]
     state_samples = [row for row in rows if _event_kind(row) == "state_sample"]
     dispatches = [row for row in rows if _event_kind(row) == "frame_context_dispatch"]
@@ -361,10 +368,15 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     positive_duplicate_polls = 0
 
     for row in first_seen:
-        scan_start = _first_number(row, ("scan_started_monotonic_s",))
-        scan_done = _first_number(row, ("scan_completed_monotonic_s",))
-        hmget_start = _first_number(row, ("hmget_started_monotonic_s",))
-        hmget_done = _first_number(row, ("hmget_completed_monotonic_s", "first_seen_monotonic_s"))
+        scan_start = _first_number(row, (
+            "scan_started_perf_counter_s", "scan_started_monotonic_s"))
+        scan_done = _first_number(row, (
+            "scan_completed_perf_counter_s", "scan_completed_monotonic_s"))
+        hmget_start = _first_number(row, (
+            "hmget_started_perf_counter_s", "hmget_started_monotonic_s"))
+        hmget_done = _first_number(row, (
+            "hmget_completed_perf_counter_s",
+            "hmget_completed_monotonic_s", "first_seen_monotonic_s"))
         for key, value in (
             ("scan_monotonic_s", _difference(scan_done, scan_start)),
             ("hmget_monotonic_s", _difference(hmget_done, hmget_start)),
@@ -375,6 +387,7 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     poll_times_by_uid: dict[str, list[float]] = defaultdict(list)
     for row in polls:
         poll_time = _first_number(row, (
+            "poll_started_perf_counter_s", "scan_started_perf_counter_s",
             "poll_started_monotonic_s", "scan_started_monotonic_s",
             "captured_monotonic_s", "monotonic_s"))
         if poll_time is not None:
@@ -408,8 +421,10 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if seen is not None:
             matched_dispatches += 1
             first_mono = _first_number(seen, (
+                "hmget_completed_perf_counter_s",
                 "hmget_completed_monotonic_s", "first_seen_monotonic_s"))
-            dispatch_mono = _first_number(row, ("dispatch_monotonic_s",))
+            dispatch_mono = _first_number(row, (
+                "dispatch_perf_counter_s", "dispatch_monotonic_s"))
             _append(metrics, "redis_first_seen_to_context_dispatch_monotonic_s",
                     _difference(dispatch_mono, first_mono))
             first_unix = _first_number(seen, ("hmget_completed_unix_s", "first_seen_unix_s"))
@@ -426,21 +441,31 @@ def _probe_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             _append(metrics, "dispatch_state_world_minus_source_sim_s",
                     _difference(world, source))
             captured_mono = _first_number(state, (
+                "world_state_observed_perf_counter_s",
                 "world_state_observed_monotonic_s", "captured_monotonic_s"))
-            dispatch_mono = _first_number(row, ("dispatch_monotonic_s",))
+            dispatch_mono = _first_number(row, (
+                "dispatch_perf_counter_s", "dispatch_monotonic_s"))
             _append(metrics, "state_capture_to_context_dispatch_monotonic_s",
                     _difference(dispatch_mono, captured_mono))
 
     first_seen_mono = sorted(value for value in (
-        _first_number(row, ("hmget_completed_monotonic_s", "first_seen_monotonic_s"))
+        _first_number(row, (
+            "hmget_completed_perf_counter_s",
+            "hmget_completed_monotonic_s", "first_seen_monotonic_s"))
         for row in first_seen) if value is not None)
     state_mono = sorted(value for value in (
         _first_number(row, (
+            "world_state_observed_perf_counter_s",
             "world_state_observed_monotonic_s", "captured_monotonic_s"))
         for row in state_samples)
                         if value is not None)
     return {
         "event_counts": dict(sorted(kinds.items())),
+        "clock_metadata": {
+            "clock_domains": metadata.get("clock_domains", {}),
+            "clock_resolution_s": metadata.get("clock_resolution_s", {}),
+            "analysis_priority": "perf_counter_s_then_legacy_monotonic_s",
+        },
         "bridge_poll": {
             "outcomes": dict(sorted(poll_outcomes.items())),
             "positive_duplicate_index_rows": positive_duplicate_polls,
@@ -582,6 +607,8 @@ def _truncation(summary: Mapping[str, Any], timing_rows: list[dict[str, Any]],
             "timing_matched_unix_s": _value_range(timing_rows, ("matched_unix_s",)),
             "prediction_estimate_index": _value_range(prediction_rows, ("estimate_index",)),
             "probe_monotonic_s": _value_range(probe_rows, (
+                "hmget_completed_perf_counter_s", "dispatch_perf_counter_s",
+                "world_state_observed_perf_counter_s",
                 "hmget_completed_monotonic_s", "dispatch_monotonic_s",
                 "world_state_observed_monotonic_s", "captured_monotonic_s",
                 "scan_started_monotonic_s")),

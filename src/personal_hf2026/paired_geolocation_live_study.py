@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：避免 Windows 低分辨率 monotonic 时钟把 Redis 子毫秒阶段量化为零。
+# 修改内容：在保留兼容钟字段的同时记录 QueryPerformanceCounter 高分辨率同进程时钟。
+# 修改时间：2026-09-16。
 # 修改目的：排除实时图像时间语义和必要延迟测量中的未验证假设。
 # 修改内容：逐事件记录 Redis 轮询、首次见帧、当前状态样本及帧与状态分发关系，并严格区分钟域。
 # 修改时间：2026-09-16。
@@ -93,6 +96,8 @@ class FrameTimeProbe:
             clock_domains={
                 "unix_s": "local_python_wall_clock",
                 "monotonic_s": "local_python_monotonic_clock_same_process_only",
+                "perf_counter_s": (
+                    "local_python_high_resolution_monotonic_clock_same_process_only"),
                 "world_sim_time": "engine_absolute_simulation_clock",
                 "world_timestamp": "engine_state_timestamp_semantics_unverified",
                 "source_sim_time": (
@@ -103,6 +108,11 @@ class FrameTimeProbe:
                 "do_not_subtract_values_from_different_clock_domains_without_a_verified_mapping"),
             exposure_time_verified=False,
             atomic_frame_pose_binding=False,
+            clock_resolution_s={
+                "time": time.get_clock_info("time").resolution,
+                "monotonic": time.get_clock_info("monotonic").resolution,
+                "perf_counter": time.get_clock_info("perf_counter").resolution,
+            },
         )
 
     def add_count(self, name, value=1):
@@ -184,7 +194,11 @@ class RedisFrameBridge:
 
     @staticmethod
     def _clock_pair():
-        return {"unix_s": time.time(), "monotonic_s": time.monotonic()}
+        return {
+            "unix_s": time.time(),
+            "monotonic_s": time.monotonic(),
+            "perf_counter_s": time.perf_counter(),
+        }
 
     @staticmethod
     def _key_text(key):
@@ -202,8 +216,10 @@ class RedisFrameBridge:
             "purpose": str(purpose),
             "scan_started_unix_s": scan_started["unix_s"],
             "scan_started_monotonic_s": scan_started["monotonic_s"],
+            "scan_started_perf_counter_s": scan_started["perf_counter_s"],
             "scan_completed_unix_s": scan_completed["unix_s"],
             "scan_completed_monotonic_s": scan_completed["monotonic_s"],
+            "scan_completed_perf_counter_s": scan_completed["perf_counter_s"],
             "key_count": len(keys),
         }
         if not keys:
@@ -222,8 +238,10 @@ class RedisFrameBridge:
             "frame_no": frame_no,
             "hmget_started_unix_s": hmget_started["unix_s"],
             "hmget_started_monotonic_s": hmget_started["monotonic_s"],
+            "hmget_started_perf_counter_s": hmget_started["perf_counter_s"],
             "hmget_completed_unix_s": hmget_completed["unix_s"],
             "hmget_completed_monotonic_s": hmget_completed["monotonic_s"],
+            "hmget_completed_perf_counter_s": hmget_completed["perf_counter_s"],
             "hash_field_presence": {
                 "image": bool(image),
                 "sim_time": source_time is not None,
@@ -245,6 +263,7 @@ class RedisFrameBridge:
             "source_sim_time_raw": source_sim_time_raw,
             "redis_read_unix_s": hmget_completed["unix_s"],
             "redis_read_monotonic_s": hmget_completed["monotonic_s"],
+            "redis_read_perf_counter_s": hmget_completed["perf_counter_s"],
             "image": image,
             "detections": json.loads(detections) if detections else [],
         }, base
@@ -290,12 +309,16 @@ class RedisFrameBridge:
                 "delivery_eligible": bool(delivery_eligible),
                 "scan_started_unix_s": poll["scan_started_unix_s"],
                 "scan_started_monotonic_s": poll["scan_started_monotonic_s"],
+                "scan_started_perf_counter_s": poll["scan_started_perf_counter_s"],
                 "scan_completed_unix_s": poll["scan_completed_unix_s"],
                 "scan_completed_monotonic_s": poll["scan_completed_monotonic_s"],
+                "scan_completed_perf_counter_s": poll["scan_completed_perf_counter_s"],
                 "hmget_started_unix_s": poll["hmget_started_unix_s"],
                 "hmget_started_monotonic_s": poll["hmget_started_monotonic_s"],
+                "hmget_started_perf_counter_s": poll["hmget_started_perf_counter_s"],
                 "hmget_completed_unix_s": poll["hmget_completed_unix_s"],
                 "hmget_completed_monotonic_s": poll["hmget_completed_monotonic_s"],
+                "hmget_completed_perf_counter_s": poll["hmget_completed_perf_counter_s"],
                 "frame_number_gap_from_previous": gap,
                 "source_sim_time_semantics": (
                     "redis_renderer_field_not_verified_exposure_time"),
@@ -362,6 +385,7 @@ class RedisFrameBridge:
                         "source_sim_time": frame["source_sim_time"],
                         "dispatch_unix_s": dispatched["unix_s"],
                         "dispatch_monotonic_s": dispatched["monotonic_s"],
+                        "dispatch_perf_counter_s": dispatched["perf_counter_s"],
                         "outcome": ("current_context_available" if context is not None
                                     else "no_current_context"),
                         "state_sample_id": (context.get("state_sample_id")
@@ -377,6 +401,9 @@ class RedisFrameBridge:
                             if context is not None else None),
                         "context_published_monotonic_s": (
                             context.get("context_published_monotonic_s")
+                            if context is not None else None),
+                        "context_published_perf_counter_s": (
+                            context.get("context_published_perf_counter_s")
                             if context is not None else None),
                         "atomic_frame_pose_binding": False,
                     })
@@ -405,6 +432,7 @@ class RedisFrameBridge:
                     "bridge_error",
                     captured_unix_s=failed["unix_s"],
                     captured_monotonic_s=failed["monotonic_s"],
+                    captured_perf_counter_s=failed["perf_counter_s"],
                     error=repr(exc),
                 )
                 self._stop.set()
@@ -583,6 +611,7 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
             "state_sample_id": f"{uid}:{runner_tick_index}",
             "world_state_observed_unix_s": captured["unix_s"],
             "world_state_observed_monotonic_s": captured["monotonic_s"],
+            "world_state_observed_perf_counter_s": captured["perf_counter_s"],
             "aircraft_attitude": attitude,
             "raw_state_coverage": {
                 "entity_keys": sorted(str(key) for key in raw),
@@ -643,6 +672,7 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
                     "truth_sample_sim_time": world.get("world_sim_time"),
                     "context_published_unix_s": context_published["unix_s"],
                     "context_published_monotonic_s": context_published["monotonic_s"],
+                    "context_published_perf_counter_s": context_published["perf_counter_s"],
                     "time_alignment": "nearest_current_state_unverified",
                     "aircraft_attitude": world.get("aircraft_attitude"),
                     "truth_by_target_id": world.get("truth_by_target_id", {}),
@@ -667,12 +697,17 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
                     world_state_observed_unix_s=world.get("world_state_observed_unix_s"),
                     world_state_observed_monotonic_s=world.get(
                         "world_state_observed_monotonic_s"),
+                    world_state_observed_perf_counter_s=world.get(
+                        "world_state_observed_perf_counter_s"),
                     decide_entered_unix_s=decide_entered["unix_s"],
                     decide_entered_monotonic_s=decide_entered["monotonic_s"],
+                    decide_entered_perf_counter_s=decide_entered["perf_counter_s"],
                     decide_completed_unix_s=decide_completed["unix_s"],
                     decide_completed_monotonic_s=decide_completed["monotonic_s"],
+                    decide_completed_perf_counter_s=decide_completed["perf_counter_s"],
                     context_published_unix_s=context_published["unix_s"],
                     context_published_monotonic_s=context_published["monotonic_s"],
+                    context_published_perf_counter_s=context_published["perf_counter_s"],
                     current_observation_pose=pose,
                     current_world_aircraft_attitude=world.get("aircraft_attitude"),
                     raw_state_coverage=world.get("raw_state_coverage", {}),
