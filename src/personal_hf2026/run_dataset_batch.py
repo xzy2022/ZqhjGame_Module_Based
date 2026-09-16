@@ -1,3 +1,6 @@
+# 修改时间：2026-09-16。
+# 修改目的：把 FOV30 六天气一百五十秒采集计划迁入模块化项目。
+# 修改内容：支持单输出根、20/50/150/200 秒计划，并把默认预算调整为五十五 GiB。
 # 修改时间：2026-09-14
 # 修改目的：让个人实验脱离官方仓库的后续修改并支持独立运行。
 # 修改内容：统一模块、SDK、运行资源及输出路径并保留实验行为。
@@ -7,7 +10,7 @@
 # 修改时间：2026-09-13。
 # 修改目的：让多天气采集按双盘预算串行运行，并保留短测和失败轮的真实占用。
 # 修改内容：新增可续跑的轮次清单、整轮容量预留、资源检查和停止文件收尾。
-"""双盘串行采集入口；短测、失败轮和生产轮共享同一批次预算。"""
+"""单目录串行采集入口；短测、失败轮和生产轮共享同一批次预算。"""
 from __future__ import annotations
 
 import argparse
@@ -67,12 +70,7 @@ def free_bytes(path):
 
 
 def load_plan(args):
-    plan = read_json(args.plan_json) if args.plan_json else [
-        {"run_id": f"run-{index:02d}", "weather": weather, "seed": seed,
-         "duration": 200, "stage": "runs"}
-        for index, (seed, weather) in enumerate(
-            ((seed, weather) for seed in (1, 2, 3) for weather in WEATHERS), 1)
-    ]
+    plan = read_json(args.plan_json)
     identifiers = set()
     for item in plan:
         run_id = str(item["run_id"])
@@ -81,8 +79,8 @@ def load_plan(args):
         if run_id in identifiers:
             raise ValueError(f"重复 run_id：{run_id}")
         identifiers.add(run_id)
-        if item["weather"] not in WEATHERS or item["duration"] not in (20, 200):
-            raise ValueError(f"{run_id} 只支持六种天气和 20/200 秒")
+        if item["weather"] not in WEATHERS or item["duration"] not in (20, 50, 150, 200):
+            raise ValueError(f"{run_id} 只支持六种天气和 20/50/150/200 秒")
         if item["stage"] not in ("preflight", "runs"):
             raise ValueError(f"{run_id} stage 必须为 preflight 或 runs")
         if item.get("layout"):
@@ -110,10 +108,10 @@ def reserve_200_bytes(manifest, initial):
 
 
 def disk_states(roots, args):
-    return [{"disk": disk, "root": str(root), "used_bytes": total_bytes(root),
-             "free_bytes": free_bytes(root), "budget_bytes": int(budget * GIB)}
-            for disk, root, budget in zip(("D", "E"), roots,
-                                         (args.d_budget_gib, args.e_budget_gib))]
+    return [{"disk": root.drive.rstrip(":").upper(), "root": str(root),
+             "used_bytes": total_bytes(root), "free_bytes": free_bytes(root),
+             "budget_bytes": int(args.output_budget_gib * GIB)}
+            for root in roots]
 
 
 def choose_disk(states, reserve, minimum):
@@ -168,9 +166,9 @@ def existing_manifest(roots, args):
     if copies:
         manifest = max(copies, key=lambda value: value["updated_at"])
         if manifest["roots"] != [str(root) for root in roots]:
-            raise ValueError("续跑必须使用原批次的两个根目录")
+            raise ValueError("续跑必须使用原批次的输出根目录")
         if len({value["batch_id"] for value in copies}) != 1:
-            raise ValueError("两盘清单属于不同批次")
+            raise ValueError("清单副本属于不同批次")
         return manifest
     return {"batch_id": datetime.now().strftime("%Y%m%d-%H%M%S-%f"), "created_at": now(),
             "roots": [str(root) for root in roots], "code_root": str(ROOT),
@@ -250,7 +248,7 @@ def run_one(item, state, manifest, roots, args):
 def execute(manifest, plan, roots, args):
     started = datetime.fromisoformat(manifest["created_at"]).timestamp()
     invocation = {"started_at": now(), "plan": plan, "status": "running",
-                  "d_budget_gib": args.d_budget_gib, "e_budget_gib": args.e_budget_gib,
+                  "output_budget_gib": args.output_budget_gib,
                   "min_free_gib": args.min_free_gib, "child_launch_count": 0}
     manifest["invocations"].append(invocation)
     reason = "plan_completed"
@@ -306,25 +304,22 @@ def main():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime-root", type=Path, default=RUNTIME_ROOT)
-    parser.add_argument("--d-root", type=Path, default=OUTPUT_ROOT / "personal_v2" / f"night-capture-{stamp}")
-    parser.add_argument("--e-root", type=Path, default=Path("E:/datasets/_for/_codex") / f"night-capture-{stamp}")
-    parser.add_argument("--d-budget-gib", type=float, default=60)
-    parser.add_argument("--e-budget-gib", type=float, default=60)
+    parser.add_argument("--output-root", type=Path,
+                        default=OUTPUT_ROOT / "fov30_gt_crop_capture" / f"capture-{stamp}")
+    parser.add_argument("--output-budget-gib", type=float, default=55)
     parser.add_argument("--min-free-gib", type=float, default=20)
     parser.add_argument("--initial-reserve-gib", type=float, default=8,
-                        help="200 秒整轮初始预留；20 秒轮按比例预留")
+                        help="200 秒整轮初始预留；其他允许时长按比例预留")
     parser.add_argument("--deadline-hours", type=float, default=8)
-    parser.add_argument("--fov", type=float, default=48)
-    parser.add_argument("--plan-json", type=Path, help="轮次 JSON 数组；省略时为 3 seed × 6 天气 × 200 秒")
+    parser.add_argument("--fov", type=float, default=30)
+    parser.add_argument("--plan-json", type=Path, required=True, help="版本化轮次 JSON 数组")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--plan-only", action="store_true", help="仅打印清单和当前容量，不创建输出或启动仿真")
     args = parser.parse_args()
     args.runtime_root = args.runtime_root.resolve()
-    roots = [args.d_root.resolve(), args.e_root.resolve()]
-    if roots[0].drive.upper() != "D:" or roots[1].drive.upper() != "E:":
-        parser.error("--d-root 必须在 D 盘，--e-root 必须在 E 盘")
-    if not roots[1].is_relative_to(Path("E:/datasets/_for/_codex").resolve()) or roots[1] == Path("E:/datasets/_for/_codex").resolve():
-        parser.error("--e-root 必须是 E:/datasets/_for/_codex 下的独立批次目录")
+    roots = [args.output_root.resolve()]
+    if roots[0] == Path(roots[0].anchor):
+        parser.error("--output-root 不能是磁盘根目录")
     plan = load_plan(args)
     if args.plan_only:
         manifest = existing_manifest(roots, args)

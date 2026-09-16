@@ -55,11 +55,24 @@ $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
   --duration 200 --seed 1 --output "..\output\tmp\module_based\v2-$stamp"
 
 .\ZqhjGame_Module_Based\run.cmd dataset_capture `
-  --weather Clear_Skies --duration 20 --seed 1 `
+  --weather Clear_Skies --duration 20 --seed 1 --fov 30 `
   --output "..\output\tmp\module_based\capture-$stamp"
 ```
 
-逐条运行并等待上一轮结束；V2 和采集入口自行管理本轮 UE。V2 仍由 V1 控制，视觉仅在旁路观察；采集使用 `oracle_identity` 与 `ideal_positions`，可见性未经人工标注。已有输出不会用作新的采集目录。
+逐条运行并等待上一轮结束；V2 和采集入口自行管理本轮 UE。V2 仍由 V1 控制，视觉仅在旁路观察；采集使用 `oracle_identity` 与 `ideal_positions`，可见性未经人工标注。已有输出不会用作新的采集目录。FOV30 采集会额外记录飞机姿态、协同状态、`camera_calibration.json` 和 `dataset/coop_pairs.jsonl`；相机参数仍是基于未验证假设的推导值。
+
+已有 FOV30 批次可直接导出严格的双机 pair 数据集，不需要重新采集。下面命令处理 `runs` 下的全部 run；默认剔除任一侧缺框、缺位姿/姿态/真值、时间差超过 0.1 秒以及触边框的 pair：
+
+```powershell
+$pairOutput = 'E:\datasets\fov30-red-m-0916-paired-strict'
+.\ZqhjGame_Module_Based\run.cmd coop_pair_dataset `
+  --source-root 'E:\datasets\fov30-red-m-0916\runs' `
+  --output-root $pairOutput `
+  --image-mode hardlink `
+  --max-time-delta-s 0.1
+```
+
+硬链接要求源图和输出目录位于同一磁盘卷。只处理一个 run 时加 `--run-names seed01-clear-skies-150s-fov30`；需要保留触边框时加 `--keep-edge`。训练/验证划分必须按输出标签中的 `run + session_id` 分组，不能随机拆相邻帧。
 
 非默认目录可在模块名前指定 `--sim-root <SDK目录> --runtime-root <完整发行包目录>`。当前兼容基准为官方 `79b91d2336b61fee901b1342fbdd99a83ee15f40`，保留 OpenSim 2.0.4 官方更新。
 

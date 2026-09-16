@@ -1,0 +1,50 @@
+[
+  {
+    "run_id": "seed01-clear-skies-150s-fov30",
+    "weather": "Clear_Skies",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  },
+  {
+    "run_id": "seed01-partly-cloudy-150s-fov30",
+    "weather": "Partly_Cloudy",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  },
+  {
+    "run_id": "seed01-rain-150s-fov30",
+    "weather": "Rain",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  },
+  {
+    "run_id": "seed01-foggy-150s-fov30",
+    "weather": "Foggy",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  },
+  {
+    "run_id": "seed01-snow-light-150s-fov30",
+    "weather": "Snow_Light",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  },
+  {
+    "run_id": "seed01-sand-dust-calm-150s-fov30",
+    "weather": "Sand_Dust_Calm",
+    "seed": 1,
+    "duration": 150,
+    "fov": 30,
+    "stage": "runs"
+  }
+]
