@@ -1,3 +1,6 @@
+# 修改时间：2026-09-17。
+# 修改目的：修正姿态时间戳与缺失 FOV 来源元数据的可审计语义。
+# 修改内容：声明 SDK 解析时间戳只作来源信息，并在 FOV 均缺失时不伪造来源字段。
 # 修改时间：2026-09-16。
 # 修改目的：为采集帧补充同一 sim:state 时刻的完整机体与云台姿态。
 # 修改内容：原子记录位置、三轴姿态和云台 pan/tilt/FOV，并保留旧姿态字段兼容性。
@@ -32,8 +35,10 @@ def _entity_raw(entity: Any) -> Mapping[str, Any]:
     return raw if isinstance(raw, Mapping) else {}
 
 
-def _number(mapping: Mapping[str, Any], key: str) -> float | None:
+def _number(mapping: Mapping[str, Any], key: str | None) -> float | None:
     """读取原始数值；缺字段时保留 None，不采用 SDK 的零值回退。"""
+    if key is None:
+        return None
     value = mapping.get(key)
     if value is None:
         return None
@@ -93,7 +98,8 @@ def gimbal_state(entity: Any) -> dict[str, Any]:
     raw = _entity_raw(entity)
     gimbal = raw.get("gimbal_tracking", {})
     gimbal = gimbal if isinstance(gimbal, Mapping) else {}
-    fov_key = "fov" if gimbal.get("fov") is not None else "fov_deg"
+    fov_key = ("fov" if gimbal.get("fov") is not None
+               else "fov_deg" if gimbal.get("fov_deg") is not None else None)
     values = {
         "pan": _number(gimbal, "pan_angle"),
         "tilt": _number(gimbal, "tilt_angle"),
@@ -139,6 +145,10 @@ def world_state_pose_sample(world_state: Any, uid: str) -> dict[str, Any]:
         "uid": str(uid),
         "sim_time": float(getattr(world_state, "sim_time")),
         "state_timestamp": float(timestamp) if timestamp is not None else None,
+        "state_timestamp_source": "world_state.timestamp_sdk_parsed",
+        "state_timestamp_semantics": "wall_clock_or_simulation_epoch_seconds_unresolved",
+        "state_timestamp_usage": "provenance_only_not_frame_alignment",
+        "state_timestamp_presence_status": "schema_required_sdk_presence_not_preserved",
         "capture_pose": pose,
         "aircraft_attitude": pose["aircraft_attitude"],
     }
@@ -167,6 +177,11 @@ def add_frame_capture_pose(frame_row: Mapping[str, Any], state_row: Mapping[str,
     row["capture_pose_alignment"] = str(alignment)
     row["capture_pose_state_sim_time"] = float(state_row["sim_time"])
     row["capture_pose_state_timestamp"] = state_row.get("state_timestamp")
+    row["capture_pose_state_timestamp_source"] = state_row.get("state_timestamp_source")
+    row["capture_pose_state_timestamp_semantics"] = state_row.get("state_timestamp_semantics")
+    row["capture_pose_state_timestamp_usage"] = state_row.get("state_timestamp_usage")
+    row["capture_pose_state_timestamp_presence_status"] = state_row.get(
+        "state_timestamp_presence_status")
     return row
 
 

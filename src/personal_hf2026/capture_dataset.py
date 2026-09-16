@@ -1,3 +1,6 @@
+# 修改时间：2026-09-17。
+# 修改目的：保证 exact 对齐时间差与保存的状态时刻严格一致。
+# 修改内容：exact 分支返回真实浮点时间差，并为缺失姿态补齐时间戳说明字段。
 # 修改时间：2026-09-16。
 # 修改目的：让每张采集图像携带同一世界状态时刻的完整机体与云台姿态。
 # 修改内容：对齐 capture_pose 原子快照并统计完整率，同时保留原有 source_pose 和 aircraft_attitude。
@@ -109,7 +112,7 @@ def aligned_pose_state(history, times, source, max_delta_s=0.25):
     if before is None and after is None:
         return None, None, None, None
     if before is after:
-        return before, "exact", 0.0, 0.0
+        return before, "exact", float(before["sim_time"]) - source, 0.0
     candidates = [row for row in (before, after) if row is not None]
     selected = min(candidates, key=lambda row: abs(float(row["sim_time"]) - source))
     delta = float(selected["sim_time"]) - source
@@ -203,12 +206,20 @@ def build_index(output):
                 row, pose_state["aircraft_attitude"], pose_alignment)
             row.update(capture_pose=None, capture_pose_alignment=None,
                        capture_pose_state_sim_time=None,
-                       capture_pose_state_timestamp=None)
+                       capture_pose_state_timestamp=None,
+                       capture_pose_state_timestamp_source=None,
+                       capture_pose_state_timestamp_semantics=None,
+                       capture_pose_state_timestamp_usage=None,
+                       capture_pose_state_timestamp_presence_status=None)
         else:
             row.update(aircraft_attitude=None, aircraft_attitude_alignment=None,
                        capture_pose=None, capture_pose_alignment=None,
                        capture_pose_state_sim_time=None,
-                       capture_pose_state_timestamp=None)
+                       capture_pose_state_timestamp=None,
+                       capture_pose_state_timestamp_source=None,
+                       capture_pose_state_timestamp_semantics=None,
+                       capture_pose_state_timestamp_usage=None,
+                       capture_pose_state_timestamp_presence_status=None)
         row["aircraft_attitude_time_delta_s"] = pose_delta
         row["aircraft_attitude_bracket_gap_s"] = pose_gap
         row["capture_pose_time_delta_s"] = pose_delta
