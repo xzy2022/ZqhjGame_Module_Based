@@ -1,0 +1,124 @@
+{
+  "_comment": "相机变焦与云台姿态速度专项场景：单机静止、三辆静止目标车；名义光轴为北向下俯 45 度。",
+  "config_version": "1.0",
+  "simulation": {
+    "tick_rate_hz": 60,
+    "time_scale": 1,
+    "redis_host": "127.0.0.1",
+    "redis_port": 6379,
+    "redis_command_channel": "sim:commands",
+    "redis_state_channel": "sim:state",
+    "auto_start": false,
+    "seed": 0
+  },
+  "entities": [
+    {
+      "id": "20001",
+      "name": "camera_probe_uav",
+      "type": "FixedWingUAV",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.0,
+        "initial_longitude": 125.0,
+        "initial_altitude": 500,
+        "initial_heading": 0,
+        "initial_velocity": 0
+      },
+      "components": {
+        "kinematics": {
+          "type": "KinematicsComponent",
+          "enabled": true,
+          "params": {
+            "min_speed": 0,
+            "max_speed": 40,
+            "max_bank_angle_deg": 45
+          }
+        },
+        "gimbal_tracking": {
+          "type": "GimbalTrackingComponent",
+          "enabled": true,
+          "params": {
+            "pan_rate_limit_dps": 60,
+            "tilt_rate_limit_dps": 45,
+            "auto_track": false,
+            "fov": 48
+          }
+        },
+        "comm": {
+          "type": "CommComponent",
+          "enabled": true,
+          "params": {}
+        }
+      }
+    },
+    {
+      "id": "10001",
+      "name": "camera_probe_target_a",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.007483612,
+        "initial_longitude": 125.0,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 0,
+            "speed_jitter": 0,
+            "waypoints": []
+          }
+        }
+      }
+    },
+    {
+      "id": "10002",
+      "name": "camera_probe_target_b",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.00349975,
+        "initial_longitude": 124.998629756,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 0,
+            "speed_jitter": 0,
+            "waypoints": []
+          }
+        }
+      }
+    },
+    {
+      "id": "10003",
+      "name": "camera_probe_target_c",
+      "type": "TargetVehicle",
+      "enabled": true,
+      "params": {
+        "initial_latitude": 27.00349975,
+        "initial_longitude": 125.001370244,
+        "initial_altitude": 0
+      },
+      "components": {
+        "trajectory": {
+          "type": "TargetTrajectoryComponent",
+          "enabled": true,
+          "params": {
+            "speed": 0,
+            "speed_jitter": 0,
+            "waypoints": []
+          }
+        }
+      }
+    }
+  ],
+  "weather": {
+    "type": "Clear_Skies"
+  }
+}
