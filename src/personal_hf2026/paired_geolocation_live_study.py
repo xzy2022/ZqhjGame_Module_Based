@@ -1,4 +1,7 @@
 # 修改时间：2026-09-16。
+# 修改目的：让全部合格双机估计可记录，并按裁判一赫兹限制持续上报最新结果。
+# 修改内容：桥接估计候选、替换协同阶段旧单机上报并分别统计候选、命令和限额落盘。
+# 修改时间：2026-09-16。
 # 修改目的：为实时双机定位补齐可离线审计的图像接收与状态取样时刻。
 # 修改内容：记录 Redis 首次读取、本机单调时钟、上下文发布及姿态真值样本时间。
 # 修改时间：2026-09-16。
@@ -8,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 from pathlib import Path
@@ -19,6 +23,7 @@ import time
 import redis
 
 from competition.sdk.core.runner import ScenarioConfig
+from competition.sdk.core.commands import report_target
 
 from .control_test_runner import IdealPerceptionCoopDecoyRunner
 from .dropout_capture import StudyRenderer
@@ -53,6 +58,7 @@ class RedisFrameBridge:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._seen = {}
+        self._report_candidates = []
         self._error = None
 
     def _read_latest(self, uid):
@@ -92,6 +98,20 @@ class RedisFrameBridge:
         if self._error is not None:
             raise RuntimeError("实时 Redis 帧评估失败") from self._error
 
+    def drain_report_candidates(self, reporter_uid):
+        """取走分配给该主机的全部新估计；正式上报限速由 runner 负责。"""
+        reporter_uid = str(reporter_uid)
+        with self._lock:
+            selected = [
+                row for row in self._report_candidates
+                if str(row["views"]["master"]["uid"]) == reporter_uid
+            ]
+            self._report_candidates = [
+                row for row in self._report_candidates
+                if str(row["views"]["master"]["uid"]) != reporter_uid
+            ]
+        return selected
+
     def _loop(self):
         while not self._stop.is_set():
             try:
@@ -112,7 +132,10 @@ class RedisFrameBridge:
                                  if world_time is not None else None)
                         context["pose_time_delta_s"] = delta
                         context["world_truth_time_delta_s"] = delta
-                        self.evaluator.observe_frame(uid, frame, context)
+                        records = self.evaluator.observe_frame(uid, frame, context)
+                        if records:
+                            with self._lock:
+                                self._report_candidates.extend(records)
             except BaseException as exc:
                 self._error = exc
                 self._stop.set()
@@ -139,7 +162,77 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
         self.bridge = None
         self.world_context = {}
         self.live_summary = None
+        self.report_counts = Counter()
+        self._pending_reports = {}
+        self._last_report_sim_time = {}
+        self._report_written_bytes = 0
+        self._report_stream = (
+            self.output / "paired_geolocation_reports.jsonl").open(
+                "x", encoding="utf-8", buffering=1)
         self._closed = False
+
+    def _write_report_command(self, record, reporter_uid, sim_time):
+        audit = {
+            "schema_version": 1,
+            "kind": "formal_report_target_command",
+            "estimate_index": record["estimate_index"],
+            "reporter_uid": str(reporter_uid),
+            "target_id": record["target_id"],
+            "sim_time": sim_time,
+            "estimate": record["estimate"],
+            "judge_acceptance": "unknown_until_evaluation_json",
+        }
+        line = json.dumps(
+            audit, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        size = len(line.encode("utf-8"))
+        if self.report_counts["report_records_written"] >= self.evaluator.max_records:
+            self.report_counts["report_records_suppressed_record_limit"] += 1
+            return
+        if self._report_written_bytes + size > self.evaluator.max_output_bytes:
+            self.report_counts["report_records_suppressed_byte_limit"] += 1
+            return
+        self._report_stream.write(line)
+        self._report_written_bytes += size
+        self.report_counts["report_records_written"] += 1
+
+    def _append_paired_report(self, commands, entity_uid, coordinator, sim_time):
+        if self.bridge is None:
+            return commands
+        candidates = self.bridge.drain_report_candidates(entity_uid)
+        for record in candidates:
+            key = str(record["target_id"])
+            if key in self._pending_reports:
+                self.report_counts["candidates_superseded_before_1hz"] += 1
+            self._pending_reports[key] = record
+            self.report_counts["candidates_received"] += 1
+
+        if coordinator.phase != coordinator.ACTIVE:
+            for key, record in list(self._pending_reports.items()):
+                if str(record["views"]["master"]["uid"]) == str(entity_uid):
+                    self._pending_reports.pop(key)
+                    self.report_counts["candidates_discarded_after_active"] += 1
+            return commands
+        if coordinator.role != coordinator.MASTER:
+            return commands
+
+        due = []
+        for target_id, record in self._pending_reports.items():
+            if str(record["views"]["master"]["uid"]) != str(entity_uid):
+                continue
+            last = self._last_report_sim_time.get(target_id)
+            if last is None or sim_time - last >= 1.0:
+                due.append((last if last is not None else -float("inf"), target_id, record))
+        if not due:
+            return commands
+        _, target_id, record = min(due, key=lambda item: (item[0], item[1]))
+        estimate = record["estimate"]
+        commands.append(report_target(
+            float(estimate["lat"]), float(estimate["lon"]), target_id))
+        self._last_report_sim_time[target_id] = sim_time
+        self._pending_reports.pop(target_id, None)
+        self.report_counts["report_commands_emitted"] += 1
+        self._write_report_command(record, entity_uid, sim_time)
+        return commands
 
     def run(self):
         # 旁路和 UE 必须在本轮 Redis 退出前收尾，否则无法发送 UE shutdown。
@@ -233,6 +326,22 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
                 }
                 self.bridge.update_context(entity_uid, context)
                 self.bridge.ensure_healthy()
+                if coordinator.phase == coordinator.ACTIVE:
+                    legacy_count = sum(
+                        getattr(command, "verb", None) == "agent.report"
+                        for command in commands)
+                    if legacy_count:
+                        commands = [
+                            command for command in commands
+                            if getattr(command, "verb", None) != "agent.report"
+                        ]
+                        self.report_counts[
+                            "legacy_report_commands_suppressed"] += legacy_count
+                sim_time = world.get("world_sim_time")
+                if sim_time is None:
+                    sim_time = agent._t
+                commands = self._append_paired_report(
+                    commands, entity_uid, coordinator, float(sim_time))
             return commands
 
         agent.decide = observed_decide
@@ -260,6 +369,12 @@ class PairedGeolocationLiveRunner(IdealPerceptionCoopDecoyRunner):
                     self.live_summary = result
             except BaseException as exc:
                 errors.append(exc)
+        self.report_counts["pending_reports_at_close"] = len(self._pending_reports)
+        self.report_counts["report_written_bytes"] = self._report_written_bytes
+        try:
+            self._report_stream.close()
+        except BaseException as exc:
+            errors.append(exc)
         if errors:
             raise errors[0]
 
@@ -317,6 +432,11 @@ def main(argv=None):
         "max_records": args.max_records,
         "max_output_bytes": args.max_output_bytes,
         "time_alignment": "nearest_current_state_unverified",
+        "formal_reporting": {
+            "policy": "latest_qualifying_estimate_per_target_at_most_1hz",
+            "legacy_personal_v1_reports_suppressed_during_coop_active": True,
+            "judge_acceptance_source": "evaluation_json_n_reports",
+        },
         "redis": {"host": args.redis_host, "port": args.redis_port},
         "output": str(output),
         "git_branch": subprocess.check_output(
@@ -367,6 +487,7 @@ def main(argv=None):
                 "frames_strict_cooperation": counts.get("frames_strict_cooperation", 0),
                 "estimates_produced": counts.get("estimates_produced", 0),
                 "records_written": counts.get("records_written", 0),
+                **dict(sorted(runner.report_counts.items())),
             },
         )
     except BaseException as exc:
