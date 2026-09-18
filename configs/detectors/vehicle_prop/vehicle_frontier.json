@@ -1,0 +1,32 @@
+{
+  "weights": "assets/vehicle_prop/yolo26s_two_class.pt",
+  "sha256": "de1736560d235151c031063876fdcf6a1b1ec8a2857dcf47cd72177c1d81a1f6",
+  "detector": {
+    "imgsz": 2048,
+    "flip": true,
+    "tile_size": 0,
+    "tile_imgsz": 1024,
+    "iou": 0.5,
+    "merge": "weighted",
+    "full_frame": true
+  },
+  "views": "flip",
+  "tracker": {
+    "high": 0.5,
+    "low": 0.25,
+    "background_power": 0.0,
+    "use_motion": true,
+    "smoothing": 0.85,
+    "recovery": true,
+    "distance_gate": 1.8,
+    "min_high_hits": 2,
+    "low_distance_gate": 1.0
+  },
+  "unknown_threshold": 0.6,
+  "class_names": [
+    "real_vehicle",
+    "model_prop"
+  ],
+  "selection": "Foggy end-to-end class macro F1 among candidates within 1.5 percentage points of best detection F1. Optional frozen-feature blend chosen on Foggy only.",
+  "historical_test_note": "Sand_Dust_Calm was seen in previous work; this is a historical holdout, not a fresh blind test."
+}
