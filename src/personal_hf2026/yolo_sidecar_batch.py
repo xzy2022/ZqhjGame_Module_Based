@@ -1,4 +1,7 @@
 # 修改时间：2026-09-18。
+# 修改目的：避免空结果或部分收尾的单轮被批次误判为成功。
+# 修改内容：收紧 FOV 和种子范围，并核验两份摘要、worker 状态、三机完成覆盖及 JSONL 计数闭合。
+# 修改时间：2026-09-18。
 # 修改目的：让批量计划显式保留核心 runner 已确认的模型配置与设备参数。
 # 修改内容：新增可选 --config 和默认设备 0，并把实际值写入计划与子命令。
 # 修改时间：2026-09-18。
@@ -69,10 +72,91 @@ def validate_args(args, parser):
         parser.error(f"--output 必须位于 {allowed_output_root} 下")
     if args.duration <= 0:
         parser.error("--duration 必须大于 0")
-    if args.fov <= 0:
-        parser.error("--fov 必须大于 0")
+    if not 5 <= args.fov <= 50:
+        parser.error("--fov 必须位于比赛允许的 [5, 50] 度范围")
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("--seeds 不能重复")
+    if any(seed < 0 for seed in args.seeds):
+        parser.error("--seeds 不能为负数")
+
+
+def count_jsonl_records(path):
+    with path.open("r", encoding="utf-8-sig") as stream:
+        return sum(bool(line.strip()) for line in stream)
+
+
+def validate_run_output(run_output):
+    results_path = run_output / RESULTS_NAME
+    submissions_path = run_output / "yolo_sidecar_submissions.jsonl"
+    summary_path = run_output / "summary.json"
+    sidecar_summary_path = run_output / "yolo_sidecar_summary.json"
+    required = (results_path, submissions_path, summary_path, sidecar_summary_path)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        return {"ok": False, "reasons": ["missing_required_artifact"], "missing": missing}
+
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
+        sidecar = json.loads(sidecar_summary_path.read_text(encoding="utf-8-sig"))
+        results_rows = count_jsonl_records(results_path)
+        submission_rows = count_jsonl_records(submissions_path)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        return {"ok": False, "reasons": [f"artifact_read_failed:{type(error).__name__}:{error}"]}
+
+    reasons = []
+    worker = sidecar.get("worker", {})
+    counts = sidecar.get("counts", {})
+    expected_uids = [str(uid) for uid in counts.get("expected_uids", [])]
+    completed_by_uid = {
+        str(uid): value for uid, value in counts.get("completed_by_uid", {}).items()
+    }
+    completed = counts.get("completed")
+    submitted = counts.get("submitted")
+    final_status = counts.get("by_final_status", {})
+    if summary.get("status") != "completed":
+        reasons.append("summary_not_completed")
+    if not summary.get("sidecar_ok"):
+        reasons.append("summary_sidecar_not_ok")
+    if not worker.get("ready"):
+        reasons.append("worker_not_ready")
+    if worker.get("errors"):
+        reasons.append("worker_has_errors")
+    if worker.get("exitcode") != 0:
+        reasons.append("worker_nonzero_exit")
+    if not isinstance(completed, int) or completed <= 0:
+        reasons.append("no_completed_results")
+    if len(expected_uids) != 3:
+        reasons.append("expected_uids_not_three")
+    if any(completed_by_uid.get(uid, 0) <= 0 for uid in expected_uids):
+        reasons.append("not_all_uids_completed")
+    if isinstance(completed, int) and sum(completed_by_uid.values()) != completed:
+        reasons.append("completed_by_uid_mismatch")
+    if isinstance(completed, int) and results_rows != completed:
+        reasons.append("results_row_count_mismatch")
+    if isinstance(submitted, int) and submission_rows != submitted:
+        reasons.append("submissions_row_count_mismatch")
+    if isinstance(submitted, int) and sum(final_status.values()) != submitted:
+        reasons.append("final_status_count_mismatch")
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "summary_status": summary.get("status"),
+        "sidecar_ok": summary.get("sidecar_ok"),
+        "worker": {
+            "ready": worker.get("ready"),
+            "errors": worker.get("errors"),
+            "exitcode": worker.get("exitcode"),
+        },
+        "counts": {
+            "expected_uids": expected_uids,
+            "submitted": submitted,
+            "submission_rows": submission_rows,
+            "completed": completed,
+            "result_rows": results_rows,
+            "completed_by_uid": completed_by_uid,
+            "by_final_status": final_status,
+        },
+    }
 
 
 def child_command(item, args):
@@ -184,13 +268,15 @@ def execute(plan, args):
                 check=False,
             )
         results_path = run_output / RESULTS_NAME
+        validation = validate_run_output(run_output)
         record.update(
             returncode=completed.returncode,
             results=str(results_path),
             results_present=results_path.is_file(),
+            validation=validation,
             status=(
                 "completed"
-                if completed.returncode == 0 and results_path.is_file()
+                if completed.returncode == 0 and validation["ok"]
                 else "failed"
             ),
             finished_at=utc_now(),

@@ -1,4 +1,7 @@
 # 修改时间：2026-09-18。
+# 修改目的：把全部已提交图像的去重证据与仅完成推理的检测样本严格分开。
+# 修改内容：新增 submissions 全量哈希统计及逐无人机口径，并将 results 哈希明确标为 completed-only。
+# 修改时间：2026-09-18。
 # 修改目的：让人读报告直接呈现两随机种子的分天气波动范围与去重判断阈值。
 # 修改内容：在天气表加入 Precision、Recall 的轮次范围，并记录连续重复率百分之五的机械判断口径。
 # 修改时间：2026-09-18。
@@ -120,6 +123,7 @@ class Accumulator:
         self.missing_hash = 0
         self.unique_hash_keys = set()
         self.repeated_hashes = 0
+        self.hash_comparisons = 0
         self.consecutive_repeated_hashes = 0
         self.consecutive_repeat_wall_ms = 0.0
         self.last_hash_by_stream = {}
@@ -155,6 +159,8 @@ class Accumulator:
             self.repeated_hashes += 1
         else:
             self.unique_hash_keys.add(key)
+        if stream in self.last_hash_by_stream:
+            self.hash_comparisons += 1
         if self.last_hash_by_stream.get(stream) == image_hash:
             self.consecutive_repeated_hashes += 1
             if finite_number(wall_ms) and wall_ms >= 0:
@@ -173,6 +179,7 @@ class Accumulator:
         self.missing_hash += other.missing_hash
         self.unique_hash_keys.update(other.unique_hash_keys)
         self.repeated_hashes += other.repeated_hashes
+        self.hash_comparisons += other.hash_comparisons
         self.consecutive_repeated_hashes += other.consecutive_repeated_hashes
         self.consecutive_repeat_wall_ms += other.consecutive_repeat_wall_ms
 
@@ -180,15 +187,9 @@ class Accumulator:
         fp = self.predictions - self.tp
         fn = self.gt - self.tp
         duplicate_rate = safe_ratio(self.repeated_hashes, self.rows_with_hash)
-        consecutive_rate = safe_ratio(self.consecutive_repeated_hashes, self.rows_with_hash)
+        consecutive_rate = safe_ratio(self.consecutive_repeated_hashes, self.hash_comparisons)
         wall_total = sum(self.wall_ms)
         repeat_wall_share = safe_ratio(self.consecutive_repeat_wall_ms, wall_total)
-        if consecutive_rate is None:
-            assessment = "insufficient_hash_evidence"
-        elif consecutive_rate >= 0.05:
-            assessment = "worth_considering_exact_hash_dedup"
-        else:
-            assessment = "not_supported_by_current_exact_hash_evidence"
         return {
             "frames": self.frames,
             "ground_truth_objects": self.gt,
@@ -208,18 +209,112 @@ class Accumulator:
                 "hash_rows": self.rows_with_hash,
                 "missing_hash_rows": self.missing_hash,
             },
-            "exact_hash_reuse": {
+            "completed_result_hashes": {
+                "evidence_scope": "completed_inference_results_only_not_dedup_decision_basis",
                 "scope": "same_run_and_uav",
                 "unique_hashes": len(self.unique_hash_keys),
                 "repeated_hash_rows": self.repeated_hashes,
                 "repeated_hash_rate": duplicate_rate,
+                "consecutive_comparisons": self.hash_comparisons,
                 "consecutive_repeated_hash_rows": self.consecutive_repeated_hashes,
                 "consecutive_repeated_hash_rate": consecutive_rate,
                 "consecutive_repeat_inference_wall_ms": self.consecutive_repeat_wall_ms,
                 "consecutive_repeat_wall_time_share": repeat_wall_share,
-                "assessment_threshold": "consecutive_repeated_hash_rate >= 0.05",
-                "assessment": assessment,
             },
+        }
+
+
+class SubmissionHashAccumulator:
+    """按提交顺序统计全量输入；同一轮同一无人机之间才允许连续比较。"""
+
+    def __init__(self):
+        self.rows = 0
+        self.rows_with_hash = 0
+        self.missing_identity_or_hash = 0
+        self.unique_hash_keys = set()
+        self.repeated_hashes = 0
+        self.comparisons = 0
+        self.consecutive_same_hash = 0
+        self.consecutive_same_frame_no = 0
+        self.consecutive_sim_gap_s = []
+        self.same_hash_sim_gap_s = []
+        self.last_by_stream = {}
+
+    def add(self, row, run_id):
+        self.rows += 1
+        uid = row.get("uid", row.get("uav_id"))
+        image_hash = row.get("image_sha256", row.get("image_hash"))
+        if uid is None or not image_hash:
+            self.missing_identity_or_hash += 1
+            return
+        self.rows_with_hash += 1
+        stream = (run_id, str(uid))
+        key = (*stream, str(image_hash))
+        if key in self.unique_hash_keys:
+            self.repeated_hashes += 1
+        else:
+            self.unique_hash_keys.add(key)
+
+        previous = self.last_by_stream.get(stream)
+        if previous is not None:
+            self.comparisons += 1
+            same_hash = previous["image_hash"] == image_hash
+            if same_hash:
+                self.consecutive_same_hash += 1
+            frame_no = row.get("frame_no")
+            if frame_no is not None and frame_no == previous["frame_no"]:
+                self.consecutive_same_frame_no += 1
+            received = row.get("image_received_sim_time")
+            if (finite_number(received)
+                    and finite_number(previous["image_received_sim_time"])
+                    and received >= previous["image_received_sim_time"]):
+                gap = float(received - previous["image_received_sim_time"])
+                self.consecutive_sim_gap_s.append(gap)
+                if same_hash:
+                    self.same_hash_sim_gap_s.append(gap)
+        self.last_by_stream[stream] = {
+            "image_hash": image_hash,
+            "frame_no": row.get("frame_no"),
+            "image_received_sim_time": row.get("image_received_sim_time"),
+        }
+
+    def merge(self, other):
+        self.rows += other.rows
+        self.rows_with_hash += other.rows_with_hash
+        self.missing_identity_or_hash += other.missing_identity_or_hash
+        self.unique_hash_keys.update(other.unique_hash_keys)
+        self.repeated_hashes += other.repeated_hashes
+        self.comparisons += other.comparisons
+        self.consecutive_same_hash += other.consecutive_same_hash
+        self.consecutive_same_frame_no += other.consecutive_same_frame_no
+        self.consecutive_sim_gap_s.extend(other.consecutive_sim_gap_s)
+        self.same_hash_sim_gap_s.extend(other.same_hash_sim_gap_s)
+
+    def result(self):
+        consecutive_rate = safe_ratio(self.consecutive_same_hash, self.comparisons)
+        if consecutive_rate is None:
+            assessment = "insufficient_submission_hash_evidence"
+        elif consecutive_rate >= 0.05:
+            assessment = "worth_considering_exact_hash_dedup"
+        else:
+            assessment = "not_supported_by_current_exact_hash_evidence"
+        return {
+            "evidence_scope": "all_accepted_submissions_before_newest_only_supersession",
+            "scope": "same_run_and_uav",
+            "submission_rows": self.rows,
+            "hash_rows": self.rows_with_hash,
+            "missing_identity_or_hash_rows": self.missing_identity_or_hash,
+            "unique_hashes": len(self.unique_hash_keys),
+            "repeated_hash_rows": self.repeated_hashes,
+            "repeated_hash_rate": safe_ratio(self.repeated_hashes, self.rows_with_hash),
+            "consecutive_comparisons": self.comparisons,
+            "consecutive_same_hash": self.consecutive_same_hash,
+            "consecutive_same_hash_rate": consecutive_rate,
+            "consecutive_same_frame_no": self.consecutive_same_frame_no,
+            "consecutive_sim_gap_s": distribution(self.consecutive_sim_gap_s),
+            "same_hash_sim_gap_s": distribution(self.same_hash_sim_gap_s),
+            "assessment_threshold": "consecutive_same_hash_rate >= 0.05",
+            "assessment": assessment,
         }
 
 
@@ -293,8 +388,12 @@ def analyze(input_path, iou_threshold):
     overall = Accumulator()
     by_weather = defaultdict(Accumulator)
     by_uav = defaultdict(Accumulator)
+    overall_submissions = SubmissionHashAccumulator()
+    by_weather_submissions = defaultdict(SubmissionHashAccumulator)
+    by_uav_submissions = defaultdict(SubmissionHashAccumulator)
     run_results = []
     missing_runs = []
+    missing_submission_logs = []
     for item in discovered:
         results_path = item["output"] / RESULTS_NAME
         if not results_path.is_file():
@@ -304,6 +403,20 @@ def analyze(input_path, iou_threshold):
         metadata = metadata_for(item["output"])
         weather = item["weather"] or metadata.get("weather") or metadata.get("requested_weather") or "unknown"
         seed = item["seed"] if item["seed"] is not None else metadata.get("seed")
+        submissions_path = item["output"] / "yolo_sidecar_submissions.jsonl"
+        run_submissions = SubmissionHashAccumulator()
+        if submissions_path.is_file():
+            for row in iter_rows(submissions_path):
+                run_submissions.add(row, item["run_id"])
+                uav_id = str(row.get("uid", row.get("uav_id", "unknown")))
+                by_uav_submissions[uav_id].add(row, item["run_id"])
+            overall_submissions.merge(run_submissions)
+            by_weather_submissions[str(weather)].merge(run_submissions)
+        else:
+            missing_submission_logs.append({
+                "run_id": item["run_id"],
+                "path": str(submissions_path),
+            })
         for row in iter_rows(results_path):
             accumulator.add(row, item["run_id"], iou_threshold)
             uav_id = str(row.get("uid", row.get("uav_id", "unknown")))
@@ -317,6 +430,9 @@ def analyze(input_path, iou_threshold):
                 "seed": seed,
                 "results": str(results_path),
                 "metrics": accumulator.result(),
+                "submission_hashes": (
+                    run_submissions.result() if submissions_path.is_file() else None
+                ),
             }
         )
 
@@ -325,6 +441,7 @@ def analyze(input_path, iou_threshold):
         runs = [item for item in run_results if str(item["weather"]) == weather]
         weather_results[weather] = {
             "aggregate": accumulator.result(),
+            "submission_hashes": by_weather_submissions[weather].result(),
             "run_stability": {
                 "run_count": len(runs),
                 "precision": metric_range(runs, "precision"),
@@ -356,12 +473,23 @@ def analyze(input_path, iou_threshold):
             "ground_truth": "runner 记录的 UE 真值投影框，仅用于开发审计",
             "detection_metrics": "当前对象检测不区分真车与诱饵，按类别无关 IoU 匹配",
             "simulation_latency": "完成仿真时间减接收仿真时间，不等同于墙钟推理延迟",
-            "hash": "仅统计同一轮同一无人机的精确哈希；建议只依据连续重复估算安全跳帧机会",
+            "hash": (
+                "去重判断使用 yolo_sidecar_submissions.jsonl 的全部已接受提交；"
+                "completed results 的哈希只描述实际推理子集"
+            ),
         },
         "planned_runs": len(discovered),
         "analyzed_runs": len(run_results),
         "missing_runs": missing_runs,
         "overall": overall.result(),
+        "submission_hash_evidence": {
+            "overall": overall_submissions.result(),
+            "by_uav": {
+                key: value.result()
+                for key, value in sorted(by_uav_submissions.items())
+            },
+            "missing_submission_logs": missing_submission_logs,
+        },
         "by_weather": weather_results,
         "by_uav": {key: value.result() for key, value in sorted(by_uav.items())},
         "runs": run_results,
@@ -409,19 +537,21 @@ def markdown(report):
             f"{number(metric['false_positives_per_frame'])} | "
             f"{number(metric['inference_wall_ms']['p95'])} |"
         )
-    hash_result = overall["exact_hash_reuse"]
+    hash_evidence = report["submission_hash_evidence"]
+    hash_result = hash_evidence["overall"]
     lines.extend(
         [
             "",
             "## 精确哈希去重证据",
             "",
-            f"- 有哈希的推理记录：{overall['field_coverage']['hash_rows']}",
+            f"- 全部已接受提交：{hash_result['submission_rows']}，其中有哈希 {hash_result['hash_rows']}",
             f"- 任意历史重复率：{percent(hash_result['repeated_hash_rate'])}",
-            f"- 连续重复率：{percent(hash_result['consecutive_repeated_hash_rate'])}",
-            f"- 连续重复推理墙钟占比：{percent(hash_result['consecutive_repeat_wall_time_share'])}",
+            f"- 同一轮同一无人机连续比较：{hash_result['consecutive_comparisons']}",
+            f"- 连续相同哈希率：{percent(hash_result['consecutive_same_hash_rate'])}",
+            f"- 连续相同哈希的仿真时间间隔 P50 / P95：{number(hash_result['same_hash_sim_gap_s']['p50'])} / {number(hash_result['same_hash_sim_gap_s']['p95'])} s",
             f"- 机械判断：`{hash_result['assessment']}`",
             "",
-            "该判断只针对精确相同且连续的图像；是否启用去重还需同时确认跳过后不会破坏结果新鲜度与控制时序。",
+            "该判断来自进入 newest-only 槽位前的全部 accepted submissions，而不是只看完成推理的子集。它只针对精确相同且连续的图像；是否启用去重还需确认跳过后不会破坏结果新鲜度与控制时序。",
             "",
             "## 证据边界",
             "",
@@ -431,6 +561,12 @@ def markdown(report):
     if report["missing_runs"]:
         lines.extend(["", "## 缺失轮次", ""])
         lines.extend(f"- {item['run_id']}：{item['output']}" for item in report["missing_runs"])
+    if hash_evidence["missing_submission_logs"]:
+        lines.extend(["", "## 缺失 submissions 日志", ""])
+        lines.extend(
+            f"- {item['run_id']}：{item['path']}"
+            for item in hash_evidence["missing_submission_logs"]
+        )
     return "\n".join(lines) + "\n"
 
 
