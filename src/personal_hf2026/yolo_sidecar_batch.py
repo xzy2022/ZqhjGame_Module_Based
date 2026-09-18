@@ -1,4 +1,7 @@
 # 修改时间：2026-09-18。
+# 修改目的：让三档在线 YOLO 方案按相同天气、种子和时长独立计划并保留完整身份链路。
+# 修改内容：新增 profile 与 TensorRT engine 传播，并校验每轮 metadata、summary 和结果行的方案一致性。
+# 修改时间：2026-09-18。
 # 修改目的：避免空结果或部分收尾的单轮被批次误判为成功。
 # 修改内容：收紧 FOV 和种子范围，并核验两份摘要、worker 状态、三机完成覆盖及 JSONL 计数闭合。
 # 修改时间：2026-09-18。
@@ -34,6 +37,7 @@ WEATHERS = (
 DEFAULT_LAYOUT = SCENARIO_ROOT / "static-decoys.json"
 RUNNER_MODULE = "yolo_sidecar_study"
 RESULTS_NAME = "yolo_sidecar_results.jsonl"
+YOLO_PROFILES = ("v1", "v2", "v3")
 
 
 def utc_now():
@@ -61,6 +65,8 @@ def validate_args(args, parser):
     args.layout = args.layout.resolve()
     args.runtime_root = args.runtime_root.resolve()
     args.output = args.output.resolve()
+    if args.trt_engine is not None:
+        args.trt_engine = args.trt_engine.resolve()
     if args.config is not None:
         args.config = args.config.resolve()
     allowed_output_root = OUTPUT_ROOT.resolve()
@@ -68,6 +74,8 @@ def validate_args(args, parser):
         parser.error(f"--layout 不存在：{args.layout}")
     if args.config is not None and not args.config.is_file():
         parser.error(f"--config 不存在：{args.config}")
+    if args.trt_engine is not None and not args.trt_engine.is_file():
+        parser.error(f"--trt-engine 不存在：{args.trt_engine}")
     if not is_relative_to(args.output, allowed_output_root):
         parser.error(f"--output 必须位于 {allowed_output_root} 下")
     if args.duration <= 0:
@@ -78,28 +86,59 @@ def validate_args(args, parser):
         parser.error("--seeds 不能重复")
     if any(seed < 0 for seed in args.seeds):
         parser.error("--seeds 不能为负数")
+    if len(set(args.yolo_profiles)) != len(args.yolo_profiles):
+        parser.error("--yolo-profiles 不能重复")
 
 
-def count_jsonl_records(path):
-    with path.open("r", encoding="utf-8-sig") as stream:
-        return sum(bool(line.strip()) for line in stream)
+def read_profile_trace(metadata, summary):
+    """提取核心 runner 冻结的实际方案；不在批次侧复制 profile 定义。"""
+    resources = metadata.get("resources") or summary.get("resources") or {}
+    return {
+        "yolo_profile": metadata.get("yolo_profile", summary.get("yolo_profile")),
+        "profile": resources.get("profile"),
+        "config_path": resources.get("config_path"),
+        "config_sha256": resources.get("config_sha256"),
+        "weights_path": resources.get("weights_path"),
+        "weights_sha256": resources.get("weights_sha256"),
+        "model_format": resources.get("model_format"),
+        "effective_options": resources.get("effective_options"),
+        "tracker_high_multiplier": resources.get("tracker_high_multiplier"),
+    }
 
 
-def validate_run_output(run_output):
+def validate_run_output(run_output, expected_profile):
     results_path = run_output / RESULTS_NAME
     submissions_path = run_output / "yolo_sidecar_submissions.jsonl"
+    metadata_path = run_output / "metadata.json"
     summary_path = run_output / "summary.json"
     sidecar_summary_path = run_output / "yolo_sidecar_summary.json"
-    required = (results_path, submissions_path, summary_path, sidecar_summary_path)
+    required = (
+        results_path,
+        submissions_path,
+        metadata_path,
+        summary_path,
+        sidecar_summary_path,
+    )
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         return {"ok": False, "reasons": ["missing_required_artifact"], "missing": missing}
 
     try:
         summary = json.loads(summary_path.read_text(encoding="utf-8-sig"))
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
         sidecar = json.loads(sidecar_summary_path.read_text(encoding="utf-8-sig"))
-        results_rows = count_jsonl_records(results_path)
-        submission_rows = count_jsonl_records(submissions_path)
+        result_profiles = []
+        with results_path.open("r", encoding="utf-8-sig") as stream:
+            for line in stream:
+                if line.strip():
+                    result_profiles.append(json.loads(line).get("yolo_profile"))
+        results_rows = len(result_profiles)
+        submission_profiles = []
+        with submissions_path.open("r", encoding="utf-8-sig") as stream:
+            for line in stream:
+                if line.strip():
+                    submission_profiles.append(json.loads(line).get("yolo_profile"))
+        submission_rows = len(submission_profiles)
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         return {"ok": False, "reasons": [f"artifact_read_failed:{type(error).__name__}:{error}"]}
 
@@ -113,6 +152,7 @@ def validate_run_output(run_output):
     completed = counts.get("completed")
     submitted = counts.get("submitted")
     final_status = counts.get("by_final_status", {})
+    profile_trace = read_profile_trace(metadata, summary)
     if summary.get("status") != "completed":
         reasons.append("summary_not_completed")
     if not summary.get("sidecar_ok"):
@@ -137,11 +177,26 @@ def validate_run_output(run_output):
         reasons.append("submissions_row_count_mismatch")
     if isinstance(submitted, int) and sum(final_status.values()) != submitted:
         reasons.append("final_status_count_mismatch")
+    if metadata.get("yolo_profile") != expected_profile:
+        reasons.append("metadata_profile_mismatch")
+    if summary.get("yolo_profile") != expected_profile:
+        reasons.append("summary_profile_mismatch")
+    if profile_trace["profile"] != expected_profile:
+        reasons.append("resource_profile_mismatch")
+    if any(profile != expected_profile for profile in result_profiles):
+        reasons.append("result_profile_mismatch")
+    if any(profile != expected_profile for profile in submission_profiles):
+        reasons.append("submission_profile_mismatch")
+    if not profile_trace["effective_options"]:
+        reasons.append("missing_effective_options")
+    if not profile_trace["model_format"]:
+        reasons.append("missing_model_format")
     return {
         "ok": not reasons,
         "reasons": reasons,
         "summary_status": summary.get("status"),
         "sidecar_ok": summary.get("sidecar_ok"),
+        "profile_trace": profile_trace,
         "worker": {
             "ready": worker.get("ready"),
             "errors": worker.get("errors"),
@@ -177,6 +232,8 @@ def child_command(item, args):
         str(args.layout),
         "--weather",
         item["weather"],
+        "--yolo-profile",
+        item["yolo_profile"],
         "--duration",
         str(args.duration),
         "--seed",
@@ -190,26 +247,30 @@ def child_command(item, args):
     ]
     if args.config is not None:
         command.extend(["--config", str(args.config)])
+    if args.trt_engine is not None and item["yolo_profile"] == "v3":
+        command.extend(["--trt-engine", str(args.trt_engine)])
     return command
 
 
 def build_plan(args):
     runs = []
-    for weather in args.weathers:
-        for seed in args.seeds:
-            run_id = f"{weather.lower()}-seed-{seed}"
-            item = {
-                "run_id": run_id,
-                "weather": weather,
-                "seed": seed,
-                "duration_s": args.duration,
-                "fov_deg": args.fov,
-                "output": str(args.output / "runs" / run_id),
-            }
-            item["command"] = child_command(item, args)
-            runs.append(item)
+    for profile in args.yolo_profiles:
+        for weather in args.weathers:
+            for seed in args.seeds:
+                run_id = f"{profile}-{weather.lower()}-seed-{seed}"
+                item = {
+                    "run_id": run_id,
+                    "yolo_profile": profile,
+                    "weather": weather,
+                    "seed": seed,
+                    "duration_s": args.duration,
+                    "fov_deg": args.fov,
+                    "output": str(args.output / "runs" / run_id),
+                }
+                item["command"] = child_command(item, args)
+                runs.append(item)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": utc_now(),
         "runner_module": RUNNER_MODULE,
         "results_name": RESULTS_NAME,
@@ -219,7 +280,9 @@ def build_plan(args):
         "duration_s": args.duration,
         "fov_deg": args.fov,
         "config": None if args.config is None else str(args.config),
+        "trt_engine": None if args.trt_engine is None else str(args.trt_engine),
         "device": args.device,
+        "yolo_profiles": list(args.yolo_profiles),
         "weathers": list(args.weathers),
         "seeds": list(args.seeds),
         "run_count": len(runs),
@@ -233,7 +296,7 @@ def execute(plan, args):
     logs.mkdir()
     write_json(args.output / "batch_plan.json", plan)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "running",
         "started_at": utc_now(),
         "plan": str(args.output / "batch_plan.json"),
@@ -245,6 +308,7 @@ def execute(plan, args):
         run_output = Path(item["output"])
         record = {
             "run_id": item["run_id"],
+            "yolo_profile": item["yolo_profile"],
             "weather": item["weather"],
             "seed": item["seed"],
             "output": item["output"],
@@ -255,7 +319,8 @@ def execute(plan, args):
         manifest["runs"].append(record)
         write_json(args.output / "batch_manifest.json", manifest)
         print(
-            f"[{index}/{plan['run_count']}] {item['weather']} seed={item['seed']}",
+            f"[{index}/{plan['run_count']}] {item['yolo_profile']} "
+            f"{item['weather']} seed={item['seed']}",
             flush=True,
         )
         # 单轮输出目录由 runner 排他创建；父批次日志独立保存，避免预创建导致 runner 拒绝启动。
@@ -268,7 +333,7 @@ def execute(plan, args):
                 check=False,
             )
         results_path = run_output / RESULTS_NAME
-        validation = validate_run_output(run_output)
+        validation = validate_run_output(run_output, item["yolo_profile"])
         record.update(
             returncode=completed.returncode,
             results=str(results_path),
@@ -310,7 +375,19 @@ def parser():
     result.add_argument("--seeds", nargs="+", type=int, default=(1, 2))
     result.add_argument("--duration", type=float, default=120.0)
     result.add_argument("--fov", type=float, default=48.0)
+    result.add_argument(
+        "--yolo-profiles",
+        nargs="+",
+        choices=YOLO_PROFILES,
+        default=YOLO_PROFILES,
+        help="要分别执行的在线方案；默认 v1 v2 v3，每档各执行天气×种子轮次",
+    )
     result.add_argument("--config", type=Path, help="传给核心 runner 的检测器配置")
+    result.add_argument(
+        "--trt-engine",
+        type=Path,
+        help="传给核心 runner 的 v3 TensorRT engine 覆盖路径",
+    )
     result.add_argument("--device", default="0", help="传给核心 runner 的推理设备")
     result.add_argument(
         "--execute",
