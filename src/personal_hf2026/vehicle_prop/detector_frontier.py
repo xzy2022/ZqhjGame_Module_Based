@@ -1,3 +1,6 @@
+# 修改时间：2026-09-18。
+# 修改目的：让在线 YOLO 档位只覆盖模型、翻转和高置信检测阈值。
+# 修改内容：为 FrontierPipeline 增加经过哈希校验的运行时权重、翻转与 tracker.high 覆盖入口。
 # 修改时间：2026-09-18
 # 修改目的：把队友交付的 FrontierPipeline 迁入可安装的 personal_hf2026 包。
 # 修改内容：改为包内相对导入和项目固定配置、权重路径，并保留检测与跟踪算法逻辑。
@@ -120,10 +123,20 @@ def arrays_for_tracker(candidates):
 
 
 class FrontierPipeline:
-    def __init__(self, config=None, device='0'):
+    def __init__(self, config=None, device='0', weights=None, weights_sha256=None,
+                 flip=None, tracker_high=None):
         self.config = json.loads(Path(config or CONFIG_PATH).read_text(encoding='utf-8'))
-        self.detector = FrontierDetector(PROJECT_ROOT/self.config['weights'], device=device,
-                                         expected_sha256=self.config['sha256'], **self.config['detector'])
+        weights_path = Path(weights).resolve() if weights is not None else (PROJECT_ROOT/self.config['weights']).resolve()
+        expected_sha256 = weights_sha256 if weights is not None else self.config['sha256']
+        if flip is not None:
+            self.config['detector']['flip'] = bool(flip)
+            self.config['views'] = 'flip' if flip else 'original'
+        if tracker_high is not None:
+            self.config['tracker']['high'] = float(tracker_high)
+        self.weights_path = weights_path
+        self.weights_sha256 = expected_sha256
+        self.detector = FrontierDetector(weights_path, device=device,
+                                         expected_sha256=expected_sha256, **self.config['detector'])
         self.tracker = TemporalTracker(**self.config['tracker'])
         self.foundation = None
         if self.config.get('foundation_classifier'):

@@ -1,3 +1,6 @@
+# 修改时间：2026-09-18。
+# 修改目的：让在线 YOLO 旁路可通过 CLI 对比原始 PT、无翻转 PT 与无翻转 TensorRT FP16 三档。
+# 修改内容：新增 profile 解析、TensorRT engine 覆盖、高置信阈值相对提高 20% 及逐层资源身份日志。
 # 修改时间：2026-09-18（run_official 集成复测）
 # 修改目的：让 Windows spawn 在入口以 runpy 的 __main__ 名称执行时仍能导入旁路目标。
 # 修改内容：创建子进程时固定引用规范包模块中的 worker 函数，避免 __main__ 无法反序列化。
@@ -44,6 +47,13 @@ WEATHERS = (
 )
 DEFAULT_CONFIG = PROJECT_ROOT / "configs/detectors/vehicle_prop/vehicle_frontier.json"
 DEFAULT_LAYOUT = PROJECT_ROOT / "configs/scenarios/coop_decoy/static-decoys.json"
+DEFAULT_TRT_ENGINE = Path(
+    "D:/Workspace/00_MyRepo/red_m_competiton/output/personal_v2/"
+    "yolo-offline-accel/trt-fp16-build-20260918-214857-153/"
+    "yolo26s_two_class.engine"
+)
+YOLO_PROFILES = ("v1", "v2", "v3")
+V3_TRACKER_HIGH_MULTIPLIER = 1.2
 SLOT_CAPACITY_BYTES = 32 * 1024 * 1024
 SLOT_HEADER = struct.Struct("<I")
 
@@ -188,6 +198,7 @@ def _worker_main(
     result_pipe,
     config,
     device,
+    resources,
 ):
     """spawn 子进程：一次只推理共享槽中尚未开始的最新一帧。"""
     try:
@@ -195,7 +206,16 @@ def _worker_main(
         from .vehicle_prop.temporal_tracker import CameraMotion, TemporalTracker
 
         started = time.perf_counter()
-        detector = create_detector(config=config, device=device)
+        effective = resources["effective_options"]
+        detector = create_detector(
+            config=config,
+            device=device,
+            profile=resources["profile"],
+            weights=resources["weights_path"],
+            weights_sha256=resources["weights_sha256"],
+            flip=effective["flip_enabled"],
+            tracker_high=effective["tracker_high_confidence_threshold"],
+        )
         stream_states = {}
         result_pipe.send({
             "event": "worker_ready",
@@ -391,9 +411,11 @@ def _percentiles(values):
 class YoloSidecar:
     """runner 所有的单子进程旁路；每机只保留最新待处理帧并公平轮询。"""
 
-    def __init__(self, output, uids, config, device, log):
+    def __init__(self, output, uids, config, device, resources, log):
         self.output = Path(output)
         self.log = log
+        self.resources = dict(resources)
+        self.profile = str(resources["profile"])
         self.uids = tuple(str(uid) for uid in uids)
         self.slot_by_uid = {uid: index for index, uid in enumerate(self.uids)}
         self.context = multiprocessing.get_context("spawn")
@@ -425,6 +447,7 @@ class YoloSidecar:
                 result_child,
                 str(Path(config).resolve()),
                 str(device),
+                self.resources,
             ),
         )
         self.process.start()
@@ -451,6 +474,7 @@ class YoloSidecar:
         metadata = {
             "submission_id": submission_id,
             "job_id": f"job-{submission_id:08d}",
+            "yolo_profile": self.profile,
             "uid": packet["uid"],
             "frame_no": packet["frame_no"],
             "source_sim_time": packet["source_sim_time"],
@@ -630,6 +654,8 @@ class YoloSidecar:
             value["class_agnostic"] = _metric_summary(value["class_agnostic"])
             value["class_aware"] = _metric_summary(value["class_aware"])
         return {
+            "yolo_profile": self.profile,
+            "resources": self.resources,
             "process_model": "one_windows_spawn_process_one_latest_pending_frame_per_uid",
             "stream_state_model": (
                 "one_shared_yolo_model_with_independent_tracker_camera_state_per_uid"
@@ -742,12 +768,13 @@ class YoloSidecar:
 class YoloSidecarRunner(StudyRunner):
     """保留 PersonalV1 理想检测控制，只从 runner 将 RGB 复制到旁路。"""
 
-    def __init__(self, cfg, output, runtime_root, weather, config, device, log):
+    def __init__(self, cfg, output, runtime_root, weather, config, device, resources, log):
         super().__init__(cfg, PersonalV1Agent, output, log)
         self.runtime_root = Path(runtime_root).resolve()
         self.weather = weather
         self.config = Path(config).resolve()
         self.device = str(device)
+        self.resources = dict(resources)
         self.camera = None
         self.sidecar = None
         self.sidecar_summary = None
@@ -783,7 +810,7 @@ class YoloSidecarRunner(StudyRunner):
         self.renderer.start(self._scenario_cfg, uids)
         self.camera.start()
         self.sidecar = YoloSidecar(
-            self.output, uids, self.config, self.device, self.log
+            self.output, uids, self.config, self.device, self.resources, self.log
         )
         return self.camera, DetectionResolver(default_detector=MultiTargetIdealDetector())
 
@@ -832,15 +859,46 @@ class YoloSidecarRunner(StudyRunner):
         self.judge.close()
 
 
-def _resource_metadata(config):
+def _resource_metadata(config, profile, trt_engine):
     config = Path(config).resolve()
     detector_config = json.loads(config.read_text(encoding="utf-8"))
-    weights = (PROJECT_ROOT / detector_config["weights"]).resolve()
+    configured_weights = (PROJECT_ROOT / detector_config["weights"]).resolve()
+    if profile == "v3":
+        weights = Path(trt_engine).resolve()
+        if weights.suffix.lower() != ".engine":
+            raise ValueError("v3 的 --trt-engine 必须指向 .engine 文件")
+        flip_enabled = False
+        tracker_high_multiplier = V3_TRACKER_HIGH_MULTIPLIER
+    else:
+        weights = configured_weights
+        flip_enabled = profile == "v1"
+        tracker_high_multiplier = 1.0
+    weights_sha256 = hashlib.sha256(weights.read_bytes()).hexdigest()
+    if profile != "v3" and weights_sha256 != detector_config["sha256"]:
+        raise ValueError("基础 PT 权重与配置中的 sha256 不一致")
+    base_tracker_high = float(detector_config["tracker"]["high"])
     return {
+        "profile": profile,
         "config_path": str(config),
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "weights_path": str(weights),
-        "weights_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
+        "weights_sha256": weights_sha256,
+        "model_format": (
+            "tensorrt_engine" if weights.suffix.lower() == ".engine" else "pytorch_pt"
+        ),
+        "effective_options": {
+            "flip_enabled": flip_enabled,
+            "tracker_high_confidence_threshold": (
+                base_tracker_high * tracker_high_multiplier
+            ),
+            "tracker_low_confidence_threshold": float(
+                detector_config["tracker"]["low"]
+            ),
+            "unknown_class_confidence_threshold": float(
+                detector_config["unknown_threshold"]
+            ),
+            "tracker_high_multiplier": tracker_high_multiplier,
+        },
     }
 
 
@@ -855,6 +913,17 @@ def parser():
     result.add_argument("--output", required=True)
     result.add_argument("--config", default=str(DEFAULT_CONFIG))
     result.add_argument("--device", default="0")
+    result.add_argument(
+        "--yolo-profile",
+        choices=YOLO_PROFILES,
+        default="v1",
+        help="v1=原始 PT+翻转，v2=原始 PT+无翻转，v3=TensorRT FP16+无翻转+tracker.high 相对提高 20%%",
+    )
+    result.add_argument(
+        "--trt-engine",
+        default=str(DEFAULT_TRT_ENGINE),
+        help="v3 使用的 TensorRT FP16 .engine；其余档位忽略此参数",
+    )
     return result
 
 
@@ -865,6 +934,7 @@ def main(argv=None):
     if args.duration <= 0:
         raise SystemExit("--duration 必须大于 0")
     PersonalV1Agent.SEARCH_FOV_DEG = float(args.fov)
+    resources = _resource_metadata(args.config, args.yolo_profile, args.trt_engine)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     metadata = {
@@ -882,12 +952,13 @@ def main(argv=None):
         "requested_fov_deg": args.fov,
         "effective_fov_deg": PersonalV1Agent.SEARCH_FOV_DEG,
         "device": args.device,
+        "yolo_profile": args.yolo_profile,
         "multiprocessing_start_method": "spawn",
         "slot_capacity_bytes": SLOT_CAPACITY_BYTES,
         "truth_source": "redis_sync_camera_same_frame_ue_projected_boxes",
         "truth_limit": "ue_projected_boxes_visibility_and_exposure_unverified",
         "time_source": "obs.briefing.score_view.sim_time",
-        "resources": _resource_metadata(args.config),
+        "resources": resources,
         "argv": os.sys.argv,
     }
     (output / "metadata.json").write_text(
@@ -919,6 +990,7 @@ def main(argv=None):
             args.weather,
             args.config,
             args.device,
+            resources,
             log,
         )
         try:
@@ -952,6 +1024,8 @@ def main(argv=None):
                 "seed": args.seed,
                 "duration": args.duration,
                 "fov_deg": args.fov,
+                "yolo_profile": args.yolo_profile,
+                "resources": resources,
                 "v1": getattr(runner, "v1_summary", None),
                 "n_destroyed": result.get("n_destroyed", 0) if result else None,
                 "runner_error": result.get("error") if result else "runner_exception",
