@@ -1,3 +1,6 @@
+# 修改时间：2026-09-19。
+# 修改目的：避免把相同 seed 误解为三档使用完全相同的诱饵路线。
+# 修改内容：在分析产物中记录官方 SDK 对诱饵路线使用未种子化随机数的比较边界。
 # 修改时间：2026-09-18。
 # 修改目的：让 v1/v2/v3 在线结果可按实际模型、配置、翻转和阈值公平比较。
 # 修改内容：新增 profile 分组、类别感知指标与提交到结果观测的完整在线延迟，并审计每轮身份一致性。
@@ -718,6 +721,10 @@ def analyze(input_path, iou_threshold):
                 "跨 profile overall 仅用于数据完整性；方案优劣必须看 by_profile "
                 "和 by_weather_by_profile，并核对 resource_variants"
             ),
+            "scenario_randomization": (
+                "官方 coop_decoy runner 的 seed 固定真车路线，但诱饵路线按设计使用"
+                "未种子化 RNG；同 weather/seed 的不同 profile 不是逐场景严格配对实验"
+            ),
             "detection_metrics": (
                 "同时报告类别无关定位和类别感知识别；档位比较以 class_aware 为主"
             ),
@@ -872,6 +879,8 @@ def markdown(report):
             "## 证据边界",
             "",
             "UE 投影真值框是开发审计信息，不是正式像素感知证据。提交接受到结果观测的墙钟差覆盖在线排队、解码/推理、IPC 和 runner 轮询；它仍不含未进入提交日志之前的相机链路。source/receive/result 的仿真时间差不是已验证曝光时延，也不能替代墙钟延迟。",
+            "",
+            "官方 coop_decoy runner 的 seed 只固定真车路线；诱饵路线按设计使用未种子化 RNG。因此相同 weather/seed 的不同 profile 仍可能面对不同诱饵布局，不能当作逐场景严格配对，只能结合双种子聚合、轮次范围和实际场景文件解释。",
         ]
     )
     if report["profile_consistency_issues"]:
