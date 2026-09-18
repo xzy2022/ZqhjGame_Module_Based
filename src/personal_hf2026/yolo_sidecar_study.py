@@ -1,3 +1,6 @@
+# 修改时间：2026-09-18（run_official 集成复测）
+# 修改目的：让 Windows spawn 在入口以 runpy 的 __main__ 名称执行时仍能导入旁路目标。
+# 修改内容：创建子进程时固定引用规范包模块中的 worker 函数，避免 __main__ 无法反序列化。
 # 修改时间：2026-09-18
 # 修改目的：在保持 PersonalV1 理想控制不变的前提下评估三机共享的 YOLO 视觉旁路。
 # 修改内容：新增 Windows spawn 单进程最新帧槽、帧级真值与时延审计以及可汇总的专用 Runner。
@@ -8,6 +11,7 @@ import argparse
 from collections import Counter, defaultdict
 import ctypes
 import hashlib
+import importlib
 import json
 import math
 import multiprocessing
@@ -404,8 +408,12 @@ class YoloSidecar:
         self.slot_ready = self.context.Event()
         self.stop_event = self.context.Event()
         self.result_parent, result_child = self.context.Pipe(duplex=False)
+        # run_official 用 runpy 把入口执行为 __main__；spawn 必须拿到可重新导入的规范模块函数。
+        worker_target = importlib.import_module(
+            "personal_hf2026.yolo_sidecar_study"
+        )._worker_main
         self.process = self.context.Process(
-            target=_worker_main,
+            target=worker_target,
             name="hf2026-yolo-sidecar",
             args=(
                 self.slots,
