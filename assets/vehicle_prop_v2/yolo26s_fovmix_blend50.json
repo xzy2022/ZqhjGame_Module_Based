@@ -1,0 +1,10 @@
+{
+  "first": "D:\\研究生学习\\研二上\\redmountain\\code\\weights\\yolo26s_two_class.pt",
+  "second": "D:\\研究生学习\\研二上\\redmountain\\code\\weights\\yolo26s_fovmix.pt",
+  "first_sha256": "de1736560d235151c031063876fdcf6a1b1ec8a2857dcf47cd72177c1d81a1f6",
+  "second_sha256": "8ed24cd4a02ef43eecb3558de059685e82f100c161fb41432817c0f576f29911",
+  "fraction_second": 0.5,
+  "output_sha256": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2",
+  "reference": "https://arxiv.org/abs/2203.05482",
+  "method": "Two matching checkpoints including BN statistics; validation candidate, not prediction ensemble."
+}

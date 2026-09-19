@@ -1,0 +1,11 @@
+{
+  "source": "yzy/0919/UE_test_used",
+  "files": {
+    "realtime_backend.py": "1d62d880c2b60ad033f53dc0dc876135bfb574827bb32f2fb8cf6176e32708c0",
+    "detector_realtime.py": "66ef6c54f7e04b3539d9df52d51ab1fff13632d01f03dd65b50c6106d1c6cd6a",
+    "temporal_tracker.py": "12c42f1cd86c8b17f99e30d73d1072956db0a1421d223284eb4aeca1053c7ba4",
+    "export_realtime.py": "6b4f96fdc3ef43def39227af2dea660d19a50af78c771de05eaf3628b4fe8d00",
+    "weights/yolo26s_fovmix_blend50.pt": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2",
+    "weights/yolo26s_fovmix_blend50.json": "128742c1dcb0d1a6e4c58d96348f46cdf10cc873fd8219e16a5c16cde8c11dc7"
+  }
+}

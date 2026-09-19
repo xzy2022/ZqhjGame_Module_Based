@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：保留 V1 各档位并为 V2 实时流水线提供统一工厂入口。
+# 修改内容：规范旧档位别名，且仅显式 V2 分流到独立实时实现。
+# 修改时间：2026-09-19。
 # 修改目的：验证固定输入方向能否减轻当前观察分布中的诱饵分类偏置。
 # 修改内容：增加默认关闭的单视图直角旋转，并将检测框和速度映射回原图坐标。
 # 修改时间：2026-09-18。
@@ -162,6 +165,20 @@ def create_detector(
     image_rotation_deg: int = 0,
 ) -> VehiclePropDetector:
     """创建使用固定配置与权重的检测器。"""
+    if profile == "V2":
+        from ..vehicle_prop_v2 import RealtimeVehiclePropDetector
+
+        return RealtimeVehiclePropDetector(
+            config=config,
+            device=device,
+            profile=profile,
+            weights=weights,
+            weights_sha256=weights_sha256,
+            flip=flip,
+            tracker_high=tracker_high,
+            image_rotation_deg=image_rotation_deg,
+        )
+    profile = {"v1": "V1-v1", "v2": "V1-v2", "v3": "V1-v3"}.get(profile, profile)
     return VehiclePropDetector(
         config=config,
         device=device,
