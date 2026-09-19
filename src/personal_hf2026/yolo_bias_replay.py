@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：在冻结的在线原图上检查观察方向与亮度域差异。
+# 修改内容：增加确定性间隔取样、直角旋转及全图亮度变换，并把检测框逆变换回原图计分。
+# 修改时间：2026-09-19。
 # 修改目的：用在线旁路实际处理的原图和时间顺序区分输入差异、在线调度和模型分类问题。
 # 修改内容：新增 v3 同帧离线重放、逐框一致性对照、纯 CPU 解码核验及有限消融参数。
 """重放旁路已处理图像；每架无人机保留独立的时序状态。"""
@@ -19,12 +22,32 @@ def write_json(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def read_rows(path, limit):
+def read_rows(path, limit, sample_every=1):
     with path.open(encoding="utf-8") as stream:
+        selected = 0
         for index, line in enumerate(stream):
-            if limit and index >= limit:
+            if index % sample_every:
+                continue
+            if limit and selected >= limit:
                 break
+            selected += 1
             yield json.loads(line)
+
+
+def restore_boxes(result, width, height, rotation):
+    """只逆变换模型输出框，分类过程不读取真值框。"""
+    for item in result:
+        a, b, c, d = item["bbox_xyxy"]
+        if rotation == 90:
+            bbox = [width-d, a, width-b, c]
+        elif rotation == 180:
+            bbox = [width-c, height-d, width-a, height-b]
+        elif rotation == 270:
+            bbox = [b, height-c, d, height-a]
+        else:
+            continue
+        item["bbox_xyxy"] = bbox
+        item["xyxy"] = bbox
 
 
 def truth_objects(row):
@@ -73,12 +96,17 @@ def parser():
     result.add_argument("--run", required=True, type=Path, help="含 metadata.json 和 yolo_sidecar_results.jsonl 的在线目录")
     result.add_argument("--output", required=True, type=Path)
     result.add_argument("--max-frames", type=int, default=0)
+    result.add_argument("--sample-every", type=int, default=1, help="仅每 N 个已处理帧取一个，最大帧数在取样后生效")
     result.add_argument("--audit-only", action="store_true", help="仅 CPU 核对原图哈希、尺寸和两种 OpenCV 解码")
     result.add_argument("--device", default="0")
     result.add_argument("--detector-config", type=Path, help="消融配置；未指定时要求配置哈希与在线一致")
     result.add_argument("--tracker-high", type=float, help="消融高置信阈值；默认取在线实际值")
     result.add_argument("--reset-each-frame", action="store_true", help="消融时序融合；默认保持每机原处理顺序")
     result.add_argument("--channel-order", choices=("bgr", "rgb"), default="bgr", help="默认原始 BGR；RGB 仅作通道交换消融")
+    result.add_argument("--rotation-deg", type=int, choices=(0, 90, 180, 270), default=0)
+    result.add_argument("--contrast-scale", type=float, default=1.)
+    result.add_argument("--brightness-offset", type=float, default=0.)
+    result.add_argument("--gamma", type=float, default=1., help="全图查表 gamma；小于 1 提亮")
     result.add_argument("--bbox-tolerance", type=float, default=.001)
     result.add_argument("--score-tolerance", type=float, default=.000001)
     return result
@@ -86,6 +114,8 @@ def parser():
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.sample_every < 1 or args.gamma <= 0:
+        raise ValueError("sample-every 和 gamma 必须大于零")
     import cv2
     import numpy as np
 
@@ -104,12 +134,16 @@ def main(argv=None):
     if args.detector_config is None and config_hash != resources["config_sha256"]:
         raise ValueError("重放基础配置 SHA256 与在线不一致")
     high = args.tracker_high if args.tracker_high is not None else options["tracker_high_confidence_threshold"]
-    identity = args.detector_config is None and args.tracker_high is None and not args.reset_each_frame and args.channel_order == "bgr"
+    identity = (args.detector_config is None and args.tracker_high is None and not args.reset_each_frame
+                and args.channel_order == "bgr" and args.rotation_deg == 0 and args.contrast_scale == 1.
+                and args.brightness_offset == 0. and args.gamma == 1. and args.sample_every == 1)
     summary = {"run": str(run), "source_results_sha256": hashlib.sha256((run / "yolo_sidecar_results.jsonl").read_bytes()).hexdigest(),
                "mode": "cpu_input_audit" if args.audit_only else "v3_same_frame_replay",
                "identity_settings": identity, "config_path": str(config), "config_sha256": config_hash,
                "source_resources": resources, "effective_tracker_high": high,
                "channel_order": args.channel_order, "reset_each_frame": args.reset_each_frame,
+               "sample_every": args.sample_every, "rotation_deg": args.rotation_deg,
+               "contrast_scale": args.contrast_scale, "brightness_offset": args.brightness_offset, "gamma": args.gamma,
                "bbox_tolerance": args.bbox_tolerance, "score_tolerance": args.score_tolerance,
                "evidence_boundary": "同帧 UE 投影框仅用于审计；不代表人工可见性标注或真实曝光时间。"}
     detector, states = None, {}
@@ -125,7 +159,7 @@ def main(argv=None):
     max_bbox, max_score = 0., 0.
     started = time.perf_counter()
     with (output / "audit.jsonl").open("w", encoding="utf-8") as audit, (output / "replay_results.jsonl").open("w", encoding="utf-8") as replay_stream:
-        for row in read_rows(run / "yolo_sidecar_results.jsonl", args.max_frames):
+        for row in read_rows(run / "yolo_sidecar_results.jsonl", args.max_frames, args.sample_every):
             path = Path(row["image_path"])
             if not path.is_absolute():
                 path = run / path
@@ -159,9 +193,17 @@ def main(argv=None):
                     detector.reset()
                 if args.channel_order == "rgb":
                     image = np.ascontiguousarray(image[:, :, ::-1])
+                if args.contrast_scale != 1. or args.brightness_offset != 0.:
+                    image = np.clip(image.astype(np.float32) * args.contrast_scale + args.brightness_offset, 0, 255).astype(np.uint8)
+                if args.gamma != 1.:
+                    lookup = np.rint(255. * (np.arange(256) / 255.) ** args.gamma).astype(np.uint8)
+                    image = cv2.LUT(image, lookup)
+                if args.rotation_deg:
+                    image = np.ascontiguousarray(np.rot90(image, args.rotation_deg // 90))
                 step = time.perf_counter()
                 result = detector.predict(image, timestamp=timestamp, sequence_id=uid)
                 step_ms = (time.perf_counter() - step) * 1000.
+                restore_boxes(result, row["image_width"], row["image_height"], args.rotation_deg)
                 states[uid] = {name: getattr(detector.pipeline, name) for name in ("camera", "tracker", "previous_t", "sequence")}
                 # 保留所有流水线结果核对；评估时沿用原离线最低检测分数 0.25。
                 replay = normalize_predictions(result, row["image_width"], row["image_height"], 0.)
