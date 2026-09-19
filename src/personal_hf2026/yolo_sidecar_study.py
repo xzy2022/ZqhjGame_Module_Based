@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：区分单帧模型偏置和时序融合带来的类别变化。
+# 修改内容：旁路结果保留融合前后类别概率及低分恢复标记。
+# 修改时间：2026-09-19。
 # 修改目的：保留在线错分诊断所需的真实推理图像以支持同帧重放。
 # 修改内容：新增可选的已处理帧原始字节保存及图像路径和保存耗时记录。
 # 修改时间：2026-09-18。
@@ -187,6 +190,13 @@ def _serialise_predictions(raw_predictions):
             "detector_confidence": float(raw.get("detector_confidence", raw["score"])),
             "track_id": int(raw.get("track_id", 0)),
             "track_hits": int(raw.get("track_hits", 0)),
+            "single_frame_probabilities": [
+                float(value) for value in raw.get("single_frame_probabilities", [])
+            ],
+            "class_probabilities": [
+                float(value) for value in raw.get("class_probabilities", [])
+            ],
+            "recovered_low_score": bool(raw.get("recovered_low_score", False)),
         })
     return output
 
