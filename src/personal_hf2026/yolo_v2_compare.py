@@ -1,4 +1,16 @@
 # 修改时间：2026-09-19。
+# 修改目的：避免稀疏方向探针误报率分母及FOV标签造成错误比较。
+# 修改内容：方向探针不报FP每分钟，记录实际FOV并核对指定FOV标签。
+# 修改时间：2026-09-19。
+# 修改目的：让同帧精度归因同时验证输入次数和整帧真值一致性。
+# 修改内容：新增重复帧键及共同帧GT审计，共同目标必须同类别、同框且所在帧真值一致。
+# 修改时间：2026-09-19。
+# 修改目的：避免旧版回放日志继承的在线耗时被误当成离线速度。
+# 修改内容：优先读取replay_step_ms，忽略无法溯源的旧回放decode和保存耗时，并按实际输入重算源间隔。
+# 修改时间：2026-09-19。
+# 修改目的：透明披露V2输出的低于共同评价阈值的恢复框。
+# 修改内容：记录原始框数、score阈值剔除数及其中低分恢复框数。
+# 修改时间：2026-09-19。
 # 修改目的：使重复图像时序身份和离线模型来源可审计。
 # 修改内容：帧键加入源时间，补记离线实际资源及每个GT身份的条件判对计数。
 # 修改时间：2026-09-19。
@@ -84,7 +96,7 @@ def inspect_run(entry):
     offline_metrics = read_json(run / "metrics.json")
     mode = entry.get("mode", "auto")
     if mode == "auto":
-        mode = ("replay" if rows and "source_online_timing" in rows[0] else
+        mode = ("replay" if source.name == "replay_results.jsonl" or (rows and "replay_step_ms" in rows[0]) else
                 "offline" if rows and "gt_objects" in rows[0] else "online")
     if mode == "replay" and not metadata and replay_summary.get("run"):
         metadata = read_json(Path(replay_summary["run"]) / "metadata.json")
@@ -92,6 +104,7 @@ def inspect_run(entry):
     counters, per_frame, matched_objects = Counter(), {}, {}
     identities = defaultdict(Counter)
     source_times, observed_times, gaps, by_uid = defaultdict(list), [], [], defaultdict(list)
+    inference_values, decode_values, previous_source = [], [], {}
     for row in rows:
         truth = row.get("gt_objects")
         if truth is None:
@@ -99,14 +112,23 @@ def inspect_run(entry):
         predictions = normalize_predictions(
             row.get("predictions", []), row.get("image_width", row.get("width", 0)),
             row.get("image_height", row.get("height", 0)), .25)
+        counters["raw_emitted_predictions"] += len(row.get("predictions", []))
+        counters["predictions_below_score_0_25"] += len(row.get("predictions", [])) - len(predictions)
+        counters["recovered_predictions_below_score_0_25"] += sum(
+            item["score"] < .25 and bool(item.get("recovered_low_score")) for item in row.get("predictions", []))
         weather = row.get("weather", metadata.get("weather", "unknown"))
         if isinstance(weather, dict):
             weather = weather.get("preset", "unknown")
-        timing = row.get("step_ms", row.get("inference_wall_ms", 0))
-        matches, _, _ = accumulators["overall"].add(truth, predictions, timing, row.get("decode_ms", 0))
-        accumulators[f"weather/{weather}"].add(truth, predictions, timing, row.get("decode_ms", 0))
+        timing = (row.get("replay_step_ms", row.get("inference_wall_ms", 0)) if mode == "replay"
+                  else row.get("step_ms", row.get("inference_wall_ms", 0)))
+        decode = (row.get("decode_ms") if mode != "replay" or "source_online_timing" in row
+                  else row.get("replay_decode_ms"))
+        inference_values.append(timing)
+        decode_values.append(decode)
+        matches, _, _ = accumulators["overall"].add(truth, predictions, timing, decode or 0)
+        accumulators[f"weather/{weather}"].add(truth, predictions, timing, decode or 0)
         uid = str(row.get("uid", "unknown"))
-        accumulators[f"uid/{uid}"].add(truth, predictions, timing, row.get("decode_ms", 0))
+        accumulators[f"uid/{uid}"].add(truth, predictions, timing, decode or 0)
         counters["empty_gt_frames"] += not truth
         counters["empty_gt_frames_with_prediction"] += not truth and bool(predictions)
         counters["empty_gt_predictions"] += len(predictions) if not truth else 0
@@ -121,44 +143,56 @@ def inspect_run(entry):
             counters["unmatched_prediction_max_iou_0_1_to_0_5"] += .1 <= max_iou < .5
             counters["unmatched_prediction_max_iou_ge_0_5"] += max_iou >= .5
         key = frame_key(row)
-        per_frame[key] = len(truth)
+        per_frame[key] = sorted((int(item["class_id"]), str(item.get("object_id")),
+                                 tuple(float(value) for value in item["bbox_xyxy"])) for item in truth)
         for match in matches:
             gt, pred = truth[match["gt_index"]], predictions[match["prediction_index"]]
             object_key = key + ":" + str(gt.get("object_id", match["gt_index"]))
             matched_objects[object_key] = {"class_id": gt["class_id"], "correct": gt["class_id"] == pred["class_id"],
-                                            "bbox_xyxy": gt["bbox_xyxy"]}
+                                            "bbox_xyxy": gt["bbox_xyxy"], "frame_key": key}
             identity = identities[f"{CLASS_NAMES[gt['class_id']]}/{gt.get('object_id')}"]
             identity["localized_pairs"] += 1
             identity["correct_class"] += gt["class_id"] == pred["class_id"]
         timestamp = source_time(row)
         if timestamp is not None:
-            source_times[source_stream(row)].append(timestamp)
+            stream = source_stream(row)
+            source_times[stream].append(timestamp)
+            if stream in previous_source:
+                gaps.append(timestamp - previous_source[stream])
+            previous_source[stream] = timestamp
         by_uid[uid].append(row)
-        if row.get("processed_source_gap_s") is not None:
-            gaps.append(row["processed_source_gap_s"])
         if mode == "online" and row.get("result_observed_perf_counter") is not None:
             observed_times.append(row["result_observed_perf_counter"])
     metrics = finish(accumulators["overall"])
     source_seconds = sum(max(values) - min(values) for values in source_times.values() if len(values) > 1)
+    sparse_probe = bool(metadata.get("diagnostic_subset")) or replay_summary.get("sample_every", 1) > 1
+    rate_seconds = None if sparse_probe else source_seconds
+    fov_values = sorted({float(value) for row in rows
+                         if (value := row.get("fov_deg", row.get("observed_gimbal_fov_deg", metadata.get("effective_fov_deg")))) is not None})
     duration = metadata.get("duration") if mode == "online" else None
     result = {"label": entry["label"], "mode": mode, "input": str(source),
               "input_sha256": file_sha256(source), "fov_deg": entry.get("fov_deg", metadata.get("effective_fov_deg")),
+              "observed_fov_values": fov_values,
+              "observed_fov_matches_requested": all(abs(value - float(entry["fov_deg"])) < 1e-6 for value in fov_values) if fov_values and entry.get("fov_deg") is not None else None,
               "metrics": metrics, "by_weather": {k[8:]: finish(v) for k, v in accumulators.items() if k.startswith("weather/")},
               "by_uid": {k[4:]: finish(v) for k, v in accumulators.items() if k.startswith("uid/")},
               "unique_frame_keys": len(per_frame), "counts": dict(counters),
+              "duplicate_frame_key_count": len(rows) - len(per_frame),
               "by_gt_identity": {key: {**value, "conditional_accuracy": ratio(value["correct_class"], value["localized_pairs"])} for key, value in sorted(identities.items())},
               "source_uav_seconds": source_seconds,
+              "fp_rate_scope": "sparse_probe_per_minute_suppressed" if sparse_probe else "evaluated_events_per_selected_stream_source_span",
               "empty_background_frame_false_positive_rate": ratio(counters["empty_gt_frames_with_prediction"], counters["empty_gt_frames"]),
-              "class_agnostic_fp_per_uav_source_minute": ratio(metrics["localization_class_agnostic"]["fp"] * 60, source_seconds),
-              "non_vehicle_fp_proxy_per_uav_source_minute": ratio(counters["unmatched_prediction_max_iou_lt_0_1"] * 60, source_seconds),
+              "class_agnostic_fp_per_uav_source_minute": ratio(metrics["localization_class_agnostic"]["fp"] * 60, rate_seconds),
+              "non_vehicle_fp_proxy_per_uav_source_minute": ratio(counters["unmatched_prediction_max_iou_lt_0_1"] * 60, rate_seconds),
               "class_agnostic_fp_per_scene_sim_minute": ratio(metrics["localization_class_agnostic"]["fp"] * 60, duration),
               "source_gap_s": distribution(gaps), "source_gap_over_0_25_count": sum(value > .25 for value in gaps),
               "source_gap_over_0_25_ratio": ratio(sum(value > .25 for value in gaps), len(gaps)),
               "resources": metadata.get("resources", {}) if mode == "online" else replay_summary.get("runtime", offline_metrics.get("detector_runtime_metadata", metadata.get("resources", {}))),
               "replay_settings": {key: replay_summary[key] for key in ("reset_each_frame", "rotation_deg", "rotation_square_pad", "detector_image_rotation_deg", "sample_every") if key in replay_summary},
-              "latency": {"inference_ms": distribution([r.get("inference_wall_ms", r.get("step_ms")) for r in rows]),
-                          "decode_ms": distribution([r.get("decode_ms") for r in rows]),
-                          "frame_save_ms": distribution([r.get("frame_save_ms") for r in rows])}}
+              "latency": {"inference_ms": distribution(inference_values),
+                          "decode_ms": distribution(decode_values),
+                          "frame_save_ms": distribution([r.get("frame_save_ms") for r in rows] if mode == "online" else [])},
+              "legacy_replay_inherited_online_timing_ignored": mode == "replay" and any("source_online_timing" not in r for r in rows)}
     if mode == "online":
         submissions_path = run / "yolo_sidecar_submissions.jsonl"
         submissions = read_rows(submissions_path) if submissions_path.is_file() else rows
@@ -199,25 +233,32 @@ def compare(args):
     output, _ = prepare_output(args.output)
     spec = read_json(args.spec)
     entries = spec if isinstance(spec, list) else spec["runs"]
-    results, frame_sets, pairs = {}, {}, {}
+    results, frame_sets, frame_truths, pairs = {}, {}, {}, {}
     for entry in entries:
         result, frames, matches = inspect_run(entry)
         results[entry["label"]], frame_sets[entry["label"]], pairs[entry["label"]] = result, set(frames), matches
+        frame_truths[entry["label"]] = frames
     comparisons = []
     for left, right in itertools.combinations(results, 2):
         common_frames = frame_sets[left] & frame_sets[right]
         if not common_frames:
             continue
+        matching_truth_frames = {key for key in common_frames if frame_truths[left][key] == frame_truths[right][key]}
         common_objects = pairs[left].keys() & pairs[right].keys()
         by_class = {}
         for class_id, name in CLASS_NAMES.items():
             keys = [key for key in common_objects if pairs[left][key]["class_id"] == class_id
-                    and pairs[left][key]["bbox_xyxy"] == pairs[right][key]["bbox_xyxy"]]
+                    and pairs[right][key]["class_id"] == class_id
+                    and pairs[left][key]["bbox_xyxy"] == pairs[right][key]["bbox_xyxy"]
+                    and pairs[left][key]["frame_key"] in matching_truth_frames]
             by_class[name] = {"common_localized_objects": len(keys),
                               "left_accuracy": ratio(sum(pairs[left][k]["correct"] for k in keys), len(keys)),
                               "right_accuracy": ratio(sum(pairs[right][k]["correct"] for k in keys), len(keys))}
         comparisons.append({"left": left, "right": right, "common_frames": len(common_frames),
-                            "identical_frame_set": frame_sets[left] == frame_sets[right], "common_localized_gt": by_class})
+                            "identical_frame_set": frame_sets[left] == frame_sets[right],
+                            "unique_same_frame_inputs": frame_sets[left] == frame_sets[right] and not results[left]["duplicate_frame_key_count"] and not results[right]["duplicate_frame_key_count"],
+                            "common_frame_gt_mismatch_count": len(common_frames) - len(matching_truth_frames),
+                            "common_localized_gt": by_class})
     report = {"runs": results, "same_frame_comparisons": comparisons, "semantics": {
         "thresholds": "IoU>=0.5；score>=0.25；uncertain保留并按class_id强制二分类。另列accepted指标。",
         "macro": "类别宏F1为两类F1均值；micro F1来自总体TP/FP/FN，与队友把uncertain计错的宏F1不能直接相减。",
