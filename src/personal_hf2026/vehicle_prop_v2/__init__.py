@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：完整沿用队友实时入口的 CPU 线程配置与模型预热策略。
+# 修改内容：V2 初始化固定四个 Torch 线程、两个 OpenCV 线程并预热，记录实际线程数与预热耗时。
+# 修改时间：2026-09-19。
 # 修改目的：提供可直接用于现有旁路与评估器的 V2 两类检测接口。
 # 修改内容：保留单模型多路独立跟踪、旋转坐标还原及可复核的真实后端元数据。
 """队友 V2 的同步实时流水线；进程调度由现有旁路负责。"""
@@ -7,6 +10,7 @@ from __future__ import annotations
 
 from os import PathLike
 from pathlib import Path
+import time
 
 import numpy as np
 
@@ -36,6 +40,9 @@ class RealtimeVehiclePropDetector(VehiclePropDetector):
         tracker_high: float | None = None,
         image_rotation_deg: int = 0,
     ):
+        import cv2
+        import torch
+
         if flip:
             raise ValueError("V2 固定单视图，不支持 flip=True")
         if image_rotation_deg not in (0, 90, 180, 270):
@@ -44,6 +51,9 @@ class RealtimeVehiclePropDetector(VehiclePropDetector):
         self.device_requested = str(device)
         self.profile = profile
         self.image_rotation_deg = image_rotation_deg
+        # 队友 ue_adapter 与 realtime_sidecar 均先限制 CPU 线程，再创建及预热共享模型。
+        torch.set_num_threads(4)
+        cv2.setNumThreads(2)
         self.pipeline = RealtimePipeline(
             config=self.config_path,
             device=device,
@@ -51,6 +61,9 @@ class RealtimeVehiclePropDetector(VehiclePropDetector):
             weights_sha256=weights_sha256,
             tracker_high=tracker_high,
         )
+        self.warmup_completed = False
+        self.warmup_ms = None
+        self.warmup()
 
     def reset(self, stream_id: str | None = None) -> None:
         """清空全部流或某一路的时序状态，模型继续共享。"""
@@ -58,7 +71,11 @@ class RealtimeVehiclePropDetector(VehiclePropDetector):
 
     def warmup(self) -> None:
         """按部署尺寸预热共享模型，且不产生任何跟踪状态。"""
+        started = time.perf_counter()
+        self.warmup_completed = False
         self.pipeline.warmup()
+        self.warmup_ms = (time.perf_counter() - started) * 1000.
+        self.warmup_completed = True
 
     def predict(
         self,
@@ -131,6 +148,10 @@ class RealtimeVehiclePropDetector(VehiclePropDetector):
             "input_dtype": str(backend.dtype),
             "batch_size": 1,
             "model_instances": 1,
+            "torch_num_threads": torch.get_num_threads(),
+            "opencv_num_threads": cv2.getNumThreads(),
+            "warmup": {"completed": self.warmup_completed, "iterations": 5,
+                       "wall_ms": self.warmup_ms},
             "class_names": ["real_vehicle", "model_prop"],
             "effective_options": {
                 "image_rotation_deg": self.image_rotation_deg,
