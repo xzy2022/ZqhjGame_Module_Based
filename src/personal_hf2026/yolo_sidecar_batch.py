@@ -1,3 +1,6 @@
+# 修改时间：2026-09-19。
+# 修改目的：让后续批量验证按需保留同帧离线重放所需的图像。
+# 修改内容：批次命令透传已处理帧保存开关并记录在计划中。
 # 修改时间：2026-09-18。
 # 修改目的：让三档在线 YOLO 方案按相同天气、种子和时长独立计划并保留完整身份链路。
 # 修改内容：新增 profile 与 TensorRT engine 传播，并校验每轮 metadata、summary 和结果行的方案一致性。
@@ -249,6 +252,8 @@ def child_command(item, args):
         command.extend(["--config", str(args.config)])
     if args.trt_engine is not None and item["yolo_profile"] == "v3":
         command.extend(["--trt-engine", str(args.trt_engine)])
+    if args.save_processed_frames:
+        command.append("--save-processed-frames")
     return command
 
 
@@ -282,6 +287,7 @@ def build_plan(args):
         "config": None if args.config is None else str(args.config),
         "trt_engine": None if args.trt_engine is None else str(args.trt_engine),
         "device": args.device,
+        "save_processed_frames": args.save_processed_frames,
         "yolo_profiles": list(args.yolo_profiles),
         "weathers": list(args.weathers),
         "seeds": list(args.seeds),
@@ -389,6 +395,8 @@ def parser():
         help="传给核心 runner 的 v3 TensorRT engine 覆盖路径",
     )
     result.add_argument("--device", default="0", help="传给核心 runner 的推理设备")
+    result.add_argument("--save-processed-frames", action="store_true",
+                        help="保存实际推理帧，供逐帧错分检查和离线重放")
     result.add_argument(
         "--execute",
         action="store_true",
