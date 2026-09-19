@@ -1,4 +1,10 @@
 # 修改时间：2026-09-19。
+# 修改目的：让没有TP的分组也与公共离线P/R/F1定义保持一致。
+# 修改内容：类别无关与强制分类均复用公共计数指标函数，并保留旧输出键。
+# 修改时间：2026-09-19。
+# 修改目的：让V2低分恢复框和uncertain在批次默认报告中遵循同一离线评价口径。
+# 修改内容：复用公共预测归一化与匹配，默认score阈值0.25，保留class_id强制分类和接受预测两套指标及原始输出计数。
+# 修改时间：2026-09-19。
 # 修改目的：避免把相同 seed 误解为三档使用完全相同的诱饵路线。
 # 修改内容：在分析产物中记录官方 SDK 对诱饵路线使用未种子化随机数的比较边界。
 # 修改时间：2026-09-18。
@@ -23,6 +29,11 @@ import json
 import math
 from pathlib import Path
 from statistics import fmean
+
+from .yolo_offline_eval import (
+    CLASS_NAMES, detection_metrics, greedy_match as common_greedy_match,
+    normalize_predictions,
+)
 
 
 RESULTS_NAME = "yolo_sidecar_results.jsonl"
@@ -105,25 +116,11 @@ def class_name(item, ground_truth=False):
 
 
 def greedy_match(ground_truth, predictions, threshold, class_aware=False):
-    candidates = []
-    for gt_index, truth in enumerate(ground_truth):
-        gt_bbox = bbox_of(truth)
-        for prediction_index, prediction in enumerate(predictions):
-            if class_aware and class_name(truth, True) != class_name(prediction):
-                continue
-            prediction_bbox = bbox_of(prediction)
-            overlap = bbox_iou(gt_bbox, prediction_bbox)
-            if overlap >= threshold:
-                candidates.append((overlap, gt_index, prediction_index))
-    used_gt = set()
-    used_predictions = set()
-    matches = []
-    for overlap, gt_index, prediction_index in sorted(candidates, reverse=True):
-        if gt_index in used_gt or prediction_index in used_predictions:
-            continue
-        used_gt.add(gt_index)
-        used_predictions.add(prediction_index)
-        matches.append(overlap)
+    # 与离线使用同一排序及一对一匹配；uncertain仍按class_id参与强制二分类。
+    names = {value: key for key, value in CLASS_NAMES.items()}
+    truth = [{"bbox_xyxy": bbox_of(item), "class_id": names[class_name(item, True)]}
+             for item in ground_truth]
+    matches, _, _ = common_greedy_match(truth, predictions, threshold, same_class=class_aware)
     return matches
 
 
@@ -134,6 +131,13 @@ class Accumulator:
         self.predictions = 0
         self.tp = 0
         self.class_aware_tp = 0
+        self.raw_predictions = 0
+        self.invalid_bbox_predictions = 0
+        self.below_threshold_predictions = 0
+        self.below_threshold_recovered_predictions = 0
+        self.uncertain_predictions = 0
+        self.accepted_predictions = 0
+        self.accepted_class_aware_tp = 0
         self.false_positive_frames = 0
         self.class_aware_false_positive_frames = 0
         self.wall_ms = []
@@ -151,10 +155,25 @@ class Accumulator:
         self.consecutive_repeat_wall_ms = 0.0
         self.last_hash_by_stream = {}
 
-    def add(self, row, run_id, iou_threshold):
+    def add(self, row, run_id, iou_threshold, confidence_threshold=0.25):
         self.frames += 1
-        ground_truth = [item for item in row.get("ground_truth", []) if bbox_of(item)]
-        predictions = [item for item in row.get("predictions", []) if bbox_of(item)]
+        ground_truth = [item for item in row.get("ground_truth", [])
+                        if bbox_of(item) and class_name(item, True) in CLASS_NAMES.values()]
+        raw_predictions = row.get("predictions", [])
+        valid_predictions = [item for item in raw_predictions if bbox_of(item)]
+        predictions = normalize_predictions(valid_predictions, row.get("image_width", 0),
+                                            row.get("image_height", 0), confidence_threshold)
+        accepted_predictions = [item for item in predictions if item["accepted"]]
+        self.raw_predictions += len(raw_predictions)
+        self.invalid_bbox_predictions += len(raw_predictions) - len(valid_predictions)
+        self.below_threshold_predictions += len(valid_predictions) - len(predictions)
+        self.below_threshold_recovered_predictions += sum(
+            item["score"] < confidence_threshold and bool(item.get("recovered_low_score"))
+            for item in valid_predictions)
+        self.uncertain_predictions += len(predictions) - len(accepted_predictions)
+        self.accepted_predictions += len(accepted_predictions)
+        self.accepted_class_aware_tp += len(greedy_match(
+            ground_truth, accepted_predictions, iou_threshold, class_aware=True))
         matches = greedy_match(ground_truth, predictions, iou_threshold)
         class_aware_matches = greedy_match(
             ground_truth, predictions, iou_threshold, class_aware=True
@@ -219,6 +238,13 @@ class Accumulator:
         self.predictions += other.predictions
         self.tp += other.tp
         self.class_aware_tp += other.class_aware_tp
+        self.raw_predictions += other.raw_predictions
+        self.invalid_bbox_predictions += other.invalid_bbox_predictions
+        self.below_threshold_predictions += other.below_threshold_predictions
+        self.below_threshold_recovered_predictions += other.below_threshold_recovered_predictions
+        self.uncertain_predictions += other.uncertain_predictions
+        self.accepted_predictions += other.accepted_predictions
+        self.accepted_class_aware_tp += other.accepted_class_aware_tp
         self.false_positive_frames += other.false_positive_frames
         self.class_aware_false_positive_frames += other.class_aware_false_positive_frames
         self.wall_ms.extend(other.wall_ms)
@@ -245,22 +271,12 @@ class Accumulator:
         wall_total = sum(self.wall_ms)
         repeat_wall_share = safe_ratio(self.consecutive_repeat_wall_ms, wall_total)
         class_agnostic = {
-            "tp": self.tp,
-            "fp": fp,
-            "fn": fn,
-            "precision": safe_ratio(self.tp, self.predictions),
-            "recall": safe_ratio(self.tp, self.gt),
-            "f1": self._f1(self.tp, fp, fn),
+            **detection_metrics(self.tp, fp, fn),
             "false_positives_per_frame": safe_ratio(fp, self.frames),
             "frames_with_false_positive": self.false_positive_frames,
         }
         class_aware = {
-            "tp": self.class_aware_tp,
-            "fp": class_aware_fp,
-            "fn": class_aware_fn,
-            "precision": safe_ratio(self.class_aware_tp, self.predictions),
-            "recall": safe_ratio(self.class_aware_tp, self.gt),
-            "f1": self._f1(self.class_aware_tp, class_aware_fp, class_aware_fn),
+            **detection_metrics(self.class_aware_tp, class_aware_fp, class_aware_fn),
             "false_positives_per_frame": safe_ratio(class_aware_fp, self.frames),
             "frames_with_false_positive": self.class_aware_false_positive_frames,
         }
@@ -287,14 +303,28 @@ class Accumulator:
             "tp": self.tp,
             "fp": fp,
             "fn": fn,
-            "precision": safe_ratio(self.tp, self.predictions),
-            "recall": safe_ratio(self.tp, self.gt),
+            "precision": class_agnostic["precision"],
+            "recall": class_agnostic["recall"],
             "false_positives_per_frame": safe_ratio(fp, self.frames),
             "frames_with_false_positive": self.false_positive_frames,
             "inference_wall_ms": distribution(self.wall_ms),
             "simulation_time_completion_minus_receive_s": distribution(self.sim_latency_s),
             "class_agnostic": class_agnostic,
             "class_aware": class_aware,
+            "class_aware_forced_class_id": class_aware,
+            "accepted_class_aware": detection_metrics(
+                self.accepted_class_aware_tp,
+                self.accepted_predictions - self.accepted_class_aware_tp,
+                self.gt - self.accepted_class_aware_tp),
+            "raw_prediction_counts": {
+                "emitted": self.raw_predictions,
+                "invalid_bbox": self.invalid_bbox_predictions,
+                "below_confidence_threshold": self.below_threshold_predictions,
+                "below_threshold_recovered_low_score": self.below_threshold_recovered_predictions,
+                "evaluated": self.predictions,
+                "uncertain_evaluated": self.uncertain_predictions,
+                "accepted_evaluated": self.accepted_predictions,
+            },
             "online_latency": online_latency,
             "field_coverage": {
                 "wall_latency_rows": len(self.wall_ms),
@@ -589,7 +619,7 @@ def unique_profile_traces(run_results):
     return list(variants.values())
 
 
-def analyze(input_path, iou_threshold):
+def analyze(input_path, iou_threshold, confidence_threshold=0.25):
     discovered = discover_runs(input_path)
     if not discovered:
         raise FileNotFoundError(f"未找到 batch_plan.json 或 {RESULTS_NAME}：{input_path}")
@@ -642,10 +672,10 @@ def analyze(input_path, iou_threshold):
         result_profiles = set()
         for row in iter_rows(results_path):
             result_profiles.add(row.get("yolo_profile"))
-            accumulator.add(row, item["run_id"], iou_threshold)
+            accumulator.add(row, item["run_id"], iou_threshold, confidence_threshold)
             uav_id = str(row.get("uid", row.get("uav_id", "unknown")))
             by_profile_uav[profile][uav_id].add(
-                row, item["run_id"], iou_threshold
+                row, item["run_id"], iou_threshold, confidence_threshold
             )
         if result_profiles != {profile}:
             trace_issues.append("result_row_profile_mismatch")
@@ -705,13 +735,16 @@ def analyze(input_path, iou_threshold):
             "run_stability": run_stability(runs),
         }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_at": utc_now(),
         "input": str(input_path),
         "matching": {
             "algorithm": "greedy_descending_iou_one_to_one",
             "iou_threshold": iou_threshold,
-            "metric_modes": ["class_agnostic", "class_aware"],
+            "confidence_threshold": confidence_threshold,
+            "metric_modes": ["class_agnostic", "class_aware_forced_class_id", "accepted_class_aware"],
+            "class_aware_alias": "class_aware是class_aware_forced_class_id的兼容键；uncertain不剔除，按class_id匹配。",
+            "previous_schema_boundary": "schema<=2未应用score阈值且按class_name匹配，不能和新默认值直接混合汇总。",
             "class_mapping": EXPECTED_CLASSES,
             "bbox_format": "xyxy",
         },
@@ -726,7 +759,8 @@ def analyze(input_path, iou_threshold):
                 "未种子化 RNG；同 weather/seed 的不同 profile 不是逐场景严格配对实验"
             ),
             "detection_metrics": (
-                "同时报告类别无关定位和类别感知识别；档位比较以 class_aware 为主"
+                "先应用confidence_threshold；class_aware按class_id强制二分类，含uncertain；"
+                "accepted_class_aware单独去除uncertain再匹配；与离线使用同一匹配实现"
             ),
             "online_latency": (
                 "accepted_to_result_observed_wall_ms 是提交被接受至 runner 观测结果的墙钟总延迟；"
@@ -786,6 +820,9 @@ def markdown(report):
         "",
         f"- 已分析轮次：{report['analyzed_runs']} / {report['planned_runs']}",
         f"- IoU 阈值：{report['matching']['iou_threshold']}",
+        f"- score 阈值：{report['matching']['confidence_threshold']}；class_aware按class_id强制二分类，uncertain仍保留。",
+        "- accepted_class_aware单独报告剔除uncertain后的指标；schema≤2旧报告未筛score且按class_name计分，不能直接混用。",
+        f"- 原始输出框 {overall['raw_prediction_counts']['emitted']}；阈值剔除 {overall['raw_prediction_counts']['below_confidence_threshold']}（其中低分恢复框 {overall['raw_prediction_counts']['below_threshold_recovered_low_score']}）；评价中uncertain {overall['raw_prediction_counts']['uncertain_evaluated']}。",
         "- 下列跨 profile 合计只用于核对数据完整性，不能用于判断某档优劣。",
         f"- 类别感知 Precision / Recall / F1：{percent(overall_aware['precision'])} / {percent(overall_aware['recall'])} / {percent(overall_aware['f1'])}",
         f"- 类别感知误报：{overall_aware['fp']}，每帧 {number(overall_aware['false_positives_per_frame'])}",
@@ -906,6 +943,7 @@ def parser():
     result.add_argument("--input", required=True, type=Path, help="批次根或单轮输出目录")
     result.add_argument("--output", type=Path, help="默认写入批次根 analysis 子目录")
     result.add_argument("--iou-threshold", type=float, default=0.5)
+    result.add_argument("--confidence-threshold", type=float, default=0.25)
     return result
 
 
@@ -916,9 +954,11 @@ def main(argv=None):
         raise FileNotFoundError(args.input)
     if not 0 < args.iou_threshold <= 1:
         raise ValueError("--iou-threshold 必须在 (0, 1] 内")
+    if not 0 <= args.confidence_threshold <= 1:
+        raise ValueError("--confidence-threshold 必须在 [0, 1] 内")
     output = (args.output or (args.input / "analysis")).resolve()
     output.mkdir(parents=True, exist_ok=False)
-    report = analyze(args.input, args.iou_threshold)
+    report = analyze(args.input, args.iou_threshold, args.confidence_threshold)
     write_json(output / "metrics.json", report)
     (output / "REPORT.md").write_text(markdown(report), encoding="utf-8")
     print(
