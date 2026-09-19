@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：用同一短测的前段和全程独立核对历史分类偏置是否复现。
+# 修改内容：增加按已记录图像接收仿真时间截取窗口的参数和产物口径字段。
+# 修改时间：2026-09-19。
 # 修改目的：区分分类决策阈值与置信拒识对系统偏置的影响。
 # 修改内容：按预先指定的六个真车概率阈值报告两类判对率和均衡准确率。
 # 修改时间：2026-09-19。
@@ -167,6 +170,8 @@ def audit(args):
         gaps, reset_reasons, counts = [], Counter(), Counter()
         for line in source.open(encoding="utf-8"):
             frame = json.loads(line)
+            if args.max_received_sim_time is not None and frame["image_received_sim_time"] > args.max_received_sim_time:
+                continue
             uid = str(frame["uid"])
             timestamp = float(frame["source_sim_time"])
             dt = frame.get("processed_source_gap_s")
@@ -235,6 +240,7 @@ def audit(args):
                 state["matched"] += 1
                 box = truth["bbox"]
                 rows.append(dict(run=run, uid=uid, frame_no=frame["frame_no"], source_sim_time=timestamp,
+                                 image_received_sim_time=frame["image_received_sim_time"],
                                  source_gap_s=dt, track_key=key, target_id=target, gt_class=gt_class,
                                  track_hits=prediction["track_hits"], iou=overlap,
                                  detector_confidence=prediction["detector_confidence"],
@@ -252,6 +258,8 @@ def audit(args):
                      for key, value in sorted(tracks.items())]
     stats = {
         "input": str(args.input), "config": str(args.config), "config_sha256": config_sha,
+        "time_window": {"field": "image_received_sim_time", "inclusive_upper_bound": args.max_received_sim_time,
+                        "semantics": "Runner observation score_view.sim_time when image was submitted; not verified exposure time."},
         "iou_threshold": args.iou, "smoothing": smoothing, "unknown_threshold": unknown_threshold,
         "single_probability_method": "Prefer saved single_frame_probabilities; otherwise inverse EMA q_t = alpha*q_prev + (1-alpha)*p_t only for contiguous track hits; first-hit q_t=p_t. Requires normalized two-class probabilities and zero background as implemented in arrays_for_tracker.",
         "ground_truth_caveat": "UE frame-projected boxes and target IDs are oracle audit metadata; occlusion and exposure alignment are not independently verified.",
@@ -305,6 +313,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path(__file__).resolve().parents[2] / "configs/detectors/vehicle_prop/vehicle_frontier.json")
     parser.add_argument("--iou", type=float, default=.5)
+    parser.add_argument("--max-received-sim-time", type=float)
     audit(parser.parse_args())
 
 
