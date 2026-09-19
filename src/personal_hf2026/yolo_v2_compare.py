@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：不把旧回放缺失的解码计时写成实测零毫秒。
+# 修改内容：仅将确实存在的decode_ms纳入公共累加器的解码耗时分布。
+# 修改时间：2026-09-19。
 # 修改目的：避免稀疏方向探针误报率分母及FOV标签造成错误比较。
 # 修改内容：方向探针不报FP每分钟，记录实际FOV并核对指定FOV标签。
 # 修改时间：2026-09-19。
@@ -125,10 +128,13 @@ def inspect_run(entry):
                   else row.get("replay_decode_ms"))
         inference_values.append(timing)
         decode_values.append(decode)
-        matches, _, _ = accumulators["overall"].add(truth, predictions, timing, decode or 0)
-        accumulators[f"weather/{weather}"].add(truth, predictions, timing, decode or 0)
         uid = str(row.get("uid", "unknown"))
-        accumulators[f"uid/{uid}"].add(truth, predictions, timing, decode or 0)
+        for group_key in ("overall", f"weather/{weather}", f"uid/{uid}"):
+            frame_matches, _, _ = accumulators[group_key].add(truth, predictions, timing, decode or 0)
+            if group_key == "overall":
+                matches = frame_matches
+            if decode is None:
+                accumulators[group_key].decode_ms.pop()
         counters["empty_gt_frames"] += not truth
         counters["empty_gt_frames_with_prediction"] += not truth and bool(predictions)
         counters["empty_gt_predictions"] += len(predictions) if not truth else 0
