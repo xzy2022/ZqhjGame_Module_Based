@@ -1,3 +1,6 @@
+# 修改时间：2026-09-19。
+# 修改目的：保留在线错分诊断所需的真实推理图像以支持同帧重放。
+# 修改内容：新增可选的已处理帧原始字节保存及图像路径和保存耗时记录。
 # 修改时间：2026-09-18。
 # 修改目的：让在线 YOLO 旁路可通过 CLI 对比原始 PT、无翻转 PT 与无翻转 TensorRT FP16 三档。
 # 修改内容：新增 profile 解析、TensorRT engine 覆盖、高置信阈值相对提高 20% 及逐层资源身份日志。
@@ -217,6 +220,10 @@ def _worker_main(
             tracker_high=effective["tracker_high_confidence_threshold"],
         )
         stream_states = {}
+        frame_output = resources.get("processed_frames_dir")
+        if frame_output:
+            frame_output = Path(frame_output)
+            frame_output.mkdir(parents=True, exist_ok=True)
         result_pipe.send({
             "event": "worker_ready",
             "initialization_ms": (time.perf_counter() - started) * 1000.0,
@@ -309,6 +316,14 @@ def _worker_main(
                 "sequence": detector.pipeline.sequence,
             })
             inference_completed = time.perf_counter()
+            image_path = None
+            save_started = time.perf_counter()
+            if frame_output:
+                # 保留模型实际收到的压缩字节，避免再次编码改变离线重放的像素。
+                suffix = ".png" if image_bytes.startswith(b"\x89PNG") else ".jpg"
+                saved_frame = frame_output / f"{sequence:07d}{suffix}"
+                saved_frame.write_bytes(image_bytes)
+                image_path = str(saved_frame.resolve())
             result_pipe.send({
                 "event": "completed",
                 "submission_id": sequence,
@@ -317,6 +332,8 @@ def _worker_main(
                 "inference_wall_ms": (inference_completed - inference_started) * 1000.0,
                 "image_width": int(image.shape[1]),
                 "image_height": int(image.shape[0]),
+                "image_path": image_path,
+                "frame_save_ms": (time.perf_counter() - save_started) * 1000.0,
                 "previous_processed_source_sim_time": previous_source_time,
                 "processed_source_gap_s": source_gap_s,
                 "tracker_reset_reason": tracker_reset_reason,
@@ -588,6 +605,8 @@ class YoloSidecar:
                 "decode_ms": float(event["decode_ms"]),
                 "image_width": int(event["image_width"]),
                 "image_height": int(event["image_height"]),
+                "image_path": event.get("image_path"),
+                "frame_save_ms": event.get("frame_save_ms", 0.0),
                 "previous_processed_source_sim_time": event[
                     "previous_processed_source_sim_time"
                 ],
@@ -914,6 +933,10 @@ def parser():
     result.add_argument("--config", default=str(DEFAULT_CONFIG))
     result.add_argument("--device", default="0")
     result.add_argument(
+        "--save-processed-frames", action="store_true",
+        help="保存实际推理的原始相机图像供错分诊断；磁盘写入在worker内，单独记录耗时",
+    )
+    result.add_argument(
         "--yolo-profile",
         choices=YOLO_PROFILES,
         default="v1",
@@ -937,6 +960,9 @@ def main(argv=None):
     resources = _resource_metadata(args.config, args.yolo_profile, args.trt_engine)
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
+    resources["processed_frames_dir"] = (
+        str(output / "processed_frames") if args.save_processed_frames else None
+    )
     metadata = {
         "schema_version": 1,
         "mode": "personal_v1_control_yolo_sidecar_audit",
