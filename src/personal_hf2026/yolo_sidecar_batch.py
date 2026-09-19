@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：让方向敏感性候选方案可在后续多天气批次中独立验证。
+# 修改内容：透传默认关闭的输入旋转参数并在批次计划中记录。
+# 修改时间：2026-09-19。
 # 修改目的：让后续批量验证按需保留同帧离线重放所需的图像。
 # 修改内容：批次命令透传已处理帧保存开关并记录在计划中。
 # 修改时间：2026-09-18。
@@ -247,6 +250,8 @@ def child_command(item, args):
         item["output"],
         "--device",
         args.device,
+        "--image-rotation-deg",
+        str(args.image_rotation_deg),
     ]
     if args.config is not None:
         command.extend(["--config", str(args.config)])
@@ -288,6 +293,7 @@ def build_plan(args):
         "trt_engine": None if args.trt_engine is None else str(args.trt_engine),
         "device": args.device,
         "save_processed_frames": args.save_processed_frames,
+        "image_rotation_deg": args.image_rotation_deg,
         "yolo_profiles": list(args.yolo_profiles),
         "weathers": list(args.weathers),
         "seeds": list(args.seeds),
@@ -395,6 +401,8 @@ def parser():
         help="传给核心 runner 的 v3 TensorRT engine 覆盖路径",
     )
     result.add_argument("--device", default="0", help="传给核心 runner 的推理设备")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270), default=0,
+                        help="传给核心 runner 的单视图输入旋转，默认 0")
     result.add_argument("--save-processed-frames", action="store_true",
                         help="保存实际推理帧，供逐帧错分检查和离线重放")
     result.add_argument(

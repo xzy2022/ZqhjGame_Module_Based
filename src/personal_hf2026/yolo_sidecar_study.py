@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：在保持同一 v3 模型的前提下验证输入方向敏感性的候选缓解方案。
+# 修改内容：新增默认关闭的单视图旋转参数并记录实际方向，不增加模型推理次数。
+# 修改时间：2026-09-19。
 # 修改目的：区分单帧模型偏置和时序融合带来的类别变化。
 # 修改内容：旁路结果保留融合前后类别概率及低分恢复标记。
 # 修改时间：2026-09-19。
@@ -228,6 +231,7 @@ def _worker_main(
             weights_sha256=resources["weights_sha256"],
             flip=effective["flip_enabled"],
             tracker_high=effective["tracker_high_confidence_threshold"],
+            image_rotation_deg=effective.get("image_rotation_deg", 0),
         )
         stream_states = {}
         frame_output = resources.get("processed_frames_dir")
@@ -942,6 +946,8 @@ def parser():
     result.add_argument("--output", required=True)
     result.add_argument("--config", default=str(DEFAULT_CONFIG))
     result.add_argument("--device", default="0")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270),
+                        default=0, help="模型输入逆时针旋转角；输出框还原到原图，默认 0 保持原 v3")
     result.add_argument(
         "--save-processed-frames", action="store_true",
         help="保存实际推理的原始相机图像供错分诊断；磁盘写入在worker内，单独记录耗时",
@@ -968,6 +974,7 @@ def main(argv=None):
         raise SystemExit("--duration 必须大于 0")
     PersonalV1Agent.SEARCH_FOV_DEG = float(args.fov)
     resources = _resource_metadata(args.config, args.yolo_profile, args.trt_engine)
+    resources["effective_options"]["image_rotation_deg"] = args.image_rotation_deg
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
     resources["processed_frames_dir"] = (
