@@ -1,3 +1,6 @@
+# 修改时间：2026-09-19。
+# 修改目的：用同一离线评价口径显式比较 V1 三档与 V2 模型。
+# 修改内容：新增规范档位和独立权重参数，保存实际资源并保持逐序列单帧推理。
 # 修改时间：2026-09-18。
 # 修改目的：为双类别 YOLO 提供可替换、可复现的离线整帧评估入口。
 # 修改内容：实现 manifest 校验、推理适配、逐帧预测保存及按天气汇总的检测与纯算法耗时指标。
@@ -16,6 +19,8 @@ import platform
 import sys
 import time
 import traceback
+
+from .yolo_profiles import YOLO_PROFILES, canonical_profile, detector_kwargs, resolve_resources
 
 
 SCHEMA_VERSION = 1
@@ -502,13 +507,16 @@ class MetricAccumulator:
         }
 
 
-def load_detector(spec, config, device):
+def load_detector(spec, config, device, resources=None):
     if ":" not in spec:
         raise ValueError("--detector 必须是 module:factory")
     module_name, factory_name = spec.split(":", 1)
     factory = getattr(importlib.import_module(module_name), factory_name)
     started = time.perf_counter()
-    detector = factory(config=None if config is None else str(config), device=device)
+    if resources is None:
+        detector = factory(config=None if config is None else str(config), device=device)
+    else:
+        detector = factory(device=device, **detector_kwargs(resources))
     initialization_ms = (time.perf_counter() - started) * 1000.0
     if not callable(getattr(detector, "predict", None)):
         raise TypeError("detector 必须提供 predict(image_bgr, timestamp, sequence_id)")
@@ -589,7 +597,7 @@ def evaluate(args, output, manifest_sha256):
     except ImportError as error:
         raise RuntimeError("实际推理需要安装 opencv-python") from error
 
-    detector, initialization_ms = load_detector(args.detector, args.detector_config, args.device)
+    detector, initialization_ms = load_detector(args.detector, args.detector_config, args.device, args.resources)
     runtime_metadata = detector_runtime_metadata(detector)
     audit = ManifestAudit()
     overall = MetricAccumulator(args.iou_threshold)
@@ -662,6 +670,7 @@ def evaluate(args, output, manifest_sha256):
             )
             prediction_row = {
                 "schema_version": OUTPUT_SCHEMA_VERSION,
+                "yolo_profile": args.yolo_profile,
                 "source_manifest_sha256": manifest_sha256,
                 "source_line": line_number,
                 "dataset_id": row["dataset_id"],
@@ -686,6 +695,8 @@ def evaluate(args, output, manifest_sha256):
     temporary_predictions.replace(predictions_path)
     metrics = {
         "schema_version": OUTPUT_SCHEMA_VERSION,
+        "yolo_profile": args.yolo_profile,
+        "resources": args.resources,
         "status": "completed",
         "created_at": utc_now(),
         "matching": {
@@ -736,6 +747,12 @@ def parser():
         help="推理工厂 module:factory；仅 --manifest-only 时不导入",
     )
     result.add_argument("--detector-config", type=Path)
+    result.add_argument("--yolo-profile", type=canonical_profile, choices=YOLO_PROFILES,
+                        help="显式选择 V1 三档或 V2；小写v1/v2/v3为旧模型别名，省略保持原工厂行为")
+    result.add_argument("--weights", type=Path, help="所选档位的显式权重覆盖")
+    result.add_argument("--trt-engine", type=Path, help="V1-v3 的旧 FP16 engine")
+    result.add_argument("--v2-engine", type=Path, help="V2 的独立 raw two-class FP16 engine")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270), default=0)
     result.add_argument("--device", default="0")
     result.add_argument("--iou-threshold", type=float, default=0.5)
     result.add_argument("--confidence-threshold", type=float, default=0.25)
@@ -768,6 +785,16 @@ def validate_args(args):
         raise ValueError("--confidence-threshold 必须在 [0, 1] 内")
     if args.max_frames < 0:
         raise ValueError("--max-frames 不能为负数")
+    if args.yolo_profile is None and (args.weights or args.trt_engine or args.v2_engine or args.image_rotation_deg):
+        raise ValueError("指定权重或旋转参数时必须同时显式选择 --yolo-profile")
+    args.resources = None
+    if args.yolo_profile is not None and not args.manifest_only:
+        args.resources = resolve_resources(
+            args.yolo_profile, config=args.detector_config, v2_config=args.detector_config,
+            trt_engine=args.trt_engine, v2_engine=args.v2_engine, weights=args.weights,
+            image_rotation_deg=args.image_rotation_deg,
+        )
+        args.detector_config = Path(args.resources["config_path"])
 
 
 def main(argv=None):
@@ -787,6 +814,8 @@ def main(argv=None):
         "allowed_output_root": str(allowed_output_root),
         "mode": "manifest_only" if args.manifest_only else "evaluation",
         "detector": None if args.manifest_only else args.detector,
+        "yolo_profile": args.yolo_profile,
+        "resources": args.resources,
         "detector_config": None if args.detector_config is None else str(args.detector_config),
         "detector_config_sha256": (
             None if args.detector_config is None else file_sha256(args.detector_config)
