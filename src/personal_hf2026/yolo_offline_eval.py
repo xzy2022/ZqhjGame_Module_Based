@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：让离线汇总准确区分 V2 的实际推理和重复源时间跳过帧。
+# 修改内容：在逐帧预测日志中保存本次 predict 产生的原生流水线元数据。
+# 修改时间：2026-09-19。
 # 修改目的：用同一离线评价口径显式比较 V1 三档与 V2 模型。
 # 修改内容：新增规范档位和独立权重参数，保存实际资源并保持逐序列单帧推理。
 # 修改时间：2026-09-18。
@@ -689,6 +692,9 @@ def evaluate(args, output, manifest_sha256):
                 "step_ms": step_ms,
                 "decode_ms": decode_ms,
             }
+            frame_metadata = getattr(getattr(detector, "pipeline", None), "last_metadata", None)
+            if isinstance(frame_metadata, dict):
+                prediction_row["detector_frame_metadata"] = jsonable(frame_metadata)
             prediction_stream.write(
                 json.dumps(prediction_row, ensure_ascii=False, allow_nan=False) + "\n"
             )
