@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：用离线回放直接验证将在线部署的检测器旋转实现。
+# 修改内容：新增 image-rotation-deg 覆盖入口，并与额外诊断旋转分开记录。
+# 修改时间：2026-09-19。
 # 修改目的：复现在线显式图像旋转并避免离线消融结果携带原在线时序含义。
 # 修改内容：读取在线检测器旋转参数，重放结果分离原在线时序和实际离线间隔与耗时。
 # 修改时间：2026-09-19。
@@ -106,6 +109,7 @@ def parser():
     result.add_argument("--tracker-high", type=float, help="消融高置信阈值；默认取在线实际值")
     result.add_argument("--reset-each-frame", action="store_true", help="消融时序融合；默认保持每机原处理顺序")
     result.add_argument("--channel-order", choices=("bgr", "rgb"), default="bgr", help="默认原始 BGR；RGB 仅作通道交换消融")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270), help="检测器旋转；默认复现在线资源记录")
     result.add_argument("--rotation-deg", type=int, choices=(0, 90, 180, 270), default=0)
     result.add_argument("--contrast-scale", type=float, default=1.)
     result.add_argument("--brightness-offset", type=float, default=0.)
@@ -137,9 +141,11 @@ def main(argv=None):
     if args.detector_config is None and config_hash != resources["config_sha256"]:
         raise ValueError("重放基础配置 SHA256 与在线不一致")
     high = args.tracker_high if args.tracker_high is not None else options["tracker_high_confidence_threshold"]
+    detector_rotation = args.image_rotation_deg if args.image_rotation_deg is not None else options.get("image_rotation_deg", 0)
     identity = (args.detector_config is None and args.tracker_high is None and not args.reset_each_frame
                 and args.channel_order == "bgr" and args.rotation_deg == 0 and args.contrast_scale == 1.
-                and args.brightness_offset == 0. and args.gamma == 1. and args.sample_every == 1)
+                and args.brightness_offset == 0. and args.gamma == 1. and args.sample_every == 1
+                and detector_rotation == options.get("image_rotation_deg", 0))
     summary = {"run": str(run), "source_results_sha256": hashlib.sha256((run / "yolo_sidecar_results.jsonl").read_bytes()).hexdigest(),
                "mode": "cpu_input_audit" if args.audit_only else "v3_same_frame_replay",
                "identity_settings": identity, "config_path": str(config), "config_sha256": config_hash,
@@ -148,13 +154,14 @@ def main(argv=None):
                "sample_every": args.sample_every, "rotation_deg": args.rotation_deg,
                "contrast_scale": args.contrast_scale, "brightness_offset": args.brightness_offset, "gamma": args.gamma,
                "source_detector_image_rotation_deg": options.get("image_rotation_deg", 0),
+               "detector_image_rotation_deg": detector_rotation,
                "bbox_tolerance": args.bbox_tolerance, "score_tolerance": args.score_tolerance,
                "evidence_boundary": "同帧 UE 投影框仅用于审计；不代表人工可见性标注或真实曝光时间。"}
     detector, states = None, {}
     if not args.audit_only:
         from .vehicle_prop import create_detector
         from .vehicle_prop.temporal_tracker import CameraMotion, TemporalTracker
-        detector_options = {"image_rotation_deg": options["image_rotation_deg"]} if "image_rotation_deg" in options else {}
+        detector_options = {"image_rotation_deg": detector_rotation} if detector_rotation or "image_rotation_deg" in options else {}
         detector = create_detector(config=config, device=args.device, profile="v3", weights=resources["weights_path"],
                                    weights_sha256=resources["weights_sha256"], flip=False, tracker_high=high, **detector_options)
         summary["runtime"] = detector.runtime_metadata()
