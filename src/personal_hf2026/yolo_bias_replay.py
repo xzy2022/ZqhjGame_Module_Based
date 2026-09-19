@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：复现在线显式图像旋转并避免离线消融结果携带原在线时序含义。
+# 修改内容：读取在线检测器旋转参数，重放结果分离原在线时序和实际离线间隔与耗时。
+# 修改时间：2026-09-19。
 # 修改目的：在冻结的在线原图上检查观察方向与亮度域差异。
 # 修改内容：增加确定性间隔取样、直角旋转及全图亮度变换，并把检测框逆变换回原图计分。
 # 修改时间：2026-09-19。
@@ -144,14 +147,16 @@ def main(argv=None):
                "channel_order": args.channel_order, "reset_each_frame": args.reset_each_frame,
                "sample_every": args.sample_every, "rotation_deg": args.rotation_deg,
                "contrast_scale": args.contrast_scale, "brightness_offset": args.brightness_offset, "gamma": args.gamma,
+               "source_detector_image_rotation_deg": options.get("image_rotation_deg", 0),
                "bbox_tolerance": args.bbox_tolerance, "score_tolerance": args.score_tolerance,
                "evidence_boundary": "同帧 UE 投影框仅用于审计；不代表人工可见性标注或真实曝光时间。"}
     detector, states = None, {}
     if not args.audit_only:
         from .vehicle_prop import create_detector
         from .vehicle_prop.temporal_tracker import CameraMotion, TemporalTracker
+        detector_options = {"image_rotation_deg": options["image_rotation_deg"]} if "image_rotation_deg" in options else {}
         detector = create_detector(config=config, device=args.device, profile="v3", weights=resources["weights_path"],
-                                   weights_sha256=resources["weights_sha256"], flip=False, tracker_high=high)
+                                   weights_sha256=resources["weights_sha256"], flip=False, tracker_high=high, **detector_options)
         summary["runtime"] = detector.runtime_metadata()
     counts = Counter()
     dimensions, by_uid, previous = Counter(), Counter(), {}
@@ -164,7 +169,9 @@ def main(argv=None):
             if not path.is_absolute():
                 path = run / path
             raw = path.read_bytes()
+            decode_started = time.perf_counter()
             image = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+            replay_decode_ms = (time.perf_counter() - decode_started) * 1000.
             disk_image = cv2.imread(str(path), cv2.IMREAD_COLOR)
             decoded_equal = image is not None and disk_image is not None and np.array_equal(image, disk_image)
             hash_equal = hashlib.sha256(raw).hexdigest() == row["image_sha256"]
@@ -217,9 +224,25 @@ def main(argv=None):
                 max_score = max(max_score, parity["score_max_abs_error"])
                 truth = truth_objects(row)
                 online_metric.add(truth, [p for p in online if p["score"] >= .25], row["inference_wall_ms"], row["decode_ms"])
-                replay_metric.add(truth, [p for p in replay if p["score"] >= .25], step_ms, 0.)
+                replay_metric.add(truth, [p for p in replay if p["score"] >= .25], step_ms, replay_decode_ms)
+                reset_reason = None
+                if args.reset_each_frame:
+                    reset_reason = "explicit_reset_each_frame"
+                elif gap is not None and gap <= 0:
+                    reset_reason = "non_increasing_source_time"
+                elif gap is not None and gap > detector.pipeline.tracker.max_gap_s:
+                    reset_reason = "source_gap_exceeds_tracker_max_gap"
+                timing_fields = ("inference_wall_ms", "decode_ms", "previous_processed_source_sim_time", "processed_source_gap_s",
+                                 "tracker_reset_reason", "inference_completed_sim_time", "result_observed_sim_time",
+                                 "result_observed_unix_s", "result_observed_perf_counter", "observation_latency_sim_s", "frame_save_ms")
                 replay_row = {**row, "predictions": replay, "replay_step_ms": step_ms,
-                              "replay_settings_identity": identity, "same_frame_parity": parity["within_tolerance"]}
+                              "replay_settings_identity": identity, "same_frame_parity": parity["within_tolerance"],
+                              "source_online_timing": {key: row[key] for key in timing_fields if key in row}}
+                for key in timing_fields:
+                    replay_row.pop(key, None)
+                replay_row.update({"inference_wall_ms": step_ms, "decode_ms": replay_decode_ms,
+                                   "previous_processed_source_sim_time": timestamp-gap if gap is not None else None,
+                                   "processed_source_gap_s": gap, "tracker_reset_reason": reset_reason})
                 replay_stream.write(json.dumps(replay_row, ensure_ascii=False, allow_nan=False) + "\n")
             audit.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
             if counts["frames"] % 200 == 0:
