@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：避免直接汇总方向清单时把原在线抽样行当成完整在线吞吐。
+# 修改内容：识别诊断清单为sampled_online，只计算精度及所选耗时，不报告FPS和场景每分钟误报。
+# 修改时间：2026-09-19。
 # 修改目的：不把旧回放缺失的解码计时写成实测零毫秒。
 # 修改内容：仅将确实存在的decode_ms纳入公共累加器的解码耗时分布。
 # 修改时间：2026-09-19。
@@ -103,6 +106,8 @@ def inspect_run(entry):
                 "offline" if rows and "gt_objects" in rows[0] else "online")
     if mode == "replay" and not metadata and replay_summary.get("run"):
         metadata = read_json(Path(replay_summary["run"]) / "metadata.json")
+    if mode == "online" and metadata.get("diagnostic_subset"):
+        mode = "sampled_online"
     accumulators = defaultdict(lambda: MetricAccumulator(.5))
     counters, per_frame, matched_objects = Counter(), {}, {}
     identities = defaultdict(Counter)
@@ -230,8 +235,10 @@ def inspect_run(entry):
             (r["result_observed_perf_counter"] - r["submitted_perf_counter"]) * 1000 for r in rows
             if r.get("result_observed_perf_counter") is not None and r.get("submitted_perf_counter") is not None])
         result["latency"]["result_observation_sim_s"] = distribution([r.get("observation_latency_sim_s") for r in rows])
-    else:
+    elif mode != "sampled_online":
         result["offline_algorithm_fps"] = metrics["timing"]["algorithm_step"]["fps"]
+    else:
+        result["timing_boundary"] = "仅为源在线运行的稀疏抽样行，不能计算完整在线或离线吞吐。"
     return result, per_frame, matched_objects
 
 
