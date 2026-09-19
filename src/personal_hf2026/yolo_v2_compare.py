@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：区分V2重复源时间导致的空结果回调与真正完成的模型推理。
+# 修改内容：增加跳过原因、实际推理计数和独立耗时与吞吐，精度仍评价所有回调输入。
+# 修改时间：2026-09-19。
 # 修改目的：避免直接汇总方向清单时把原在线抽样行当成完整在线吞吐。
 # 修改内容：识别诊断清单为sampled_online，只计算精度及所选耗时，不报告FPS和场景每分钟误报。
 # 修改时间：2026-09-19。
@@ -113,6 +116,8 @@ def inspect_run(entry):
     identities = defaultdict(Counter)
     source_times, observed_times, gaps, by_uid = defaultdict(list), [], [], defaultdict(list)
     inference_values, decode_values, previous_source = [], [], {}
+    active_inference_values, active_rows, active_gaps, skip_reasons = [], [], [], Counter()
+    previous_active_source = {}
     for row in rows:
         truth = row.get("gt_objects")
         if truth is None:
@@ -133,6 +138,18 @@ def inspect_run(entry):
                   else row.get("replay_decode_ms"))
         inference_values.append(timing)
         decode_values.append(decode)
+        frame_metadata = row.get("detector_frame_metadata") or {}
+        skipped = bool(frame_metadata.get("skipped"))
+        if skipped:
+            skip_reasons[str(frame_metadata.get("reset_reason", "unspecified"))] += 1
+        else:
+            active_rows.append(row)
+            active_inference_values.append(timing)
+            active_stream, active_timestamp = source_stream(row), source_time(row)
+            if active_timestamp is not None:
+                if active_stream in previous_active_source:
+                    active_gaps.append(active_timestamp - previous_active_source[active_stream])
+                previous_active_source[active_stream] = active_timestamp
         uid = str(row.get("uid", "unknown"))
         for group_key in ("overall", f"weather/{weather}", f"uid/{uid}"):
             frame_matches, _, _ = accumulators[group_key].add(truth, predictions, timing, decode or 0)
@@ -188,6 +205,8 @@ def inspect_run(entry):
               "metrics": metrics, "by_weather": {k[8:]: finish(v) for k, v in accumulators.items() if k.startswith("weather/")},
               "by_uid": {k[4:]: finish(v) for k, v in accumulators.items() if k.startswith("uid/")},
               "unique_frame_keys": len(per_frame), "counts": dict(counters),
+              "inference_completion_counts": {"completed_callback_rows": len(rows), "active_inference_rows": len(active_rows),
+                                               "skipped_callback_rows": len(rows) - len(active_rows), "skip_reasons": dict(skip_reasons)},
               "duplicate_frame_key_count": len(rows) - len(per_frame),
               "by_gt_identity": {key: {**value, "conditional_accuracy": ratio(value["correct_class"], value["localized_pairs"])} for key, value in sorted(identities.items())},
               "source_uav_seconds": source_seconds,
@@ -198,9 +217,12 @@ def inspect_run(entry):
               "class_agnostic_fp_per_scene_sim_minute": ratio(metrics["localization_class_agnostic"]["fp"] * 60, duration),
               "source_gap_s": distribution(gaps), "source_gap_over_0_25_count": sum(value > .25 for value in gaps),
               "source_gap_over_0_25_ratio": ratio(sum(value > .25 for value in gaps), len(gaps)),
+              "active_inference_source_gap_s": distribution(active_gaps),
+              "active_inference_source_gap_over_0_25_ratio": ratio(sum(value > .25 for value in active_gaps), len(active_gaps)),
               "resources": metadata.get("resources", {}) if mode == "online" else replay_summary.get("runtime", offline_metrics.get("detector_runtime_metadata", metadata.get("resources", {}))),
               "replay_settings": {key: replay_summary[key] for key in ("reset_each_frame", "rotation_deg", "rotation_square_pad", "detector_image_rotation_deg", "sample_every") if key in replay_summary},
               "latency": {"inference_ms": distribution(inference_values),
+                          "active_inference_ms": distribution(active_inference_values),
                           "decode_ms": distribution(decode_values),
                           "frame_save_ms": distribution([r.get("frame_save_ms") for r in rows] if mode == "online" else [])},
               "legacy_replay_inherited_online_timing_ignored": mode == "replay" and any("source_online_timing" not in r for r in rows)}
@@ -215,18 +237,26 @@ def inspect_run(entry):
             times = sorted(r["result_observed_perf_counter"] for r in uid_rows if r.get("result_observed_perf_counter") is not None)
             intervals = [right - left for left, right in zip(times, times[1:])]
             uid_gaps = [r["processed_source_gap_s"] for r in uid_rows if r.get("processed_source_gap_s") is not None]
+            uid_active = [r for r in uid_rows if not (r.get("detector_frame_metadata") or {}).get("skipped")]
             uid_timing[uid] = {"completed": len(uid_rows), "wall_window_fps": ratio(len(uid_rows), wall_seconds),
+                               "active_inference_count": len(uid_active), "skipped_count": len(uid_rows) - len(uid_active),
+                               "active_inference_wall_window_fps": ratio(len(uid_active), wall_seconds),
                                "completion_fps": ratio(len(times) - 1, max(times) - min(times)) if len(times) > 1 else None,
                                "result_observation_interval_wall_s": distribution(intervals),
                                "source_gap_s": distribution(uid_gaps),
                                "source_gap_over_0_25_ratio": ratio(sum(value > .25 for value in uid_gaps), len(uid_gaps)),
                                "wall_interval_over_0_25_ratio": ratio(sum(value > .25 for value in intervals), len(intervals))}
         worker_times = [r["worker_completed_perf_counter"] for r in rows if r.get("worker_completed_perf_counter") is not None]
+        active_observed = [r["result_observed_perf_counter"] for r in active_rows if r.get("result_observed_perf_counter") is not None]
+        active_worker = [r["worker_completed_perf_counter"] for r in active_rows if r.get("worker_completed_perf_counter") is not None]
         result["online"] = {"window_semantics": "首个 accepted submission 到末个 Runner 结果观察；包含启动等待、IPC和保存，不含UE启动前开销。",
                             "wall_window_s": wall_seconds, "wall_window_total_fps": ratio(len(rows), wall_seconds),
+                            "active_inference_wall_window_fps": ratio(len(active_rows), wall_seconds),
                             "completion_wall_span_s": completion_seconds,
                             "result_observation_completion_fps": ratio(len(observed_times) - 1, completion_seconds),
                             "worker_completion_fps": ratio(len(worker_times) - 1, max(worker_times) - min(worker_times)) if len(worker_times) > 1 else None,
+                            "active_result_observation_completion_fps": ratio(len(active_observed) - 1, max(active_observed) - min(active_observed)) if len(active_observed) > 1 else None,
+                            "active_worker_completion_fps": ratio(len(active_worker) - 1, max(active_worker) - min(active_worker)) if len(active_worker) > 1 else None,
                             "requested_sim_duration_s": duration, "frames_per_requested_sim_second": ratio(len(rows), duration),
                             "requested_sim_seconds_per_wall_second": ratio(duration, wall_seconds),
                             "counts": summary.get("counts", {"submitted": len(submissions), "completed": len(rows)}),
@@ -236,7 +266,8 @@ def inspect_run(entry):
             if r.get("result_observed_perf_counter") is not None and r.get("submitted_perf_counter") is not None])
         result["latency"]["result_observation_sim_s"] = distribution([r.get("observation_latency_sim_s") for r in rows])
     elif mode != "sampled_online":
-        result["offline_algorithm_fps"] = metrics["timing"]["algorithm_step"]["fps"]
+        result["offline_algorithm_fps"] = ratio(len(active_inference_values) * 1000, sum(active_inference_values))
+        result["offline_all_callback_fps"] = metrics["timing"]["algorithm_step"]["fps"]
     else:
         result["timing_boundary"] = "仅为源在线运行的稀疏抽样行，不能计算完整在线或离线吞吐。"
     return result, per_frame, matched_objects
@@ -279,6 +310,7 @@ def compare(args):
         "time": "实际wall FPS来自perf_counter。source、observation sim时间不是曝光时间；稀疏片段FP/min只以已取样序列跨度为分母。",
         "online_comparison": "不同UE运行的场景/处理帧不完全相同；同图回放用于精度归因，真实在线用于吞吐观察。",
         "offline": "离线算法FPS不含UE渲染、IPC及最新帧覆盖；不替代在线FPS。",
+        "skipped_inputs": "精度包含所有回调输入，原生skipped返回空仍计入系统漏检；active_inference耗时和FPS排除这些未推理回调，completed默认计回调。",
         "labels": "UE投影GT属于审计元数据；空GT不保证人工可见性意义的空背景。"}}
     write_json(output / "comparison.json", report)
     lines = ["# V1-v3 / V2 统一日志评价", "", "IoU≥0.5，score≥0.25；分类按 class_id。GT 为未验证可见性的 UE 投影。", "",
