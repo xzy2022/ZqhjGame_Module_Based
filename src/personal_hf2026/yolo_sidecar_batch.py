@@ -1,3 +1,12 @@
+# 修改时间：2026-09-19。
+# 修改目的：生成四档 YOLO 的无歧义串行计划并分别指定两代 TensorRT 权重。
+# 修改内容：规范旧别名并透传 V2 独立配置与 engine，保持默认仅计划。
+# 修改时间：2026-09-19。
+# 修改目的：让方向敏感性候选方案可在后续多天气批次中独立验证。
+# 修改内容：透传默认关闭的输入旋转参数并在批次计划中记录。
+# 修改时间：2026-09-19。
+# 修改目的：让后续批量验证按需保留同帧离线重放所需的图像。
+# 修改内容：批次命令透传已处理帧保存开关并记录在计划中。
 # 修改时间：2026-09-18。
 # 修改目的：让三档在线 YOLO 方案按相同天气、种子和时长独立计划并保留完整身份链路。
 # 修改内容：新增 profile 与 TensorRT engine 传播，并校验每轮 metadata、summary 和结果行的方案一致性。
@@ -24,6 +33,10 @@ import subprocess
 import sys
 
 from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SCENARIO_ROOT, SIM_ROOT
+from .yolo_profiles import (
+    DEFAULT_CONFIG, DEFAULT_TRT_ENGINE, DEFAULT_V2_CONFIG, DEFAULT_V2_ENGINE,
+    YOLO_PROFILES, canonical_profile,
+)
 
 
 WEATHERS = (
@@ -37,7 +50,6 @@ WEATHERS = (
 DEFAULT_LAYOUT = SCENARIO_ROOT / "static-decoys.json"
 RUNNER_MODULE = "yolo_sidecar_study"
 RESULTS_NAME = "yolo_sidecar_results.jsonl"
-YOLO_PROFILES = ("v1", "v2", "v3")
 
 
 def utc_now():
@@ -69,6 +81,8 @@ def validate_args(args, parser):
         args.trt_engine = args.trt_engine.resolve()
     if args.config is not None:
         args.config = args.config.resolve()
+    args.v2_config = args.v2_config.resolve()
+    args.v2_engine = args.v2_engine.resolve()
     allowed_output_root = OUTPUT_ROOT.resolve()
     if not args.layout.is_file():
         parser.error(f"--layout 不存在：{args.layout}")
@@ -76,6 +90,9 @@ def validate_args(args, parser):
         parser.error(f"--config 不存在：{args.config}")
     if args.trt_engine is not None and not args.trt_engine.is_file():
         parser.error(f"--trt-engine 不存在：{args.trt_engine}")
+    if args.execute and "V2" in args.yolo_profiles:
+        if not args.v2_config.is_file() or not args.v2_engine.is_file():
+            parser.error("执行 V2 时 --v2-config 和 --v2-engine 必须指向实际文件")
     if not is_relative_to(args.output, allowed_output_root):
         parser.error(f"--output 必须位于 {allowed_output_root} 下")
     if args.duration <= 0:
@@ -244,11 +261,17 @@ def child_command(item, args):
         item["output"],
         "--device",
         args.device,
+        "--image-rotation-deg",
+        str(args.image_rotation_deg),
     ]
-    if args.config is not None:
+    if args.config is not None and item["yolo_profile"] != "V2":
         command.extend(["--config", str(args.config)])
-    if args.trt_engine is not None and item["yolo_profile"] == "v3":
+    if args.trt_engine is not None and item["yolo_profile"] == "V1-v3":
         command.extend(["--trt-engine", str(args.trt_engine)])
+    if item["yolo_profile"] == "V2":
+        command.extend(["--v2-config", str(args.v2_config), "--v2-engine", str(args.v2_engine)])
+    if args.save_processed_frames:
+        command.append("--save-processed-frames")
     return command
 
 
@@ -265,6 +288,9 @@ def build_plan(args):
                     "seed": seed,
                     "duration_s": args.duration,
                     "fov_deg": args.fov,
+                    "config": str(args.v2_config if profile == "V2" else args.config or DEFAULT_CONFIG),
+                    "engine": (str(args.v2_engine) if profile == "V2" else
+                               str(args.trt_engine or DEFAULT_TRT_ENGINE) if profile == "V1-v3" else None),
                     "output": str(args.output / "runs" / run_id),
                 }
                 item["command"] = child_command(item, args)
@@ -281,7 +307,11 @@ def build_plan(args):
         "fov_deg": args.fov,
         "config": None if args.config is None else str(args.config),
         "trt_engine": None if args.trt_engine is None else str(args.trt_engine),
+        "v2_config": str(args.v2_config),
+        "v2_engine": str(args.v2_engine),
         "device": args.device,
+        "save_processed_frames": args.save_processed_frames,
+        "image_rotation_deg": args.image_rotation_deg,
         "yolo_profiles": list(args.yolo_profiles),
         "weathers": list(args.weathers),
         "seeds": list(args.seeds),
@@ -378,17 +408,24 @@ def parser():
     result.add_argument(
         "--yolo-profiles",
         nargs="+",
+        type=canonical_profile,
         choices=YOLO_PROFILES,
         default=YOLO_PROFILES,
-        help="要分别执行的在线方案；默认 v1 v2 v3，每档各执行天气×种子轮次",
+        help="默认 V1-v1 V1-v2 V1-v3 V2；小写 v1/v2/v3 仅为旧模型三档别名",
     )
     result.add_argument("--config", type=Path, help="传给核心 runner 的检测器配置")
     result.add_argument(
         "--trt-engine",
         type=Path,
-        help="传给核心 runner 的 v3 TensorRT engine 覆盖路径",
+        help="传给核心 runner 的 V1-v3 TensorRT engine 覆盖路径",
     )
+    result.add_argument("--v2-config", type=Path, default=DEFAULT_V2_CONFIG, help="V2 独立配置")
+    result.add_argument("--v2-engine", type=Path, default=DEFAULT_V2_ENGINE, help="V2 本机 raw two-class FP16 engine")
     result.add_argument("--device", default="0", help="传给核心 runner 的推理设备")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270), default=0,
+                        help="传给核心 runner 的单视图输入旋转，默认 0")
+    result.add_argument("--save-processed-frames", action="store_true",
+                        help="保存实际推理帧，供逐帧错分检查和离线重放")
     result.add_argument(
         "--execute",
         action="store_true",

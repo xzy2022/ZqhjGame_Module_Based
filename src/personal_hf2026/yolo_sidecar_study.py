@@ -1,3 +1,15 @@
+# 修改时间：2026-09-19。
+# 修改目的：在线比较 V1 三档与 V2，保持各机独立时序并核验全程固定 FOV。
+# 修改内容：统一档位与资源解析，新增 V2 原生多流推理及阶段 FOV 审计。
+# 修改时间：2026-09-19。
+# 修改目的：在保持同一 v3 模型的前提下验证输入方向敏感性的候选缓解方案。
+# 修改内容：新增默认关闭的单视图旋转参数并记录实际方向，不增加模型推理次数。
+# 修改时间：2026-09-19。
+# 修改目的：区分单帧模型偏置和时序融合带来的类别变化。
+# 修改内容：旁路结果保留融合前后类别概率及低分恢复标记。
+# 修改时间：2026-09-19。
+# 修改目的：保留在线错分诊断所需的真实推理图像以支持同帧重放。
+# 修改内容：新增可选的已处理帧原始字节保存及图像路径和保存耗时记录。
 # 修改时间：2026-09-18。
 # 修改目的：让在线 YOLO 旁路可通过 CLI 对比原始 PT、无翻转 PT 与无翻转 TensorRT FP16 三档。
 # 修改内容：新增 profile 解析、TensorRT engine 覆盖、高置信阈值相对提高 20% 及逐层资源身份日志。
@@ -35,6 +47,10 @@ from .dropout_capture import StudyRenderer
 from .paths import PROJECT_ROOT, RUNTIME_ROOT, SCENARIO_ROOT
 from .personal_v1 import PersonalV1Agent
 from .timing_study import StudyRunner
+from .yolo_profiles import (
+    DEFAULT_CONFIG, DEFAULT_TRT_ENGINE, DEFAULT_V2_CONFIG, DEFAULT_V2_ENGINE,
+    YOLO_PROFILES, canonical_profile, detector_kwargs, resolve_resources,
+)
 
 
 WEATHERS = (
@@ -45,15 +61,7 @@ WEATHERS = (
     "Snow_Light",
     "Sand_Dust_Calm",
 )
-DEFAULT_CONFIG = PROJECT_ROOT / "configs/detectors/vehicle_prop/vehicle_frontier.json"
 DEFAULT_LAYOUT = PROJECT_ROOT / "configs/scenarios/coop_decoy/static-decoys.json"
-DEFAULT_TRT_ENGINE = Path(
-    "D:/Workspace/00_MyRepo/red_m_competiton/output/personal_v2/"
-    "yolo-offline-accel/trt-fp16-build-20260918-214857-153/"
-    "yolo26s_two_class.engine"
-)
-YOLO_PROFILES = ("v1", "v2", "v3")
-V3_TRACKER_HIGH_MULTIPLIER = 1.2
 SLOT_CAPACITY_BYTES = 32 * 1024 * 1024
 SLOT_HEADER = struct.Struct("<I")
 
@@ -184,6 +192,13 @@ def _serialise_predictions(raw_predictions):
             "detector_confidence": float(raw.get("detector_confidence", raw["score"])),
             "track_id": int(raw.get("track_id", 0)),
             "track_hits": int(raw.get("track_hits", 0)),
+            "single_frame_probabilities": [
+                float(value) for value in raw.get("single_frame_probabilities", [])
+            ],
+            "class_probabilities": [
+                float(value) for value in raw.get("class_probabilities", [])
+            ],
+            "recovered_low_score": bool(raw.get("recovered_low_score", False)),
         })
     return output
 
@@ -206,17 +221,14 @@ def _worker_main(
         from .vehicle_prop.temporal_tracker import CameraMotion, TemporalTracker
 
         started = time.perf_counter()
-        effective = resources["effective_options"]
-        detector = create_detector(
-            config=config,
-            device=device,
-            profile=resources["profile"],
-            weights=resources["weights_path"],
-            weights_sha256=resources["weights_sha256"],
-            flip=effective["flip_enabled"],
-            tracker_high=effective["tracker_high_confidence_threshold"],
-        )
+        detector = create_detector(device=device, **detector_kwargs(resources))
+        manages_streams = bool(getattr(detector, "manages_streams", False))
+        max_source_gap_s = float(detector.pipeline.config.get("max_source_gap_s", 0.25))
         stream_states = {}
+        frame_output = resources.get("processed_frames_dir")
+        if frame_output:
+            frame_output = Path(frame_output)
+            frame_output.mkdir(parents=True, exist_ok=True)
         result_pipe.send({
             "event": "worker_ready",
             "initialization_ms": (time.perf_counter() - started) * 1000.0,
@@ -273,12 +285,13 @@ def _worker_main(
             inference_started = time.perf_counter()
             uid = str(metadata["uid"])
             if uid not in stream_states:
-                stream_states[uid] = {
-                    "camera": CameraMotion(),
-                    "tracker": TemporalTracker(**detector.pipeline.config["tracker"]),
-                    "previous_t": None,
-                    "sequence": uid,
-                }
+                stream_states[uid] = {"previous_t": None}
+                if not manages_streams:
+                    stream_states[uid].update({
+                        "camera": CameraMotion(),
+                        "tracker": TemporalTracker(**detector.pipeline.config["tracker"]),
+                        "sequence": uid,
+                    })
             state = stream_states[uid]
             source_time = float(metadata["source_sim_time"])
             previous_source_time = state["previous_t"]
@@ -290,36 +303,49 @@ def _worker_main(
             if source_gap_s is not None:
                 if source_gap_s <= 0.0:
                     tracker_reset_reason = "non_increasing_source_time"
-                elif source_gap_s > state["tracker"].max_gap_s:
+                elif source_gap_s > (max_source_gap_s if manages_streams else state["tracker"].max_gap_s):
                     tracker_reset_reason = "source_gap_exceeds_tracker_max_gap"
             # 三机共享同一个 YOLO 模型，但各自保留时序跟踪与相机运动状态。
-            detector.pipeline.camera = state["camera"]
-            detector.pipeline.tracker = state["tracker"]
-            detector.pipeline.previous_t = state["previous_t"]
-            detector.pipeline.sequence = state["sequence"]
-            predictions = detector.predict(
-                image,
-                timestamp=source_time,
-                sequence_id=uid,
-            )
-            state.update({
-                "camera": detector.pipeline.camera,
-                "tracker": detector.pipeline.tracker,
-                "previous_t": detector.pipeline.previous_t,
-                "sequence": detector.pipeline.sequence,
-            })
+            if manages_streams:
+                predictions = detector.predict(image, timestamp=source_time, sequence_id=uid, stream_id=uid)
+                state["previous_t"] = detector.pipeline.streams[uid].previous_t
+                # V2 对重复源时间会跳过而非 reset，采用流水线的真实决定。
+                frame_metadata = detector.pipeline.last_metadata
+                tracker_reset_reason = {
+                    "source_gap": "source_gap_exceeds_tracker_max_gap",
+                    "nonincreasing_source_time": "non_increasing_source_time_skipped",
+                }.get(frame_metadata.get("reset_reason"), frame_metadata.get("reset_reason"))
+            else:
+                for name, value in state.items():
+                    setattr(detector.pipeline, name, value)
+                predictions = detector.predict(image, timestamp=source_time, sequence_id=uid)
+                state.update({name: getattr(detector.pipeline, name) for name in state})
             inference_completed = time.perf_counter()
+            image_path = None
+            save_started = time.perf_counter()
+            if frame_output:
+                # 保留模型实际收到的压缩字节，避免再次编码改变离线重放的像素。
+                suffix = ".png" if image_bytes.startswith(b"\x89PNG") else ".jpg"
+                saved_frame = frame_output / f"{sequence:07d}{suffix}"
+                saved_frame.write_bytes(image_bytes)
+                image_path = str(saved_frame.resolve())
             result_pipe.send({
                 "event": "completed",
                 "submission_id": sequence,
+                "worker_inference_started_perf_counter": inference_started,
                 "worker_completed_perf_counter": inference_completed,
                 "decode_ms": decode_ms,
                 "inference_wall_ms": (inference_completed - inference_started) * 1000.0,
                 "image_width": int(image.shape[1]),
                 "image_height": int(image.shape[0]),
+                "image_path": image_path,
+                "frame_save_ms": (time.perf_counter() - save_started) * 1000.0,
                 "previous_processed_source_sim_time": previous_source_time,
                 "processed_source_gap_s": source_gap_s,
                 "tracker_reset_reason": tracker_reset_reason,
+                "detector_frame_metadata": (
+                    dict(detector.pipeline.last_metadata) if manages_streams else None
+                ),
                 "predictions": _serialise_predictions(predictions),
             })
     except Exception as exc:  # noqa: BLE001
@@ -585,14 +611,19 @@ class YoloSidecar:
                 "result_observed_unix_s": time.time(),
                 "result_observed_perf_counter": time.perf_counter(),
                 "inference_wall_ms": float(event["inference_wall_ms"]),
+                "worker_inference_started_perf_counter": event["worker_inference_started_perf_counter"],
+                "worker_completed_perf_counter": event["worker_completed_perf_counter"],
                 "decode_ms": float(event["decode_ms"]),
                 "image_width": int(event["image_width"]),
                 "image_height": int(event["image_height"]),
+                "image_path": event.get("image_path"),
+                "frame_save_ms": event.get("frame_save_ms", 0.0),
                 "previous_processed_source_sim_time": event[
                     "previous_processed_source_sim_time"
                 ],
                 "processed_source_gap_s": event["processed_source_gap_s"],
                 "tracker_reset_reason": event["tracker_reset_reason"],
+                "detector_frame_metadata": event.get("detector_frame_metadata"),
                 "predictions": event["predictions"],
             })
             if self.last_observed_sim_time is not None:
@@ -779,6 +810,8 @@ class YoloSidecarRunner(StudyRunner):
         self.sidecar = None
         self.sidecar_summary = None
         self.delivered_frames = set()
+        self.observed_fov_by_phase = Counter()
+        self.observed_fov_mismatch_count = 0
 
     def prepare_scenario(self):
         super().prepare_scenario()
@@ -819,6 +852,11 @@ class YoloSidecarRunner(StudyRunner):
         controlled_decide = agent.decide
 
         def decide(obs, dt):
+            # 此统计覆盖每次 Agent 决策；FOV 观测仍不等同于已核验曝光参数。
+            observed_fov = float(obs.self.gimbal_fov_deg)
+            phase = str(getattr(agent, "_state", "unknown"))
+            self.observed_fov_by_phase[(str(entity_uid), phase, observed_fov)] += 1
+            self.observed_fov_mismatch_count += int(abs(observed_fov - PersonalV1Agent.SEARCH_FOV_DEG) > 1e-6)
             score = getattr(getattr(obs, "briefing", None), "score_view", None)
             observed_sim_time = score.sim_time if score is not None else None
             if self.sidecar:
@@ -841,6 +879,17 @@ class YoloSidecarRunner(StudyRunner):
         agent.decide = decide
         return agent
 
+    def fov_audit(self):
+        return {
+            "requested_fov_deg": PersonalV1Agent.SEARCH_FOV_DEG,
+            "observed_mismatch_count": self.observed_fov_mismatch_count,
+            "observed_by_uid_phase": [
+                {"uid": uid, "phase": phase, "fov_deg": fov, "observations": count}
+                for (uid, phase, fov), count in sorted(self.observed_fov_by_phase.items())
+            ],
+            "alignment": "runner_observation_not_verified_exposure_time",
+        }
+
     def should_finish(self, agents):
         # 更新 V1 完成摘要，但视觉评估必须覆盖用户请求的完整时长。
         super().should_finish(agents)
@@ -859,47 +908,8 @@ class YoloSidecarRunner(StudyRunner):
         self.judge.close()
 
 
-def _resource_metadata(config, profile, trt_engine):
-    config = Path(config).resolve()
-    detector_config = json.loads(config.read_text(encoding="utf-8"))
-    configured_weights = (PROJECT_ROOT / detector_config["weights"]).resolve()
-    if profile == "v3":
-        weights = Path(trt_engine).resolve()
-        if weights.suffix.lower() != ".engine":
-            raise ValueError("v3 的 --trt-engine 必须指向 .engine 文件")
-        flip_enabled = False
-        tracker_high_multiplier = V3_TRACKER_HIGH_MULTIPLIER
-    else:
-        weights = configured_weights
-        flip_enabled = profile == "v1"
-        tracker_high_multiplier = 1.0
-    weights_sha256 = hashlib.sha256(weights.read_bytes()).hexdigest()
-    if profile != "v3" and weights_sha256 != detector_config["sha256"]:
-        raise ValueError("基础 PT 权重与配置中的 sha256 不一致")
-    base_tracker_high = float(detector_config["tracker"]["high"])
-    return {
-        "profile": profile,
-        "config_path": str(config),
-        "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
-        "weights_path": str(weights),
-        "weights_sha256": weights_sha256,
-        "model_format": (
-            "tensorrt_engine" if weights.suffix.lower() == ".engine" else "pytorch_pt"
-        ),
-        "effective_options": {
-            "flip_enabled": flip_enabled,
-            "tracker_high_confidence_threshold": (
-                base_tracker_high * tracker_high_multiplier
-            ),
-            "tracker_low_confidence_threshold": float(
-                detector_config["tracker"]["low"]
-            ),
-            "unknown_class_confidence_threshold": float(
-                detector_config["unknown_threshold"]
-            ),
-            "tracker_high_multiplier": tracker_high_multiplier,
-        },
-    }
+def _resource_metadata(config, profile, trt_engine, **options):
+    return resolve_resources(profile, config, trt_engine, **options)
 
 
 def parser():
@@ -912,17 +922,26 @@ def parser():
     result.add_argument("--fov", type=float, default=48.0)
     result.add_argument("--output", required=True)
     result.add_argument("--config", default=str(DEFAULT_CONFIG))
+    result.add_argument("--v2-config", default=str(DEFAULT_V2_CONFIG), help="V2 独立配置，不复用 V1 --config")
+    result.add_argument("--v2-engine", default=str(DEFAULT_V2_ENGINE), help="V2 本机 raw two-class FP16 engine")
     result.add_argument("--device", default="0")
+    result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270),
+                        default=0, help="模型输入逆时针旋转角；输出框还原到原图，默认 0 保持原 v3")
+    result.add_argument(
+        "--save-processed-frames", action="store_true",
+        help="保存实际推理的原始相机图像供错分诊断；磁盘写入在worker内，单独记录耗时",
+    )
     result.add_argument(
         "--yolo-profile",
+        type=canonical_profile,
         choices=YOLO_PROFILES,
-        default="v1",
-        help="v1=原始 PT+翻转，v2=原始 PT+无翻转，v3=TensorRT FP16+无翻转+tracker.high 相对提高 20%%",
+        default="V1-v1",
+        help="V1-v1=PT翻转，V1-v2=PT无翻转，V1-v3=旧FP16，V2=新模型；旧小写v1/v2/v3仍映射V1三档",
     )
     result.add_argument(
         "--trt-engine",
         default=str(DEFAULT_TRT_ENGINE),
-        help="v3 使用的 TensorRT FP16 .engine；其余档位忽略此参数",
+        help="V1-v3 使用的旧 TensorRT FP16 .engine；V2 使用独立 --v2-engine",
     )
     return result
 
@@ -934,9 +953,15 @@ def main(argv=None):
     if args.duration <= 0:
         raise SystemExit("--duration 必须大于 0")
     PersonalV1Agent.SEARCH_FOV_DEG = float(args.fov)
-    resources = _resource_metadata(args.config, args.yolo_profile, args.trt_engine)
+    resources = _resource_metadata(args.config, args.yolo_profile, args.trt_engine,
+                                   v2_config=args.v2_config, v2_engine=args.v2_engine,
+                                   image_rotation_deg=args.image_rotation_deg)
+    resources["requested_fov_deg"] = args.fov
     output = Path(args.output).resolve()
     output.mkdir(parents=True, exist_ok=False)
+    resources["processed_frames_dir"] = (
+        str(output / "processed_frames") if args.save_processed_frames else None
+    )
     metadata = {
         "schema_version": 1,
         "mode": "personal_v1_control_yolo_sidecar_audit",
@@ -951,6 +976,7 @@ def main(argv=None):
         "duration": args.duration,
         "requested_fov_deg": args.fov,
         "effective_fov_deg": PersonalV1Agent.SEARCH_FOV_DEG,
+        "fov_policy": "initial_search_coop_and_lock_min_max_preferred_all_fixed",
         "device": args.device,
         "yolo_profile": args.yolo_profile,
         "multiprocessing_start_method": "spawn",
@@ -988,7 +1014,7 @@ def main(argv=None):
             output,
             args.runtime_root,
             args.weather,
-            args.config,
+            resources["config_path"],
             args.device,
             resources,
             log,
@@ -1024,6 +1050,7 @@ def main(argv=None):
                 "seed": args.seed,
                 "duration": args.duration,
                 "fov_deg": args.fov,
+                "fov_audit": runner.fov_audit(),
                 "yolo_profile": args.yolo_profile,
                 "resources": resources,
                 "v1": getattr(runner, "v1_summary", None),

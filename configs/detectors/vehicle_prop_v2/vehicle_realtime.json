@@ -1,0 +1,39 @@
+{
+  "model_type": "realtime",
+  "weights": "assets/vehicle_prop_v2/yolo26s_fovmix_blend50.pt",
+  "detector": {
+    "shape": [
+      1152,
+      1536
+    ],
+    "half": true,
+    "confidence": 0.05,
+    "iou": 0.5,
+    "expected_sha256": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2"
+  },
+  "max_source_gap_s": 0.25,
+  "motion_width": 384,
+  "max_streams": 16,
+  "tracker": {
+    "high": 0.4,
+    "low": 0.1,
+    "use_motion": true,
+    "smoothing": 0.85,
+    "recovery": true,
+    "distance_gate": 1.8,
+    "min_high_hits": 2,
+    "low_distance_gate": 1.0
+  },
+  "unknown_threshold": 0.6,
+  "class_names": [
+    "real_vehicle",
+    "model_prop"
+  ],
+  "flip": false,
+  "selection": "Validation-only mean of per-FOV macro class F1; nano/resolution preference within 1 pp; FOV48 retention guardrail checked explicitly.",
+  "guardrail_passed": true,
+  "data_index_sha256": "09e7cc661688f9429356a0888836ea73a311640deab66e28214a23ac6d912ee9",
+  "sha256": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2",
+  "backend": "pytorch",
+  "description": "V2固定PT与1152x1536单视图；在线评估显式覆盖本机重建raw TensorRT engine。"
+}
