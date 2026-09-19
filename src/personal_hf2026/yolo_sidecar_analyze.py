@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：透明区分V2重复源时间的算法跳过与实际推理完成。
+# 修改内容：记录skipped原因和实际推理耗时，保留全部回调输入的检测评价分母。
+# 修改时间：2026-09-19。
 # 修改目的：让没有TP的分组也与公共离线P/R/F1定义保持一致。
 # 修改内容：类别无关与强制分类均复用公共计数指标函数，并保留旧输出键。
 # 修改时间：2026-09-19。
@@ -23,7 +26,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import json
 import math
@@ -141,6 +144,8 @@ class Accumulator:
         self.false_positive_frames = 0
         self.class_aware_false_positive_frames = 0
         self.wall_ms = []
+        self.active_inference_wall_ms = []
+        self.skipped_reasons = Counter()
         self.decode_ms = []
         self.accepted_to_result_wall_ms = []
         self.source_to_receive_sim_s = []
@@ -188,6 +193,11 @@ class Accumulator:
             self.class_aware_false_positive_frames += 1
 
         wall_ms = row.get("inference_wall_ms")
+        frame_metadata = row.get("detector_frame_metadata") or {}
+        if frame_metadata.get("skipped"):
+            self.skipped_reasons[str(frame_metadata.get("reset_reason", "unspecified"))] += 1
+        elif finite_number(wall_ms) and wall_ms >= 0:
+            self.active_inference_wall_ms.append(float(wall_ms))
         if finite_number(wall_ms) and wall_ms >= 0:
             self.wall_ms.append(float(wall_ms))
         decode_ms = row.get("decode_ms")
@@ -248,6 +258,8 @@ class Accumulator:
         self.false_positive_frames += other.false_positive_frames
         self.class_aware_false_positive_frames += other.class_aware_false_positive_frames
         self.wall_ms.extend(other.wall_ms)
+        self.active_inference_wall_ms.extend(other.active_inference_wall_ms)
+        self.skipped_reasons.update(other.skipped_reasons)
         self.decode_ms.extend(other.decode_ms)
         self.accepted_to_result_wall_ms.extend(other.accepted_to_result_wall_ms)
         self.source_to_receive_sim_s.extend(other.source_to_receive_sim_s)
@@ -282,6 +294,7 @@ class Accumulator:
         }
         online_latency = {
             "inference_wall_ms": distribution(self.wall_ms),
+            "active_inference_wall_ms": distribution(self.active_inference_wall_ms),
             "decode_ms": distribution(self.decode_ms),
             "accepted_to_result_observed_wall_ms": distribution(
                 self.accepted_to_result_wall_ms
@@ -324,6 +337,12 @@ class Accumulator:
                 "evaluated": self.predictions,
                 "uncertain_evaluated": self.uncertain_predictions,
                 "accepted_evaluated": self.accepted_predictions,
+            },
+            "inference_completion_counts": {
+                "completed_callback_rows": self.frames,
+                "skipped_callback_rows": sum(self.skipped_reasons.values()),
+                "active_inference_rows": self.frames - sum(self.skipped_reasons.values()),
+                "skip_reasons": dict(self.skipped_reasons),
             },
             "online_latency": online_latency,
             "field_coverage": {
@@ -823,6 +842,8 @@ def markdown(report):
         f"- score 阈值：{report['matching']['confidence_threshold']}；class_aware按class_id强制二分类，uncertain仍保留。",
         "- accepted_class_aware单独报告剔除uncertain后的指标；schema≤2旧报告未筛score且按class_name计分，不能直接混用。",
         f"- 原始输出框 {overall['raw_prediction_counts']['emitted']}；阈值剔除 {overall['raw_prediction_counts']['below_confidence_threshold']}（其中低分恢复框 {overall['raw_prediction_counts']['below_threshold_recovered_low_score']}）；评价中uncertain {overall['raw_prediction_counts']['uncertain_evaluated']}。",
+        f"- 完成回调 {overall['inference_completion_counts']['completed_callback_rows']}；原生跳过 {overall['inference_completion_counts']['skipped_callback_rows']}；实际推理 {overall['inference_completion_counts']['active_inference_rows']}。精度分母包含跳过返回空的输入。",
+        f"- 排除跳过的实际推理 P50 / P95：{number(overall_latency['active_inference_wall_ms']['p50'])} / {number(overall_latency['active_inference_wall_ms']['p95'])} ms。",
         "- 下列跨 profile 合计只用于核对数据完整性，不能用于判断某档优劣。",
         f"- 类别感知 Precision / Recall / F1：{percent(overall_aware['precision'])} / {percent(overall_aware['recall'])} / {percent(overall_aware['f1'])}",
         f"- 类别感知误报：{overall_aware['fp']}，每帧 {number(overall_aware['false_positives_per_frame'])}",
