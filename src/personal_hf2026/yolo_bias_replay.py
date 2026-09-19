@@ -1,4 +1,7 @@
 # 修改时间：2026-09-19。
+# 修改目的：在完全相同的在线原图上比较 V1-v3 与 V2，并控制旋转探针的缩放混杂。
+# 修改内容：新增显式档位与权重选择、V2 独立多流状态及正方形补边旋转诊断。
+# 修改时间：2026-09-19。
 # 修改目的：用离线回放直接验证将在线部署的检测器旋转实现。
 # 修改内容：新增 image-rotation-deg 覆盖入口，并与额外诊断旋转分开记录。
 # 修改时间：2026-09-19。
@@ -22,6 +25,10 @@ import time
 
 from .paths import PROJECT_ROOT
 from .yolo_offline_eval import MetricAccumulator, greedy_match, normalize_predictions
+from .yolo_profiles import (
+    DEFAULT_CONFIG, DEFAULT_V2_CONFIG, YOLO_PROFILES, canonical_profile,
+    detector_kwargs, resolve_resources,
+)
 
 
 def write_json(path, value):
@@ -82,7 +89,7 @@ def compare_predictions(online, replay, bbox_tolerance, score_tolerance):
             if field not in left or field not in right:
                 continue
             a, b = left[field], right[field]
-            numeric_errors[field] = max(abs(float(x) - float(y)) for x, y in zip(a, b)) if isinstance(a, list) else abs(float(a) - float(b))
+            numeric_errors[field] = max((abs(float(x) - float(y)) for x, y in zip(a, b)), default=0.) if isinstance(a, list) else abs(float(a) - float(b))
         score_error = max(numeric_errors.values(), default=0.)
         discrete = {field: [left.get(field), right.get(field)] for field in
                     ("class_id", "class_name", "track_id", "track_hits", "recovered_low_score")
@@ -106,11 +113,16 @@ def parser():
     result.add_argument("--audit-only", action="store_true", help="仅 CPU 核对原图哈希、尺寸和两种 OpenCV 解码")
     result.add_argument("--device", default="0")
     result.add_argument("--detector-config", type=Path, help="消融配置；未指定时要求配置哈希与在线一致")
+    result.add_argument("--yolo-profile", type=canonical_profile, choices=YOLO_PROFILES,
+                        help="重放使用的模型档位；默认复现源在线档位，旧小写v2仍为V1-v2")
+    result.add_argument("--weights", type=Path, help="重放权重覆盖；换模型时使用相应模型权重")
     result.add_argument("--tracker-high", type=float, help="消融高置信阈值；默认取在线实际值")
     result.add_argument("--reset-each-frame", action="store_true", help="消融时序融合；默认保持每机原处理顺序")
     result.add_argument("--channel-order", choices=("bgr", "rgb"), default="bgr", help="默认原始 BGR；RGB 仅作通道交换消融")
     result.add_argument("--image-rotation-deg", type=int, choices=(0, 90, 180, 270), help="检测器旋转；默认复现在线资源记录")
     result.add_argument("--rotation-deg", type=int, choices=(0, 90, 180, 270), default=0)
+    result.add_argument("--rotation-square-pad", action="store_true",
+                        help="先用114在底/右补成正方形再旋转，控制不同方向的letterbox缩放尺度")
     result.add_argument("--contrast-scale", type=float, default=1.)
     result.add_argument("--brightness-offset", type=float, default=0.)
     result.add_argument("--gamma", type=float, default=1., help="全图查表 gamma；小于 1 提亮")
@@ -131,27 +143,46 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=False)
     metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
     resources = metadata["resources"]
-    if resources.get("profile") != "v3":
-        raise ValueError("本重放只接受 v3 在线数据")
+    source_profile = canonical_profile(resources["profile"])
+    profile = args.yolo_profile or source_profile
+    same_profile = profile == source_profile
     options = resources["effective_options"]
-    config = args.detector_config or Path(resources["config_path"])
+    default_config = DEFAULT_V2_CONFIG if profile == "V2" else DEFAULT_CONFIG
+    config = args.detector_config or (Path(resources["config_path"]) if same_profile else default_config)
     if not config.is_file() and args.detector_config is None:
-        config = PROJECT_ROOT / "configs/detectors/vehicle_prop/vehicle_frontier.json"
+        config = default_config
     config_hash = hashlib.sha256(config.read_bytes()).hexdigest()
-    if args.detector_config is None and config_hash != resources["config_sha256"]:
+    if same_profile and args.detector_config is None and config_hash != resources["config_sha256"]:
         raise ValueError("重放基础配置 SHA256 与在线不一致")
-    high = args.tracker_high if args.tracker_high is not None else options["tracker_high_confidence_threshold"]
-    detector_rotation = args.image_rotation_deg if args.image_rotation_deg is not None else options.get("image_rotation_deg", 0)
-    identity = (args.detector_config is None and args.tracker_high is None and not args.reset_each_frame
+    high = args.tracker_high if args.tracker_high is not None else (options["tracker_high_confidence_threshold"] if same_profile else None)
+    detector_rotation = args.image_rotation_deg if args.image_rotation_deg is not None else (options.get("image_rotation_deg", 0) if same_profile else 0)
+    replay_resources = None
+    if not args.audit_only:
+        replay_resources = resolve_resources(
+            profile, config=config, v2_config=config,
+            weights=args.weights or (resources["weights_path"] if same_profile else None),
+            tracker_high=high, image_rotation_deg=detector_rotation,
+        )
+        if same_profile and args.weights is None and replay_resources["weights_sha256"] != resources["weights_sha256"]:
+            raise ValueError("重放基础权重 SHA256 与在线不一致")
+        high = replay_resources["effective_options"]["tracker_high_confidence_threshold"]
+    identity = (same_profile and args.weights is None and args.detector_config is None and args.tracker_high is None and not args.reset_each_frame
                 and args.channel_order == "bgr" and args.rotation_deg == 0 and args.contrast_scale == 1.
                 and args.brightness_offset == 0. and args.gamma == 1. and args.sample_every == 1
+                and not args.rotation_square_pad
                 and detector_rotation == options.get("image_rotation_deg", 0))
     summary = {"run": str(run), "source_results_sha256": hashlib.sha256((run / "yolo_sidecar_results.jsonl").read_bytes()).hexdigest(),
-               "mode": "cpu_input_audit" if args.audit_only else "v3_same_frame_replay",
+               "mode": "cpu_input_audit" if args.audit_only else "yolo_same_frame_replay",
+               "yolo_profile": profile, "source_yolo_profile": source_profile,
+               "resources": replay_resources,
+               "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+               "requested_fov_deg": metadata.get("requested_fov_deg", metadata.get("effective_fov_deg")),
                "identity_settings": identity, "config_path": str(config), "config_sha256": config_hash,
                "source_resources": resources, "effective_tracker_high": high,
                "channel_order": args.channel_order, "reset_each_frame": args.reset_each_frame,
                "sample_every": args.sample_every, "rotation_deg": args.rotation_deg,
+               "rotation_square_pad": args.rotation_square_pad,
+               "rotation_square_pad_placement": "image_top_left_bottom_right_padding_114" if args.rotation_square_pad else None,
                "contrast_scale": args.contrast_scale, "brightness_offset": args.brightness_offset, "gamma": args.gamma,
                "source_detector_image_rotation_deg": options.get("image_rotation_deg", 0),
                "detector_image_rotation_deg": detector_rotation,
@@ -161,9 +192,9 @@ def main(argv=None):
     if not args.audit_only:
         from .vehicle_prop import create_detector
         from .vehicle_prop.temporal_tracker import CameraMotion, TemporalTracker
-        detector_options = {"image_rotation_deg": detector_rotation} if detector_rotation or "image_rotation_deg" in options else {}
-        detector = create_detector(config=config, device=args.device, profile="v3", weights=resources["weights_path"],
-                                   weights_sha256=resources["weights_sha256"], flip=False, tracker_high=high, **detector_options)
+        detector = create_detector(device=args.device, **detector_kwargs(replay_resources))
+        manages_streams = bool(getattr(detector, "manages_streams", False))
+        max_source_gap_s = float(detector.pipeline.config.get("max_source_gap_s", .25))
         summary["runtime"] = detector.runtime_metadata()
     counts = Counter()
     dimensions, by_uid, previous = Counter(), Counter(), {}
@@ -198,13 +229,16 @@ def main(argv=None):
             record = {"submission_id": row["submission_id"], "uid": uid, "frame_no": row["frame_no"], "image_path": str(path),
                       "hash_equal": hash_equal, "decode_pixel_equal": decoded_equal, "size_equal": size_equal, "source_gap_s": gap}
             if detector is not None:
-                if uid not in states:
-                    states[uid] = {"camera": CameraMotion(), "tracker": TemporalTracker(**detector.pipeline.config["tracker"]),
-                                   "previous_t": None, "sequence": uid}
-                for name, value in states[uid].items():
-                    setattr(detector.pipeline, name, value)
-                if args.reset_each_frame:
-                    detector.reset()
+                if not manages_streams:
+                    if uid not in states:
+                        states[uid] = {"camera": CameraMotion(), "tracker": TemporalTracker(**detector.pipeline.config["tracker"]),
+                                       "previous_t": None, "sequence": uid}
+                    for name, value in states[uid].items():
+                        setattr(detector.pipeline, name, value)
+                    if args.reset_each_frame:
+                        detector.reset()
+                elif args.reset_each_frame:
+                    detector.reset(stream_id=uid)
                 if args.channel_order == "rgb":
                     image = np.ascontiguousarray(image[:, :, ::-1])
                 if args.contrast_scale != 1. or args.brightness_offset != 0.:
@@ -212,13 +246,34 @@ def main(argv=None):
                 if args.gamma != 1.:
                     lookup = np.rint(255. * (np.arange(256) / 255.) ** args.gamma).astype(np.uint8)
                     image = cv2.LUT(image, lookup)
+                restore_width, restore_height = image.shape[1], image.shape[0]
+                if args.rotation_square_pad:
+                    side = max(image.shape[:2])
+                    square = np.full((side, side, 3), 114, dtype=np.uint8)
+                    square[:image.shape[0], :image.shape[1]] = image
+                    image = square
+                    restore_width = restore_height = side
                 if args.rotation_deg:
                     image = np.ascontiguousarray(np.rot90(image, args.rotation_deg // 90))
                 step = time.perf_counter()
-                result = detector.predict(image, timestamp=timestamp, sequence_id=uid)
+                if manages_streams:
+                    result = detector.predict(image, timestamp=timestamp, sequence_id=uid, stream_id=uid)
+                else:
+                    result = detector.predict(image, timestamp=timestamp, sequence_id=uid)
                 step_ms = (time.perf_counter() - step) * 1000.
-                restore_boxes(result, row["image_width"], row["image_height"], args.rotation_deg)
-                states[uid] = {name: getattr(detector.pipeline, name) for name in ("camera", "tracker", "previous_t", "sequence")}
+                restore_boxes(result, restore_width, restore_height, args.rotation_deg)
+                if args.rotation_square_pad:
+                    # 逆旋转后只保留原图区域内的有效框，补边区域没有对应真值。
+                    clipped = []
+                    for prediction in result:
+                        x1, y1, x2, y2 = prediction["bbox_xyxy"]
+                        bbox = [max(0., x1), max(0., y1), min(float(row["image_width"]), x2), min(float(row["image_height"]), y2)]
+                        if bbox[2] > bbox[0] and bbox[3] > bbox[1]:
+                            prediction["bbox_xyxy"] = prediction["xyxy"] = bbox
+                            clipped.append(prediction)
+                    result = clipped
+                if not manages_streams:
+                    states[uid] = {name: getattr(detector.pipeline, name) for name in ("camera", "tracker", "previous_t", "sequence")}
                 # 保留所有流水线结果核对；评估时沿用原离线最低检测分数 0.25。
                 replay = normalize_predictions(result, row["image_width"], row["image_height"], 0.)
                 online = normalize_predictions(row["predictions"], row["image_width"], row["image_height"], 0.)
@@ -233,16 +288,22 @@ def main(argv=None):
                 online_metric.add(truth, [p for p in online if p["score"] >= .25], row["inference_wall_ms"], row["decode_ms"])
                 replay_metric.add(truth, [p for p in replay if p["score"] >= .25], step_ms, replay_decode_ms)
                 reset_reason = None
+                if manages_streams:
+                    actual_reason = detector.pipeline.last_metadata.get("reset_reason")
+                    reset_reason = {"source_gap": "source_gap_exceeds_tracker_max_gap",
+                                    "nonincreasing_source_time": "non_increasing_source_time_skipped"}.get(actual_reason, actual_reason)
                 if args.reset_each_frame:
                     reset_reason = "explicit_reset_each_frame"
-                elif gap is not None and gap <= 0:
+                elif not manages_streams and gap is not None and gap <= 0:
                     reset_reason = "non_increasing_source_time"
-                elif gap is not None and gap > detector.pipeline.tracker.max_gap_s:
+                elif not manages_streams and gap is not None and gap > detector.pipeline.tracker.max_gap_s:
                     reset_reason = "source_gap_exceeds_tracker_max_gap"
                 timing_fields = ("inference_wall_ms", "decode_ms", "previous_processed_source_sim_time", "processed_source_gap_s",
                                  "tracker_reset_reason", "inference_completed_sim_time", "result_observed_sim_time",
-                                 "result_observed_unix_s", "result_observed_perf_counter", "observation_latency_sim_s", "frame_save_ms")
+                                 "result_observed_unix_s", "result_observed_perf_counter", "observation_latency_sim_s", "frame_save_ms",
+                                 "worker_inference_started_perf_counter", "worker_completed_perf_counter", "detector_frame_metadata")
                 replay_row = {**row, "predictions": replay, "replay_step_ms": step_ms,
+                              "yolo_profile": profile, "source_yolo_profile": source_profile,
                               "replay_settings_identity": identity, "same_frame_parity": parity["within_tolerance"],
                               "source_online_timing": {key: row[key] for key in timing_fields if key in row}}
                 for key in timing_fields:
@@ -250,6 +311,8 @@ def main(argv=None):
                 replay_row.update({"inference_wall_ms": step_ms, "decode_ms": replay_decode_ms,
                                    "previous_processed_source_sim_time": timestamp-gap if gap is not None else None,
                                    "processed_source_gap_s": gap, "tracker_reset_reason": reset_reason})
+                if manages_streams:
+                    replay_row["detector_frame_metadata"] = dict(detector.pipeline.last_metadata)
                 replay_stream.write(json.dumps(replay_row, ensure_ascii=False, allow_nan=False) + "\n")
             audit.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
             if counts["frames"] % 200 == 0:
