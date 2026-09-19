@@ -1,3 +1,6 @@
+# 修改时间：2026-09-19。
+# 修改目的：验证固定输入方向能否减轻当前观察分布中的诱饵分类偏置。
+# 修改内容：增加默认关闭的单视图直角旋转，并将检测框和速度映射回原图坐标。
 # 修改时间：2026-09-18。
 # 修改目的：让在线旁路以显式档位参数创建 PT 或 TensorRT 检测器。
 # 修改内容：透传权重、翻转和 tracker.high 覆盖，并在运行时元数据中记录实际生效值。
@@ -32,10 +35,14 @@ class VehiclePropDetector:
         weights_sha256: str | None = None,
         flip: bool | None = None,
         tracker_high: float | None = None,
+        image_rotation_deg: int = 0,
     ):
         self.config_path = Path(config or CONFIG_PATH).resolve()
         self.device_requested = str(device)
         self.profile = profile
+        if image_rotation_deg not in (0, 90, 180, 270):
+            raise ValueError("image_rotation_deg 必须为 0、90、180 或 270")
+        self.image_rotation_deg = image_rotation_deg
         self.pipeline = FrontierPipeline(
             config=self.config_path,
             device=device,
@@ -56,8 +63,13 @@ class VehiclePropDetector:
         sequence_id: str = "single",
     ) -> list[dict]:
         """检测一帧 BGR uint8 图像，并保留原始流水线审计字段。"""
+        height, width = image_bgr.shape[:2]
+        inference_image = (
+            np.ascontiguousarray(np.rot90(image_bgr, self.image_rotation_deg // 90))
+            if self.image_rotation_deg else image_bgr
+        )
         detections = self.pipeline.predict(
-            image_bgr,
+            inference_image,
             timestamp=float(timestamp),
             sequence_id=str(sequence_id),
         )
@@ -65,6 +77,22 @@ class VehiclePropDetector:
         for detection in detections:
             record = dict(detection)
             record["bbox_xyxy"] = list(detection["xyxy"])
+            if self.image_rotation_deg:
+                # 跟踪状态继续使用旋转图坐标，仅把对外结果逆变换回原图。
+                a, b, c, d = record["bbox_xyxy"]
+                if self.image_rotation_deg == 90:
+                    box = [width - d, a, width - b, c]
+                elif self.image_rotation_deg == 180:
+                    box = [width - c, height - d, width - a, height - b]
+                else:
+                    box = [b, height - c, d, height - a]
+                record["bbox_xyxy"] = box
+                record["xyxy"] = box
+                if "motion_velocity_px_per_s" in record:
+                    vx, vy = record["motion_velocity_px_per_s"]
+                    record["motion_velocity_px_per_s"] = {
+                        90: [-vy, vx], 180: [-vx, -vy], 270: [vy, -vx]
+                    }[self.image_rotation_deg]
             record["score"] = float(detection["confidence"])
             output.append(record)
         return output
@@ -105,6 +133,7 @@ class VehiclePropDetector:
                 "tensorrt_engine" if weights_path.suffix.lower() == ".engine" else "pytorch_pt"
             ),
             "effective_options": {
+                "image_rotation_deg": self.image_rotation_deg,
                 "flip_enabled": bool(self.pipeline.detector.flip),
                 "tracker_high_confidence_threshold": float(self.pipeline.tracker.high),
                 "tracker_low_confidence_threshold": float(self.pipeline.tracker.low),
@@ -130,6 +159,7 @@ def create_detector(
     weights_sha256: str | None = None,
     flip: bool | None = None,
     tracker_high: float | None = None,
+    image_rotation_deg: int = 0,
 ) -> VehiclePropDetector:
     """创建使用固定配置与权重的检测器。"""
     return VehiclePropDetector(
@@ -140,6 +170,7 @@ def create_detector(
         weights_sha256=weights_sha256,
         flip=flip,
         tracker_high=tracker_high,
+        image_rotation_deg=image_rotation_deg,
     )
 
 
