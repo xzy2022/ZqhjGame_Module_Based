@@ -1,3 +1,6 @@
+# 修改时间：2026-09-18。
+# 修改目的：让在线旁路以显式档位参数创建 PT 或 TensorRT 检测器。
+# 修改内容：透传权重、翻转和 tracker.high 覆盖，并在运行时元数据中记录实际生效值。
 # 修改时间：2026-09-18
 # 修改目的：为离线评估和后续集成提供稳定的单帧、序列检测入口。
 # 修改内容：封装 FrontierPipeline 并统一输出 bbox、分数、类别与审计字段。
@@ -14,16 +17,33 @@ import numpy as np
 
 from .detector_frontier import FrontierPipeline
 from .frontier_runtime import CONFIG_PATH
-from personal_hf2026.paths import PROJECT_ROOT
 
 
 class VehiclePropDetector:
     """面向评估器的轻量 API；内部算法仍由原 FrontierPipeline 执行。"""
 
-    def __init__(self, config: str | PathLike[str] | None = None, device: str = "0"):
+    def __init__(
+        self,
+        config: str | PathLike[str] | None = None,
+        device: str = "0",
+        *,
+        profile: str | None = None,
+        weights: str | PathLike[str] | None = None,
+        weights_sha256: str | None = None,
+        flip: bool | None = None,
+        tracker_high: float | None = None,
+    ):
         self.config_path = Path(config or CONFIG_PATH).resolve()
         self.device_requested = str(device)
-        self.pipeline = FrontierPipeline(config=self.config_path, device=device)
+        self.profile = profile
+        self.pipeline = FrontierPipeline(
+            config=self.config_path,
+            device=device,
+            weights=weights,
+            weights_sha256=weights_sha256,
+            flip=flip,
+            tracker_high=tracker_high,
+        )
 
     def reset(self) -> None:
         """清空时序跟踪状态，开始一个独立序列。"""
@@ -72,14 +92,26 @@ class VehiclePropDetector:
         import torch
         import ultralytics
 
-        weights_path = (PROJECT_ROOT / self.pipeline.config["weights"]).resolve()
+        weights_path = self.pipeline.weights_path
         return {
             "detector": "VehicleProp FrontierPipeline",
+            "profile": self.profile,
             "device_requested": self.device_requested,
             "config_path": str(self.config_path),
             "config_sha256": hashlib.sha256(self.config_path.read_bytes()).hexdigest(),
             "weights_path": str(weights_path),
             "weights_sha256": hashlib.sha256(weights_path.read_bytes()).hexdigest(),
+            "model_format": (
+                "tensorrt_engine" if weights_path.suffix.lower() == ".engine" else "pytorch_pt"
+            ),
+            "effective_options": {
+                "flip_enabled": bool(self.pipeline.detector.flip),
+                "tracker_high_confidence_threshold": float(self.pipeline.tracker.high),
+                "tracker_low_confidence_threshold": float(self.pipeline.tracker.low),
+                "unknown_class_confidence_threshold": float(
+                    self.pipeline.config["unknown_threshold"]
+                ),
+            },
             "torch": torch.__version__,
             "cuda_runtime": torch.version.cuda,
             "ultralytics": ultralytics.__version__,
@@ -92,9 +124,23 @@ class VehiclePropDetector:
 def create_detector(
     config: str | PathLike[str] | None = None,
     device: str = "0",
+    *,
+    profile: str | None = None,
+    weights: str | PathLike[str] | None = None,
+    weights_sha256: str | None = None,
+    flip: bool | None = None,
+    tracker_high: float | None = None,
 ) -> VehiclePropDetector:
     """创建使用固定配置与权重的检测器。"""
-    return VehiclePropDetector(config=config, device=device)
+    return VehiclePropDetector(
+        config=config,
+        device=device,
+        profile=profile,
+        weights=weights,
+        weights_sha256=weights_sha256,
+        flip=flip,
+        tracker_high=tracker_high,
+    )
 
 
 __all__ = ["FrontierPipeline", "VehiclePropDetector", "create_detector"]
