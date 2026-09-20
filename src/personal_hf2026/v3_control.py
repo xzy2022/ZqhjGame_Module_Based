@@ -1,3 +1,9 @@
+# 修改时间：2026-09-20（预测主锁定接线）。
+# 修改目的：避免把意图目标回写成预测主锁定而形成自证闭环。
+# 修改内容：单独保存 track_predict 地理位置，并用它驱动 V1 的 primary_matches 与锁定暂停语义。
+# 修改时间：2026-09-20（新帧消费与门控复位）。
+# 修改目的：避免重复快照刷新轨迹，并保证每次协同发起都重新满足连续五帧。
+# 修改内容：只为真正的新 frame key 递增提交序号，在感知陈旧及 SEARCH 离开时复位门控。
 # 修改时间：2026-09-20。
 # 修改目的：为真实感知 V3 提供可独立集成的航线、协同门控和跟踪纠偏控制层。
 # 修改内容：新增鸭子类型感知输入、连续五个新帧门控、固定四十八度视场及目标竞争方向控制。
@@ -66,6 +72,7 @@ class V3PerceptionInput:
     track_predict: Any = None
     closest_others: Any = None
     target_position: tuple[float, float] | None = None
+    track_predict_position: tuple[float, float] | None = None
     competitor_position: tuple[float, float] | None = None
     frame_id: Any = None
     source_sim_time: float | None = None
@@ -192,11 +199,13 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._submission_serial = 0
         self._consumed_serial = 0
         self._active_target_position = None
+        self._active_track_predict_position = None
         self._active_competitor_position = None
 
     def submit_perception(self, snapshot=None, *, detection=None,
                           track_predict=None, closest_others=None,
-                          target_position=None, competitor_position=None,
+                          target_position=None, track_predict_position=None,
+                          competitor_position=None,
                           frame_id=None, source_sim_time=None,
                           observed_sim_time=None, primary_is_target=None):
         """提交一帧感知/投影结果；参数均支持字典或带同名字段的对象。
@@ -213,6 +222,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                               else _field(snapshot, "closest_others", None))
             target_position = (target_position if target_position is not None
                                else _field(snapshot, "target_position", None))
+            track_predict_position = (
+                track_predict_position if track_predict_position is not None
+                else _field(snapshot, "track_predict_position", None))
             competitor_position = (
                 competitor_position if competitor_position is not None
                 else _field(snapshot, "competitor_position", None))
@@ -228,8 +240,10 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 primary_is_target if primary_is_target is not None
                 else _field(snapshot, "primary_is_target", None))
 
-        target_position = (_position(target_position) or _position(track_predict)
-                           or _position(detection))
+        target_position = _position(target_position) or _position(detection)
+        track_predict_position = (
+            _position(track_predict_position) or _position(track_predict)
+        )
         competitor_position = (_position(competitor_position)
                                or _position(closest_others))
         frame = V3PerceptionInput(
@@ -237,15 +251,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             track_predict=track_predict,
             closest_others=closest_others,
             target_position=target_position,
+            track_predict_position=track_predict_position,
             competitor_position=competitor_position,
             frame_id=frame_id,
             source_sim_time=(None if source_sim_time is None else float(source_sim_time)),
             observed_sim_time=(None if observed_sim_time is None else float(observed_sim_time)),
             primary_is_target=primary_is_target,
         )
-        self._submission_serial += 1
+        next_serial = self._submission_serial + 1
+        if not self._target_gate.observe(frame, next_serial):
+            return self._perception
+        self._submission_serial = next_serial
         self._perception = frame
-        self._target_gate.observe(frame, self._submission_serial)
         return frame
 
     def _frame_is_fresh(self, frame, now):
@@ -284,6 +301,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "v3_perception_frame_id": (None if self._perception is None
                                         else self._perception.frame_id),
             "v3_target_position": self._active_target_position,
+            "v3_track_predict_position": self._active_track_predict_position,
             "v3_competitor_position": self._active_competitor_position,
             "v3_fov_deg": self.SEARCH_FOV_DEG,
             "v3_flight_alt_m": self.FLIGHT_ALT_M,
@@ -299,15 +317,20 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         fresh = frame is not None and self._frame_is_fresh(frame, now)
         if fresh:
             self._active_target_position = frame.target_position
+            self._active_track_predict_position = frame.track_predict_position
             self._active_competitor_position = frame.competitor_position
         else:
             self._active_target_position = None
+            self._active_track_predict_position = None
             self._active_competitor_position = None
+            if self._coordinator.phase == CoopCoordinator.SEARCH:
+                self._target_gate.reset()
         self._competition_flight.set_perception(
             self._active_target_position, self._active_competitor_position)
 
         if is_new and fresh:
-            primary = self._sdk_detection(frame, self._active_target_position)
+            # 单数 detection 表示本机预测的原生最近对象，而非意图真目标。
+            primary = self._sdk_detection(frame, self._active_track_predict_position)
             multiple = tuple(
                 self._sdk_detection(frame, position)
                 for position in (self._active_target_position,
@@ -323,7 +346,12 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         if is_new:
             self._consumed_serial = self._submission_serial
 
+        phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
+        if (phase_before == CoopCoordinator.SEARCH
+                and self._coordinator.phase != CoopCoordinator.SEARCH):
+            # 协同资格按每次发起消费，回到 SEARCH 后必须重新累计五个新帧。
+            self._target_gate.reset()
         fixed = []
         for command in commands:
             if command.verb == "set_destination":

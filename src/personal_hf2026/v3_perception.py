@@ -1,3 +1,6 @@
+# 修改时间：2026-09-20（异步姿态绑定与初始化门控）。
+# 修改目的：避免用推理返回时姿态解释旧图片，并让模型加载失败可在启动仿真前暴露。
+# 修改内容：快照固化提交时相机位姿，并增加可等待 ready 或明确失败的启动接口。
 # 修改时间：2026-09-20（离线回放修正）。
 # 修改目的：避免尚无主目标时把普通对象误称为主目标的竞争对象。
 # 修改内容：closest_others 仅在 detection 已存在时从其余零高程投影对象中选择。
@@ -65,6 +68,7 @@ class PerceptionSnapshot:
     observed_sim_time: float
     fov_deg: float
     image_size: tuple[int, int]
+    source_pose: Mapping[str, float] | None
     detection: PixelObservation | None
     track_predict: PixelObservation | None
     closest_others: PixelObservation | None
@@ -227,15 +231,23 @@ def submit_observation(
 
 def snapshot_to_sensor_detections(snapshot: PerceptionSnapshot | None) -> list:
     """把主目标转为 SDK sensor 列表；空结果返回 ``[]``，绝不回退理想感知。"""
-    item = snapshot.detection if snapshot is not None and snapshot.error is None else None
-    if item is None or item.ground_point_h0 is None:
+    error = (snapshot.get("error") if isinstance(snapshot, Mapping)
+             else getattr(snapshot, "error", None))
+    item = (snapshot.get("detection") if isinstance(snapshot, Mapping)
+            else getattr(snapshot, "detection", None))
+    item = item if snapshot is not None and error is None else None
+    point = (item.get("ground_point_h0") if isinstance(item, Mapping)
+             else getattr(item, "ground_point_h0", None))
+    if item is None or point is None:
         return []
+    real_score = (item.get("real_score", 0.0) if isinstance(item, Mapping)
+                  else getattr(item, "real_score", 0.0))
     from competition.sdk.core.observation import Detection
     return [Detection(
         detected=True,
-        confidence=max(0.0, min(1.0, item.real_score)),
-        target_lat=item.ground_point_h0[0],
-        target_lon=item.ground_point_h0[1],
+        confidence=max(0.0, min(1.0, float(real_score))),
+        target_lat=point[0],
+        target_lon=point[1],
         target_type="ground_vehicle",
     )]
 
@@ -362,6 +374,18 @@ class V3PerceptionWorker:
             self._condition.notify_all()
         self._thread.join(timeout=max(0.0, float(timeout_s)))
 
+    def wait_until_ready(self, timeout_s: float = 120.0) -> None:
+        """在启动仿真前等待模型加载/预热，失败或超时立即终止本轮。"""
+        deadline = time.perf_counter() + max(0.0, float(timeout_s))
+        with self._condition:
+            while not self._ready and self._worker_error is None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.0:
+                    raise TimeoutError("V3 感知模型初始化超时")
+                self._condition.wait(timeout=remaining)
+            if self._worker_error is not None:
+                raise RuntimeError(f"V3 感知模型初始化失败：{self._worker_error}")
+
     def _next_job(self) -> _FrameJob | None:
         if not self._pending or not self._uid_order:
             return None
@@ -441,6 +465,7 @@ class V3PerceptionWorker:
             observed_sim_time=job.observed_sim_time,
             fov_deg=job.fov_deg,
             image_size=image_size,
+            source_pose=(dict(job.own_pose) if job.own_pose is not None else None),
             detection=detection,
             track_predict=track_predict,
             closest_others=closest_others,

@@ -1,3 +1,6 @@
+# 修改时间：2026-09-20（乱序收件保护）。
+# 修改目的：避免同拍首次看到多条 F3 消息时旧测量覆盖发送者的新测量。
+# 修改内容：每个发送者和会话只保留 source_sim_time 不回退的最新包。
 # 修改时间：2026-09-20。
 # 修改目的：为 V3 提供只依赖合法本机观测和机间通信的单机投影及双机定位能力。
 # 修改内容：实现零高度投影、50 字节逻辑单播协议、收件去重和成功三角化后的上报候选。
@@ -474,7 +477,11 @@ class V3Fusion:
                 self._seen.discard(self._seen_order.popleft())
             decoded["sender_uid"] = sender_uid
             decoded["received_sim_time"] = now
-            self._latest[(sender_uid, decoded["session_token"])] = decoded
+            latest_key = (sender_uid, decoded["session_token"])
+            previous = self._latest.get(latest_key)
+            if (previous is None
+                    or decoded["source_sim_time"] >= previous["source_sim_time"]):
+                self._latest[latest_key] = decoded
             accepted.append(decoded)
         return accepted
 
