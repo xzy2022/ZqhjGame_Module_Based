@@ -1,3 +1,6 @@
+# 修改时间：2026-09-20（异步锁定门槛适配）。
+# 修改目的：避免不同真实视觉帧之间的空控制 tick 反复清零 V1 的半秒锁定计时。
+# 修改内容：V3 保留五个不同真车帧和运动轨迹确认，并把额外主锁定稳定时间设为零。
 # 修改时间：2026-09-20（预测主锁定接线）。
 # 修改目的：避免把意图目标回写成预测主锁定而形成自证闭环。
 # 修改内容：单独保存 track_predict 地理位置，并用它驱动 V1 的 primary_matches 与锁定暂停语义。
@@ -17,6 +20,7 @@ from competition.sdk.core.observation import Detection
 
 from .competition_flight import CompetitionDirectionController
 from .coordination import CoopCoordinator
+from .gimbal_lock import GimbalLockConfig, GimbalLockController
 from .personal_v1 import PersonalV1Agent
 
 
@@ -185,6 +189,16 @@ class PersonalV3ControlAgent(PersonalV1Agent):
 
     def reset(self):
         super().reset()
+        # V3 的连续性证据来自五个不同的真实像素帧；异步推理帧之间会有空控制
+        # tick，不能再沿用 V1 对每个约十赫兹 tick 连续锁定半秒的假设。
+        self._gimbal_lock = GimbalLockController(GimbalLockConfig(
+            min_fov_deg=self.SEARCH_FOV_DEG,
+            max_fov_deg=self.SEARCH_FOV_DEG,
+            preferred_fov_deg=self.SEARCH_FOV_DEG,
+            stable_after_s=0.0,
+            allow_multiple_targets=True,
+            coop_reacquire_timeout_s=self.COOP_REACQUIRE_TIMEOUT_S,
+        ))
         self._target_gate = ConsecutiveTargetGate(self.TARGET_CONFIRM_FRAMES)
         self._coordinator = _GatedCoordinator(
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,

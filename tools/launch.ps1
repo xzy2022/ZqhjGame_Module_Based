@@ -6,7 +6,9 @@ for ($i = 0; $i -lt $args.Count - 1; $i++) {
     if ($args[$i] -eq '--sim-root') { $sdkRoot = $args[$i + 1] }
     if ($args[$i] -eq '--runtime-root') { $runtimeRoot = $args[$i + 1] }
 }
-$candidates = @((Join-Path $projectRoot '.venv\Scripts\python.exe'))
+$candidates = @()
+if ($env:HF2026_PYTHON) { $candidates += $env:HF2026_PYTHON }
+$candidates += Join-Path $projectRoot '.venv\Scripts\python.exe'
 if ($runtimeRoot) { $candidates += Join-Path $runtimeRoot 'python\python.exe' }
 $candidates += Join-Path $sdkRoot 'python\python.exe'
 $pythonExe = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
