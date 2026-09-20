@@ -1,3 +1,6 @@
+# 修改时间：2026-09-20（正式场景与运动审计修复）。
+# 修改目的：避免把静止诱饵控制实验误当成正式 coop_decoy 测评环境。
+# 修改内容：强制使用官方动态场景和默认参数，并以裁判侧有界摘要记录真车与诱饵实际位移。
 # 修改时间：2026-09-20（相机残留帧隔离）。
 # 修改目的：避免上一轮 Redis 相机键在新 UE 出帧前被 V3 当成本轮首帧。
 # 修改内容：记录启动时最新帧键并只在键变化后向 Agent 交付图片，不读取投影框元数据。
@@ -14,6 +17,7 @@ import argparse
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -24,7 +28,7 @@ from competition.sdk.core.perception import DetectionResolver, PhotoCache
 from competition.sdk.core.runner import ScenarioConfig
 
 from .dropout_capture import StudyRenderer
-from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SCENARIO_ROOT
+from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SIM_ROOT
 from .personal_v3 import PersonalV3Agent
 from .redis_runtime import RedisRuntime
 from .sdk_compat import IdleCompatibleCoopDecoyRunner
@@ -39,7 +43,7 @@ WEATHERS = (
     "Snow_Light",
     "Sand_Dust_Calm",
 )
-DEFAULT_LAYOUT = SCENARIO_ROOT / "static-decoys.json"
+DEFAULT_LAYOUT = SIM_ROOT / "competition/scenarios/coop_decoy/scenario.json"
 _FRAME_NUMBER = re.compile(r"frame:(\d+)$")
 
 
@@ -49,6 +53,64 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _scenario_profile(path: Path) -> dict:
+    """读取正式场景静态契约；这些信息只用于启动校验和结果审计。"""
+    raw = path.read_bytes()
+    scenario = json.loads(raw.decode("utf-8-sig"))
+    entities = scenario.get("entities", [])
+    vehicles = []
+    for entity in entities:
+        entity_type = entity.get("type")
+        if entity_type not in ("TargetVehicle", "ground_vehicle", "DecoyVehicle"):
+            continue
+        params = (
+            entity.get("components", {})
+            .get("trajectory", {})
+            .get("params", {})
+        )
+        vehicles.append({
+            "uid": str(entity.get("id") or entity.get("name") or ""),
+            "type": entity_type,
+            "speed_mps": float(params.get("speed", 0.0)),
+            "speed_jitter_mps": float(params.get("speed_jitter", 0.0)),
+        })
+    decoys = [item for item in vehicles if item["type"] == "DecoyVehicle"]
+    targets = [item for item in vehicles if item["type"] != "DecoyVehicle"]
+    return {
+        "source_path": str(path),
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "runner": "competition.sdk.scenarios.coop_decoy.runner.CoopDecoyRunner",
+        "uav_count": sum(entity.get("type") == "FixedWingUAV" for entity in entities),
+        "target_count": len(targets),
+        "decoy_count": len(decoys),
+        "all_targets_commanded_to_move": bool(targets) and all(
+            item["speed_mps"] > 0.0 for item in targets
+        ),
+        "all_decoys_commanded_to_move": bool(decoys) and all(
+            item["speed_mps"] > 0.0 for item in decoys
+        ),
+        "target_speeds_mps": sorted({item["speed_mps"] for item in targets}),
+        "decoy_speeds_mps": sorted({item["speed_mps"] for item in decoys}),
+        "target_speed_jitter_mps": sorted({
+            item["speed_jitter_mps"] for item in targets
+        }),
+        "decoy_speed_jitter_mps": sorted({
+            item["speed_jitter_mps"] for item in decoys
+        }),
+        "weather": scenario.get("weather", {}).get("type"),
+    }
+
+
+def _horizontal_distance_m(first, current):
+    """计算裁判侧审计位移，不把该结果暴露给 Agent。"""
+    lat1, lon1 = first
+    lat2, lon2 = current
+    mean_lat = math.radians((lat1 + lat2) / 2.0)
+    north = math.radians(lat2 - lat1) * 6_378_137.0
+    east = math.radians(lon2 - lon1) * 6_378_137.0 * math.cos(mean_lat)
+    return math.hypot(east, north)
 
 
 class FreshPhotoCache(PhotoCache):
@@ -111,6 +173,8 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
         )
         self.weights = None if weights is None else Path(weights).resolve()
         self.sequence_id = f"{self.weather}-seed-{self.cfg.seed}"
+        self.source_scenario_profile = _scenario_profile(Path(cfg.scenario_path))
+        self._motion_audit = {}
         self.perception_worker = None
         if not self.cfg.dry_run:
             detector_kwargs = {"device": self.device}
@@ -186,6 +250,53 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
     def should_finish(self, agents):
         # 测评入口始终跑满命令行指定时长，阶段性短测才可相互比较。
         return False
+
+    def _observe_scoring(self, evaluator, ws, sim_t0, destroyed, all_cmds=()):
+        # 仅在裁判侧旁路记录车辆位移；Agent observation 和决策输入保持不变。
+        relative_time = float(max(0.0, ws.sim_time - sim_t0))
+        for vehicle_type, entities in (("target", ws.targets), ("decoy", ws.decoys)):
+            for uid, entity in entities.items():
+                current = (float(entity.lat), float(entity.lon))
+                record = self._motion_audit.setdefault(str(uid), {
+                    "type": vehicle_type,
+                    "first_sim_time_s": relative_time,
+                    "first_lat": current[0],
+                    "first_lon": current[1],
+                    "last_sim_time_s": relative_time,
+                    "last_lat": current[0],
+                    "last_lon": current[1],
+                    "max_displacement_m": 0.0,
+                })
+                record["last_sim_time_s"] = relative_time
+                record["last_lat"] = current[0]
+                record["last_lon"] = current[1]
+                record["max_displacement_m"] = max(
+                    record["max_displacement_m"],
+                    _horizontal_distance_m(
+                        (record["first_lat"], record["first_lon"]), current
+                    ),
+                )
+        return super()._observe_scoring(
+            evaluator, ws, sim_t0, destroyed, all_cmds
+        )
+
+    def _motion_audit_summary(self):
+        records = dict(sorted(self._motion_audit.items()))
+        decoys = [item for item in records.values() if item["type"] == "decoy"]
+        targets = [item for item in records.values() if item["type"] == "target"]
+        return {
+            "basis": "judge_side_world_state_not_exposed_to_agent",
+            "moving_threshold_m": 1.0,
+            "target_count_observed": len(targets),
+            "decoy_count_observed": len(decoys),
+            "targets_moved_over_threshold": sum(
+                item["max_displacement_m"] > 1.0 for item in targets
+            ),
+            "decoys_moved_over_threshold": sum(
+                item["max_displacement_m"] > 1.0 for item in decoys
+            ),
+            "vehicles": records,
+        }
 
     def _close_owned_resources(self):
         errors = []
@@ -270,6 +381,8 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                 "duration_s": self.cfg.duration_s,
                 "fov_deg": PersonalV3Agent.SEARCH_FOV_DEG,
                 "prepared_scenario_sha256": self.prepared_scenario_sha256,
+                "source_scenario": self.source_scenario_profile,
+                "motion_audit": self._motion_audit_summary(),
                 "formal_inputs": [
                     "obs.self.photo",
                     "obs.self_pose_and_gimbal",
@@ -295,11 +408,14 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
 
 def _parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--layout", type=Path, default=DEFAULT_LAYOUT)
+    parser.add_argument(
+        "--layout", type=Path, default=DEFAULT_LAYOUT,
+        help="正式入口只接受官方 competition/scenarios/coop_decoy/scenario.json",
+    )
     parser.add_argument("--runtime-root", type=Path, default=RUNTIME_ROOT)
-    parser.add_argument("--weather", choices=WEATHERS, default="Clear_Skies")
-    parser.add_argument("--duration", type=float, default=120.0)
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--weather", choices=WEATHERS, default=None)
+    parser.add_argument("--duration", type=float, default=600.0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--redis-host", default="127.0.0.1")
     parser.add_argument("--redis-port", type=int, default=6379)
@@ -320,6 +436,27 @@ def main(argv=None):
     args.output = args.output.resolve()
     if not args.layout.is_file():
         parser.error(f"--layout 不存在：{args.layout}")
+    if args.layout != DEFAULT_LAYOUT.resolve():
+        parser.error(
+            "正式 V3 入口只允许官方 coop_decoy 场景；"
+            f"应为 {DEFAULT_LAYOUT.resolve()}"
+        )
+    try:
+        source_profile = _scenario_profile(args.layout)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        parser.error(f"官方场景读取失败：{exc}")
+    if (
+        source_profile["uav_count"] != 3
+        or source_profile["target_count"] != 3
+        or source_profile["decoy_count"] != 15
+        or not source_profile["all_targets_commanded_to_move"]
+        or not source_profile["all_decoys_commanded_to_move"]
+    ):
+        parser.error(f"官方场景实体或运动契约不满足：{source_profile}")
+    if args.weather is None:
+        args.weather = source_profile["weather"]
+    if args.weather not in WEATHERS:
+        parser.error(f"官方场景天气不受支持：{args.weather}")
     if not args.dry_run and not (args.runtime_root / "opensim-sim.exe").is_file():
         parser.error(f"运行底座缺少 opensim-sim.exe：{args.runtime_root}")
     if not _is_relative_to(args.output, OUTPUT_ROOT.resolve()):
@@ -351,6 +488,7 @@ def main(argv=None):
             "seed": args.seed,
             "duration_s": args.duration,
             "fov_deg": PersonalV3Agent.SEARCH_FOV_DEG,
+            "source_scenario": source_profile,
         }
         (args.output / "run.json").write_text(
             json.dumps(preflight, ensure_ascii=False, indent=2) + "\n",
