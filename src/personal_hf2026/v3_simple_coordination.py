@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（MASTER 等待超时退出）。
+# 修改目的：避免 HOLD 中已经跟丢超过五秒的过期会话继续等待从机并延后退出。
+# 修改内容：MASTER 在 HOLD 与 ACTIVE 的轨迹 LOST 或 epoch 断裂时统一取消会话并回到 SEARCH。
 # 修改时间：2026-09-21（静止速度门限收紧）。
 # 修改目的：阻止移动目标在中心投影短暂降到约四米每秒时被误判为明显静止。
 # 修改内容：静止专用接触点的鲁棒速度门限收紧为二米每秒，窗口和七帧确认保持不变。
@@ -711,7 +714,7 @@ class V3SimpleCoordinator(CoopCoordinator):
                     now, "session_timeout", "master_stream_timeout")
                 reset_local = True
 
-        if (self.role == self.MASTER and self.phase == self.ACTIVE
+        if (self.role == self.MASTER and self.phase in (self.HOLD, self.ACTIVE)
                 and (local.state == LocalTrackManager.LOST
                      or local.epoch != self.master_track_epoch)):
             session = self.current_session

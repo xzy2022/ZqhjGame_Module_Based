@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（MASTER 等待阶段连续性）。
+# 修改目的：避免 MASTER 在等待从机确认时先按零点七五秒丢失并带着过期目标进入 ACTIVE。
+# 修改内容：V3 MASTER 的 HOLD 与 ACTIVE 统一使用五秒丢失门限，其余角色和 SEARCH 保持原门限。
 # 修改时间：2026-09-21（静止地面接触点接线）。
 # 修改目的：把静止判定与瞄准中心投影分开，消除物体高度导致的绕飞投影漂移。
 # 修改内容：感知输入新增 stationary_position，并只把该 H=0 接触点送入停止判定器。
@@ -385,13 +388,14 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     def decide(self, obs, dt):
         score = getattr(getattr(obs, "briefing", None), "score_view", None)
         now = float(score.sim_time) if score is not None else self._t + max(0.0, dt)
-        master_active = (
+        master_tracking = (
             self._coordinator.role == self._coordinator.MASTER
-            and self._coordinator.phase == self._coordinator.ACTIVE
+            and self._coordinator.phase in (
+                self._coordinator.HOLD, self._coordinator.ACTIVE)
         )
         desired_lost_after_s = (
             self.MASTER_ACTIVE_LOST_AFTER_S
-            if master_active else self._default_track_lost_after_s
+            if master_tracking else self._default_track_lost_after_s
         )
         if self._track.config.lost_after_s != desired_lost_after_s:
             self._track.config = replace(
