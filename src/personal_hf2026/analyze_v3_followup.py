@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（审计边界分离）。
+# 修改目的：保证总状态只汇总 Agent 本机证据，裁判数据仅作为独立离线交叉核对。
+# 修改内容：将裁判时序检查移出 checks，并在 judge_cross_check 中单列状态和证据。
 # 修改时间：2026-09-21（静止完成时序交叉核对）。
 # 修改目的：避免 Agent 侧形式证据合格但在裁判销毁前发生的 master_static 假阳性被汇总为通过。
 # 修改内容：新增只用于离线审计的裁判时序旁路检查，不把裁判状态送入 Agent。
@@ -526,7 +529,6 @@ def analyze_run(directory: Path, byte_cap=MAX_TRACE_BYTES, record_cap=MAX_TRACE_
         "a_coasting_predict_aim": aim, "a_master_timeout_exit": timeout,
         "b_robust_h0_stationary_fit": fit, "b_distinct_visual_frames": frames,
         "b_static_completion_edge": edge,
-        "b_judge_timing_cross_check": judge_timing,
     }
     integrity["source_summary"] = summary
     integrity["trace_loss"] = bool(
@@ -540,6 +542,12 @@ def analyze_run(directory: Path, byte_cap=MAX_TRACE_BYTES, record_cap=MAX_TRACE_
                 item["status"] = "inconclusive"
                 item["conclusion"] += "；但 trace 不完整，不能作为整轮通过结论。"
                 item["evidence"]["trace_loss"] = True
+        if judge_timing["status"] == "passed":
+            judge_timing["status"] = "inconclusive"
+            judge_timing["conclusion"] += "；但 trace 不完整，只能保留为不确定的旁路核对。"
+            judge_timing["evidence"]["trace_loss"] = True
+    judge["status"] = judge_timing["status"]
+    judge["stationary_timing_check"] = judge_timing
     run_status = _status(checks)
     if integrity["trace_loss"] and run_status == "passed":
         run_status = "inconclusive"
@@ -550,7 +558,8 @@ def analyze_run(directory: Path, byte_cap=MAX_TRACE_BYTES, record_cap=MAX_TRACE_
         "legacy_baseline_diagnosis": _legacy(decisions, run, judge),
         "judge_cross_check": judge,
         "limitations": [
-            "前五项通过判定只使用 Agent 本机 trace；b_judge_timing_cross_check 仅用裁判销毁时间做离线旁路核对。",
+            "顶层状态及五项 Agent 检查只使用 Agent 本机 trace。",
+            "judge_cross_check 单独使用裁判数据做离线旁路核对，既不参与顶层状态，也不进入 Agent 决策。",
             "source_sim_time 不是已验证的相机曝光时刻。",
             "旧 follow_position 不是逐帧 H=0 原始位置。",
         ],
