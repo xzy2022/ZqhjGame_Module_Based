@@ -1,6 +1,9 @@
 # 修改时间：2026-09-21（后续协同审计证据）。
 # 修改目的：让丢失超时退出和鲁棒静止完成可由有界运行轨迹直接复核。
 # 修改内容：透出轨迹与静止拟合摘要，封顶确认指纹并省略周期样本中重复的 before 快照以延长 trace 覆盖时间。
+# 修改时间：2026-09-21（静止判定审计）。
+# 修改目的：让真实运行 trace 保留 V3 鲁棒静止判定的输入、拟合和连续新帧证据。
+# 修改内容：采集协调器 stationary 快照，并在连续计数或 ready 变化时记录决策边沿。
 # 修改时间：2026-09-21。
 # 修改目的：为真实场景简化协同补齐不阻塞 Runner 热循环的时序证据。
 # 修改内容：以内存有界状态边沿和零点五秒采样记录五帧、配对、门控、瞄准、结束与计数传播并自动离线审计。
@@ -241,6 +244,7 @@ def _agent_evidence(agent):
         "completed_sessions": _safe_json(completed_sessions or ()),
         "master_position": _safe_json(value(("master_position",))),
         "follow_position": _safe_json(value(("follow_position",))),
+        "stationary": _safe_json(value(("stationary",), {})),
         "confirmation": confirmation,
         "perception": perception,
     }
@@ -290,6 +294,7 @@ def _inbox_evidence(obs):
 
 
 def _state_fingerprint(state):
+    stationary = state.get("stationary") or {}
     return (
         state.get("revision"), state.get("event"), state.get("phase"),
         state.get("role"), state.get("track_state"),
@@ -301,6 +306,7 @@ def _state_fingerprint(state):
         state.get("completed_count"), state.get("rendezvous_ready"),
         state.get("within_master_gate"), state.get("within_target_gate"),
         state.get("guidance_enabled"), state.get("aiming_enabled"),
+        stationary.get("stationary_consecutive_frames"), stationary.get("ready"),
     )
 
 

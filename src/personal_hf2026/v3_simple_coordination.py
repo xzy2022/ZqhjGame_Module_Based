@@ -1,6 +1,9 @@
 # 修改时间：2026-09-21（MASTER 丢失退出）。
 # 修改目的：让 V3 主机超过 ACTIVE 跟踪容忍期后直接结束本次协同跟踪。
 # 修改内容：主机滑行时广播预测位置，轨迹 LOST 或 epoch 断裂时广播取消并直接返回 SEARCH。
+# 修改时间：2026-09-21（V3 鲁棒静止判定）。
+# 修改目的：让 V3 在本地轨迹丢失后仍能用新视觉帧的 H=0 原始位置判断目标静止。
+# 修改内容：接入 V3 专用鲁棒停止判定、严格帧去重和可审计的完成边沿证据。
 # 修改时间：2026-09-21。
 # 修改目的：为 V3 提供不依赖双机轨迹匹配和协同计时的专用简化协调流程。
 # 修改内容：实现最近空闲从机选择、零高程目标持续广播、无本机识别接受、结束计数同步和兼容摘要接口。
@@ -11,7 +14,7 @@ from dataclasses import dataclass
 from competition.baselines.coop_distributed import _haversine_m
 
 from .coordination import CoopCoordinator, CoordinationUpdate
-from .tracking import LocalTrackManager, TrackMatchResult
+from .tracking import LocalTrackManager, StoppedTargetDetector, TrackMatchResult
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,12 @@ class V3SimpleCoordinator(CoopCoordinator):
     POSITION_SCALE = 100_000.0
     MASTER_DISTANCE_M = 220.0
     TARGET_DISTANCE_M = 200.0
+    STATIONARY_WINDOW_S = 2.5
+    STATIONARY_MIN_SPAN_S = 2.0
+    STATIONARY_MIN_POINTS = 5
+    STATIONARY_SPEED_MPS = 5.0
+    STATIONARY_MOVING_SPEED_MPS = 8.0
+    STATIONARY_CONFIRM_FRAMES = 7
 
     FINISH_MASTER_STATIC = "master_static"
     FINISH_MASTER_DECOY_ONLY = "master_decoy_only"
@@ -65,6 +74,15 @@ class V3SimpleCoordinator(CoopCoordinator):
         super().__init__(
             my_uid, member_uids, duration_s,
             reacquire_timeout_s, evidence_wait_timeout_s,
+        )
+        # V1 继续使用基类默认判定；只有 V3 简化协调器消费原始视觉 H=0 点。
+        self.stopped_target = StoppedTargetDetector(
+            required_points=self.STATIONARY_CONFIRM_FRAMES,
+            moving_speed_mps=self.STATIONARY_MOVING_SPEED_MPS,
+            robust_window_s=self.STATIONARY_WINDOW_S,
+            robust_min_span_s=self.STATIONARY_MIN_SPAN_S,
+            robust_min_points=self.STATIONARY_MIN_POINTS,
+            stationary_speed_mps=self.STATIONARY_SPEED_MPS,
         )
         self._proposal_gate = proposal_gate or (lambda: True)
         self._master_prediction = master_prediction or (lambda now: None)
@@ -94,6 +112,8 @@ class V3SimpleCoordinator(CoopCoordinator):
         self._announced_completed_count = 0
         self._last_accept_send = -1e9
         self._last_grant_send = -1e9
+        self._pending_stationary_observation = None
+        self._last_stationary_evidence = dict(self.stopped_target.evidence)
         self.last_match = TrackMatchResult(False, "v3_simple_no_track_matching")
 
     @property
@@ -128,6 +148,7 @@ class V3SimpleCoordinator(CoopCoordinator):
             "rendezvous_ready": self.rendezvous_ready,
             "uses_track_matching": False,
             "uses_coop_timer": False,
+            "stationary": dict(self._last_stationary_evidence),
             "last_transition": dict(self.last_transition),
         }
 
@@ -296,6 +317,21 @@ class V3SimpleCoordinator(CoopCoordinator):
 
     request_end = signal_end
 
+    def submit_stationary_observation(self, *, frame_key=None, frame_id=None,
+                                      source_sim_time=None, track_id=None,
+                                      position_h0=None):
+        """保存本控制 tick 的 V3 新帧；``step`` 只会消费一次。"""
+        if frame_key is None:
+            self._pending_stationary_observation = None
+            return
+        self._pending_stationary_observation = {
+            "frame_key": frame_key,
+            "frame_id": frame_id,
+            "source_sim_time": source_sim_time,
+            "track_id": track_id,
+            "position_h0": position_h0,
+        }
+
     def _record_completion(self, session, reason, position, announced_count=None):
         if session[0] is None or position is None:
             return False
@@ -326,12 +362,15 @@ class V3SimpleCoordinator(CoopCoordinator):
         self.rendezvous_ready = False
         self.stage_reason = "search"
         self._pending_finish = None
+        self._pending_stationary_observation = None
+        self._last_stationary_evidence = dict(self.stopped_target.evidence)
         self._record_transition(
             event, now, reason, session=session, partner_uid=partner_uid)
 
     def _complete_current(self, now, reason, position, payloads):
         session = self.current_session
         partner_uid = self.partner_uid
+        stationary_evidence = dict(self.stopped_target.evidence)
         position = position or self.follow_position
         if session is None or position is None:
             return False
@@ -345,6 +384,9 @@ class V3SimpleCoordinator(CoopCoordinator):
         self.rendezvous_ready = False
         self.stage_reason = f"completed_{reason}"
         self._pending_finish = None
+        self._pending_stationary_observation = None
+        # ``_to_search`` 会重置判定器，完成边沿必须继续保留触发帧快照。
+        self._last_stationary_evidence = stationary_evidence
         self._record_transition(
             "coordination_finished", now, reason,
             session=session, partner_uid=partner_uid,
@@ -353,6 +395,7 @@ class V3SimpleCoordinator(CoopCoordinator):
 
     def _start_master(self, now, local, own_position):
         super()._reset_timer(False)
+        self._last_stationary_evidence = dict(self.stopped_target.evidence)
         self.phase = self.HOLD
         self.role = self.MASTER
         self.session_start_tick = self._tick(now)
@@ -377,6 +420,7 @@ class V3SimpleCoordinator(CoopCoordinator):
 
     def _accept_offer(self, offer, now):
         super()._reset_timer(False)
+        self._last_stationary_evidence = dict(self.stopped_target.evidence)
         self.phase = self.INIT
         self.role = self.FOLLOWER
         self.proposal = None
@@ -672,13 +716,25 @@ class V3SimpleCoordinator(CoopCoordinator):
                 now, "session_cancelled", "master_track_timeout")
             reset_local = True
 
-        stop_ready = self.stopped_target.update(
-            now,
-            (self.current_session, local.epoch),
-            local,
-            valid=(self.role == self.MASTER and self.phase == self.ACTIVE
-                   and local_lock_valid),
-        )
+        stationary_observation = self._pending_stationary_observation
+        self._pending_stationary_observation = None
+        stop_ready = False
+        if stationary_observation is not None:
+            stationary_valid = (
+                self.role == self.MASTER
+                and self.phase in (self.HOLD, self.ACTIVE)
+                and self.current_session is not None
+            )
+            stop_ready = self.stopped_target.update_observation(
+                (self.current_session, stationary_observation["track_id"]),
+                stationary_observation["position_h0"],
+                frame_key=stationary_observation["frame_key"],
+                frame_id=stationary_observation["frame_id"],
+                source_sim_time=stationary_observation["source_sim_time"],
+                valid=stationary_valid,
+            )
+            if stationary_valid:
+                self._last_stationary_evidence = dict(self.stopped_target.evidence)
         if self.role == self.MASTER and self.phase == self.ACTIVE:
             if self._pending_finish is not None:
                 reason, position = self._pending_finish
@@ -687,7 +743,8 @@ class V3SimpleCoordinator(CoopCoordinator):
             elif stop_ready:
                 if self._complete_current(
                         now, self.FINISH_MASTER_STATIC,
-                        local.position, payloads):
+                        self._last_stationary_evidence.get("position_h0"),
+                        payloads):
                     reset_local = True
 
         self._refresh_distances(own_position)

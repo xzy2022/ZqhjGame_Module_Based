@@ -1,6 +1,9 @@
 # 修改时间：2026-09-21（MASTER 跟踪连续性）。
 # 修改目的：让 V3 主机在 ACTIVE 中容忍约五秒缺测，并在滑行期持续瞄准运动预测点。
 # 修改内容：仅为 ACTIVE MASTER 动态延长轨迹丢失门限，并用 predict_position(now) 更新 COASTING 云台与广播目标。
+# 修改时间：2026-09-21（V3 静止帧接线）。
+# 修改目的：让静止判定直接使用每张新视觉帧的原始 H=0 位置而不受本地轨迹拒绝影响。
+# 修改内容：向简化协调器传递唯一帧键、源时间、视觉轨迹编号和真车零高程位置。
 # 修改时间：2026-09-21（结束证据保留）。
 # 修改目的：避免第五个仅诱饵帧触发完成后因回到搜索而把审计计数立即清零。
 # 修改内容：在完成边沿的运行证据中保留本次达到阈值的连续诱饵帧数。
@@ -428,6 +431,21 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             control_obs = replace(obs, self=own)
         if is_new:
             self._consumed_serial = self._submission_serial
+
+        self._coordinator.submit_stationary_observation()
+        if is_new and fresh:
+            source_time = (frame.source_sim_time if frame.source_sim_time is not None
+                           else frame.observed_sim_time)
+            source_time = now if source_time is None else source_time
+            frame_key = (frame.new_frame_key if frame.new_frame_key is not None
+                         else ("submission", self._submission_serial))
+            self._coordinator.submit_stationary_observation(
+                frame_key=frame_key,
+                frame_id=frame.frame_id,
+                source_sim_time=source_time,
+                track_id=frame.primary_key if frame.is_target else None,
+                position_h0=(frame.target_position if frame.is_target else None),
+            )
 
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
