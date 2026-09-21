@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（MASTER 丢失退出）。
+# 修改目的：让 V3 主机超过 ACTIVE 跟踪容忍期后直接结束本次协同跟踪。
+# 修改内容：主机滑行时广播预测位置，轨迹 LOST 或 epoch 断裂时广播取消并直接返回 SEARCH。
 # 修改时间：2026-09-21。
 # 修改目的：为 V3 提供不依赖双机轨迹匹配和协同计时的专用简化协调流程。
 # 修改内容：实现最近空闲从机选择、零高程目标持续广播、无本机识别接受、结束计数同步和兼容摘要接口。
@@ -58,12 +61,13 @@ class V3SimpleCoordinator(CoopCoordinator):
 
     def __init__(self, my_uid, member_uids, duration_s=22.0,
                  reacquire_timeout_s=5.0, evidence_wait_timeout_s=2.0,
-                 *, proposal_gate=None):
+                 *, proposal_gate=None, master_prediction=None):
         super().__init__(
             my_uid, member_uids, duration_s,
             reacquire_timeout_s, evidence_wait_timeout_s,
         )
         self._proposal_gate = proposal_gate or (lambda: True)
+        self._master_prediction = master_prediction or (lambda now: None)
         self.master_position = None
         self.partner_position = None
         self.target_distance_m = None
@@ -477,17 +481,26 @@ class V3SimpleCoordinator(CoopCoordinator):
         reset_local = False
         invitations = []
 
+        master_tracking_position = local.position
+        master_coasting = (
+            self.role == self.MASTER
+            and self.phase == self.ACTIVE
+            and local.state == LocalTrackManager.COASTING
+        )
+        if master_coasting:
+            master_tracking_position = (
+                self._master_prediction(now) or master_tracking_position)
         if (self.role == self.MASTER
                 and self.phase in (self.HOLD, self.ACTIVE)
-                and local_lock_valid
+                and (local_lock_valid or master_coasting)
                 and local.state in (LocalTrackManager.CONFIRMED,
                                     LocalTrackManager.COASTING)
-                and local.position is not None):
-            self.follow_position = local.position
+                and master_tracking_position is not None):
+            self.follow_position = master_tracking_position
             if self.proposal is not None:
                 self.proposal = _SimpleOffer(
                     self.my_uid, self.session_start_tick,
-                    self.master_track_epoch, local.position,
+                    self.master_track_epoch, master_tracking_position,
                     self.selected_follower_uid,
                 )
 
@@ -647,6 +660,17 @@ class V3SimpleCoordinator(CoopCoordinator):
                 self._return_to_search(
                     now, "session_timeout", "master_stream_timeout")
                 reset_local = True
+
+        if (self.role == self.MASTER and self.phase == self.ACTIVE
+                and (local.state == LocalTrackManager.LOST
+                     or local.epoch != self.master_track_epoch)):
+            session = self.current_session
+            if session is not None:
+                payloads.append(self._session_payload("C"))
+                self.cancelled_sessions.add(session)
+            self._return_to_search(
+                now, "session_cancelled", "master_track_timeout")
+            reset_local = True
 
         stop_ready = self.stopped_target.update(
             now,

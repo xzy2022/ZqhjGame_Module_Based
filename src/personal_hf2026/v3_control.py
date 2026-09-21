@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（MASTER 跟踪连续性）。
+# 修改目的：让 V3 主机在 ACTIVE 中容忍约五秒缺测，并在滑行期持续瞄准运动预测点。
+# 修改内容：仅为 ACTIVE MASTER 动态延长轨迹丢失门限，并用 predict_position(now) 更新 COASTING 云台与广播目标。
 # 修改时间：2026-09-21（结束证据保留）。
 # 修改目的：避免第五个仅诱饵帧触发完成后因回到搜索而把审计计数立即清零。
 # 修改内容：在完成边沿的运行证据中保留本次达到阈值的连续诱饵帧数。
@@ -201,9 +204,11 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     TARGET_CONFIRM_FRAMES = 5
     DECOY_ONLY_END_FRAMES = 5
     PERCEPTION_STALE_S = 1.0
+    MASTER_ACTIVE_LOST_AFTER_S = 5.0
 
     def reset(self):
         super().reset()
+        self._default_track_lost_after_s = self._track.config.lost_after_s
         # V3 的连续性证据来自五个不同的真实像素帧；异步推理帧之间会有空控制
         # tick，不能再沿用 V1 对每个约十赫兹 tick 连续锁定半秒的假设。
         self._gimbal_lock = GimbalLockController(GimbalLockConfig(
@@ -219,6 +224,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,
             self.COOP_REACQUIRE_TIMEOUT_S,
             proposal_gate=lambda: self._target_gate.ready,
+            master_prediction=lambda now: self._track.predict_position(now),
         )
         self._competition_flight = _V3CompetitionDirectionController(
             self.COMPETITION_UPDATE_PERIOD_S, self.COMPETITION_OFFSET_STEP_MPS,
@@ -362,6 +368,17 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     def decide(self, obs, dt):
         score = getattr(getattr(obs, "briefing", None), "score_view", None)
         now = float(score.sim_time) if score is not None else self._t + max(0.0, dt)
+        master_active = (
+            self._coordinator.role == self._coordinator.MASTER
+            and self._coordinator.phase == self._coordinator.ACTIVE
+        )
+        desired_lost_after_s = (
+            self.MASTER_ACTIVE_LOST_AFTER_S
+            if master_active else self._default_track_lost_after_s
+        )
+        if self._track.config.lost_after_s != desired_lost_after_s:
+            self._track.config = replace(
+                self._track.config, lost_after_s=desired_lost_after_s)
         frame = self._perception
         is_new = frame is not None and self._submission_serial != self._consumed_serial
         fresh = frame is not None and self._frame_is_fresh(frame, now)
@@ -461,11 +478,15 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._simple_control.reset()
             if (role == coordinator.MASTER
                     and phase in (coordinator.HOLD, coordinator.ACTIVE)):
+                aim_position = coordinator.follow_position
+                if self._track.state == self._track.COASTING:
+                    # 缺测期间沿既有速度外推，避免云台停在最后一次观测位置。
+                    aim_position = self._track.predict_position(now)
                 aim = self._simple_control.master_aim(
                     self_position=(obs.self.lat, obs.self.lon),
                     self_alt_m=obs.self.alt,
                     self_heading_deg=obs.self.heading_deg,
-                    target_position=coordinator.follow_position,
+                    target_position=aim_position,
                 )
                 if aim is not None:
                     commands = [command for command in commands if command.verb
@@ -494,6 +515,13 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             **coordination,
             **control_evidence,
             "agent_time_s": now,
+            "track_state": self._track.state,
+            "track_last_seen_age_s": (
+                None if self._track.last_seen <= -1e8
+                else max(0.0, now - self._track.last_seen)
+            ),
+            "master_lost_timeout_s": self.MASTER_ACTIVE_LOST_AFTER_S,
+            "track_predict_position": self._track.predict_position(now),
             "confirmation": {
                 "count": self._target_gate.count,
                 "required": self._target_gate.required_frames,
