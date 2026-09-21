@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（本地完成边沿限定）。
+# 修改目的：避免 MASTER 收到其他会话完成广播时把共享计数增长误判成本机会话完成。
+# 修改内容：结束原因、回搜索和计数传播审计只以 coordination_finished 本地边沿建立完成会话。
 # 修改时间：2026-09-21（边沿去重）。
 # 修改目的：避免周期采样重复保留的 transition 名称被误当成多次发起或接受事件。
 # 修改内容：按会话去重 MASTER 发起与 MASTER 收到 FOLLOWER 接受的审计边沿。
@@ -447,6 +450,8 @@ def _finish_reason_check(decisions):
             continue
         if _role(before) != "MASTER":
             continue
+        if str(after.get("event") or "") != "coordination_finished":
+            continue
         reason = str(after.get("finish_reason") or "")
         normalized = reason.lower()
         static_reason = any(token in normalized for token in (
@@ -498,7 +503,8 @@ def _return_and_propagation_checks(decisions, accepts):
     for row in decisions:
         before = _state(row, "before")
         after = _state(row)
-        if _completion_count(after) > _completion_count(before):
+        if (_completion_count(after) > _completion_count(before)
+                and str(after.get("event") or "") == "coordination_finished"):
             completion_sessions.update(_completed_sessions(after) - _completed_sessions(before))
             previous = _session_key(before.get("session"))
             if previous is not None:
