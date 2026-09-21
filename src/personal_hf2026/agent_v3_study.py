@@ -1,3 +1,9 @@
+# 修改时间：2026-09-21（后续协同审计证据）。
+# 修改目的：让丢失超时退出和鲁棒静止完成可由有界运行轨迹直接复核。
+# 修改内容：透出轨迹与静止拟合摘要，封顶确认指纹并省略周期样本中重复的 before 快照以延长 trace 覆盖时间。
+# 修改时间：2026-09-21（静止判定审计）。
+# 修改目的：让真实运行 trace 保留 V3 鲁棒静止判定的输入、拟合和连续新帧证据。
+# 修改内容：采集协调器 stationary 快照，并在连续计数或 ready 变化时记录决策边沿。
 # 修改时间：2026-09-21。
 # 修改目的：为真实场景简化协同补齐不阻塞 Runner 热循环的时序证据。
 # 修改内容：以内存有界状态边沿和零点五秒采样记录五帧、配对、门控、瞄准、结束与计数传播并自动离线审计。
@@ -238,9 +244,17 @@ def _agent_evidence(agent):
         "completed_sessions": _safe_json(completed_sessions or ()),
         "master_position": _safe_json(value(("master_position",))),
         "follow_position": _safe_json(value(("follow_position",))),
+        "stationary": _safe_json(value(("stationary",), {})),
         "confirmation": confirmation,
         "perception": perception,
     }
+    for key in (
+        "track_state", "track_last_seen_age_s", "master_lost_timeout_s",
+        "track_predict_position", "stationary", "last_transition",
+    ):
+        found = _safe_json(value((key,)))
+        if found is not None:
+            result[key] = found
     control = _control_evidence(agent)
     result["control"] = control
     for key in (
@@ -280,9 +294,11 @@ def _inbox_evidence(obs):
 
 
 def _state_fingerprint(state):
+    stationary = state.get("stationary") or {}
     return (
         state.get("revision"), state.get("event"), state.get("phase"),
-        state.get("role"), json.dumps(state.get("session"), sort_keys=True),
+        state.get("role"), state.get("track_state"),
+        json.dumps(state.get("session"), sort_keys=True),
         state.get("partner_uid"), state.get("proposal_count"),
         state.get("follower_accept_count"), state.get("finish_reason"),
         state.get("decoy_only_count"), state.get("decoy_only_required"),
@@ -290,6 +306,7 @@ def _state_fingerprint(state):
         state.get("completed_count"), state.get("rendezvous_ready"),
         state.get("within_master_gate"), state.get("within_target_gate"),
         state.get("guidance_enabled"), state.get("aiming_enabled"),
+        stationary.get("stationary_consecutive_frames"), stationary.get("ready"),
     )
 
 
@@ -336,8 +353,13 @@ class CoordinationEvidenceRecorder:
         state = _agent_evidence(agent)
         confirmation = state["confirmation"]
         perception = state["perception"]
+        confirmation_progress = min(
+            int(confirmation["count"]), int(confirmation["required"])
+        )
         fingerprint = (
-            confirmation["count"], confirmation["required"], confirmation["ready"],
+            # 连续确认达到门槛后不再按无上限累计值写一条完整状态；类别、
+            # track 和协同边沿变化仍会单独留下证据。
+            confirmation_progress, confirmation["required"], confirmation["ready"],
             perception.get("class_name"), perception.get("track_id"),
             state.get("decoy_only_count"), state.get("decoy_only_required"),
             perception.get("only_decoys"),
@@ -379,7 +401,9 @@ class CoordinationEvidenceRecorder:
             "dt_s": float(dt),
             "decide_wall_ms": float(decide_wall_ms),
             "basis": "agent_internal_and_formal_observation",
-            "before": before,
+            # 周期样本的 before/after 通常完全相同；只在状态边沿和错误时
+            # 保留 before，避免 600 秒有界 trace 过早耗尽字节预算。
+            "before": before if changed or error is not None else None,
             "after": after,
             "self_pose": {
                 "lat": _safe_json(own.lat), "lon": _safe_json(own.lon),

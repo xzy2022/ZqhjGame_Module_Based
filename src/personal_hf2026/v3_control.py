@@ -1,3 +1,15 @@
+# 修改时间：2026-09-21（MASTER 等待阶段连续性）。
+# 修改目的：避免 MASTER 在等待从机确认时先按零点七五秒丢失并带着过期目标进入 ACTIVE。
+# 修改内容：V3 MASTER 的 HOLD 与 ACTIVE 统一使用五秒丢失门限，其余角色和 SEARCH 保持原门限。
+# 修改时间：2026-09-21（静止地面接触点接线）。
+# 修改目的：把静止判定与瞄准中心投影分开，消除物体高度导致的绕飞投影漂移。
+# 修改内容：感知输入新增 stationary_position，并只把该 H=0 接触点送入停止判定器。
+# 修改时间：2026-09-21（MASTER 跟踪连续性）。
+# 修改目的：让 V3 主机在 ACTIVE 中容忍约五秒缺测，并在滑行期持续瞄准运动预测点。
+# 修改内容：仅为 ACTIVE MASTER 动态延长轨迹丢失门限，并用 predict_position(now) 更新 COASTING 云台与广播目标。
+# 修改时间：2026-09-21（V3 静止帧接线）。
+# 修改目的：让静止判定直接使用每张新视觉帧的原始 H=0 位置而不受本地轨迹拒绝影响。
+# 修改内容：向简化协调器传递唯一帧键、源时间、视觉轨迹编号和真车零高程位置。
 # 修改时间：2026-09-21（结束证据保留）。
 # 修改目的：避免第五个仅诱饵帧触发完成后因回到搜索而把审计计数立即清零。
 # 修改内容：在完成边沿的运行证据中保留本次达到阈值的连续诱饵帧数。
@@ -98,6 +110,7 @@ class V3PerceptionInput:
     closest_others: Any = None
     objects: tuple[Any, ...] = ()
     target_position: tuple[float, float] | None = None
+    stationary_position: tuple[float, float] | None = None
     track_predict_position: tuple[float, float] | None = None
     competitor_position: tuple[float, float] | None = None
     frame_id: Any = None
@@ -201,9 +214,11 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     TARGET_CONFIRM_FRAMES = 5
     DECOY_ONLY_END_FRAMES = 5
     PERCEPTION_STALE_S = 1.0
+    MASTER_ACTIVE_LOST_AFTER_S = 5.0
 
     def reset(self):
         super().reset()
+        self._default_track_lost_after_s = self._track.config.lost_after_s
         # V3 的连续性证据来自五个不同的真实像素帧；异步推理帧之间会有空控制
         # tick，不能再沿用 V1 对每个约十赫兹 tick 连续锁定半秒的假设。
         self._gimbal_lock = GimbalLockController(GimbalLockConfig(
@@ -219,6 +234,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,
             self.COOP_REACQUIRE_TIMEOUT_S,
             proposal_gate=lambda: self._target_gate.ready,
+            master_prediction=lambda now: self._track.predict_position(now),
         )
         self._competition_flight = _V3CompetitionDirectionController(
             self.COMPETITION_UPDATE_PERIOD_S, self.COMPETITION_OFFSET_STEP_MPS,
@@ -236,7 +252,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
 
     def submit_perception(self, snapshot=None, *, detection=None,
                           track_predict=None, closest_others=None, objects=None,
-                          target_position=None, track_predict_position=None,
+                          target_position=None, stationary_position=None,
+                          track_predict_position=None,
                           competitor_position=None,
                           frame_id=None, source_sim_time=None,
                           observed_sim_time=None, primary_is_target=None):
@@ -256,6 +273,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                        else _field(snapshot, "objects", ()))
             target_position = (target_position if target_position is not None
                                else _field(snapshot, "target_position", None))
+            stationary_position = (
+                stationary_position if stationary_position is not None
+                else _field(snapshot, "stationary_position", None))
             track_predict_position = (
                 track_predict_position if track_predict_position is not None
                 else _field(snapshot, "track_predict_position", None))
@@ -275,6 +295,11 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 else _field(snapshot, "primary_is_target", None))
 
         target_position = _position(target_position) or _position(detection)
+        stationary_position = (
+            _position(stationary_position)
+            or _position(_field(detection, "ground_contact_h0", None))
+            or target_position
+        )
         track_predict_position = (
             _position(track_predict_position) or _position(track_predict)
         )
@@ -288,6 +313,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             closest_others=closest_others,
             objects=tuple(objects),
             target_position=target_position,
+            stationary_position=stationary_position,
             track_predict_position=track_predict_position,
             competitor_position=competitor_position,
             frame_id=frame_id,
@@ -362,6 +388,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     def decide(self, obs, dt):
         score = getattr(getattr(obs, "briefing", None), "score_view", None)
         now = float(score.sim_time) if score is not None else self._t + max(0.0, dt)
+        master_tracking = (
+            self._coordinator.role == self._coordinator.MASTER
+            and self._coordinator.phase in (
+                self._coordinator.HOLD, self._coordinator.ACTIVE)
+        )
+        desired_lost_after_s = (
+            self.MASTER_ACTIVE_LOST_AFTER_S
+            if master_tracking else self._default_track_lost_after_s
+        )
+        if self._track.config.lost_after_s != desired_lost_after_s:
+            self._track.config = replace(
+                self._track.config, lost_after_s=desired_lost_after_s)
         frame = self._perception
         is_new = frame is not None and self._submission_serial != self._consumed_serial
         fresh = frame is not None and self._frame_is_fresh(frame, now)
@@ -412,6 +450,21 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         if is_new:
             self._consumed_serial = self._submission_serial
 
+        self._coordinator.submit_stationary_observation()
+        if is_new and fresh:
+            source_time = (frame.source_sim_time if frame.source_sim_time is not None
+                           else frame.observed_sim_time)
+            source_time = now if source_time is None else source_time
+            frame_key = (frame.new_frame_key if frame.new_frame_key is not None
+                         else ("submission", self._submission_serial))
+            self._coordinator.submit_stationary_observation(
+                frame_key=frame_key,
+                frame_id=frame.frame_id,
+                source_sim_time=source_time,
+                track_id=frame.primary_key if frame.is_target else None,
+                position_h0=(frame.stationary_position if frame.is_target else None),
+            )
+
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
         if ((phase_before == CoopCoordinator.SEARCH)
@@ -461,11 +514,15 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._simple_control.reset()
             if (role == coordinator.MASTER
                     and phase in (coordinator.HOLD, coordinator.ACTIVE)):
+                aim_position = coordinator.follow_position
+                if self._track.state == self._track.COASTING:
+                    # 缺测期间沿既有速度外推，避免云台停在最后一次观测位置。
+                    aim_position = self._track.predict_position(now)
                 aim = self._simple_control.master_aim(
                     self_position=(obs.self.lat, obs.self.lon),
                     self_alt_m=obs.self.alt,
                     self_heading_deg=obs.self.heading_deg,
-                    target_position=coordinator.follow_position,
+                    target_position=aim_position,
                 )
                 if aim is not None:
                     commands = [command for command in commands if command.verb
@@ -494,6 +551,13 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             **coordination,
             **control_evidence,
             "agent_time_s": now,
+            "track_state": self._track.state,
+            "track_last_seen_age_s": (
+                None if self._track.last_seen <= -1e8
+                else max(0.0, now - self._track.last_seen)
+            ),
+            "master_lost_timeout_s": self.MASTER_ACTIVE_LOST_AFTER_S,
+            "track_predict_position": self._track.predict_position(now),
             "confirmation": {
                 "count": self._target_gate.count,
                 "required": self._target_gate.required_frames,

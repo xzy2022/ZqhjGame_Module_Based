@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止位置接线）。
+# 修改目的：让静止判定使用真车包围框底边中心的 H=0 地面接触投影。
+# 修改内容：从检测对象提取 ground_contact_h0 并单独传给控制层，不改变瞄准所用中心投影。
 # 修改时间：2026-09-20（正式感知与双机融合接线）。
 # 修改目的：让 V3 标准 Agent 直接消费共享像素 worker，并在协同阶段按通信预算完成估高上报。
 # 修改内容：接入零高程控制投影、F3 心跳槽替换、双机定位及仅估高成功后的 1Hz 上报。
@@ -67,6 +70,15 @@ class PersonalV3Agent(PersonalV3ControlAgent):
         return float(point[0]), float(point[1])
 
     @staticmethod
+    def _ground_contact_position(observation):
+        point = getattr(observation, "ground_contact_h0", None)
+        if point is None and isinstance(observation, dict):
+            point = observation.get("ground_contact_h0")
+        if point is None or len(point) < 2:
+            return None
+        return float(point[0]), float(point[1])
+
+    @staticmethod
     def _snapshot_field(snapshot, name, default=None):
         if isinstance(snapshot, dict):
             return snapshot.get(name, default)
@@ -95,6 +107,7 @@ class PersonalV3Agent(PersonalV3ControlAgent):
         track_predict = self._snapshot_field(snapshot, "track_predict")
         competitor = self._snapshot_field(snapshot, "closest_others")
         target_position = self._ground_position(detection)
+        stationary_position = self._ground_contact_position(detection)
         track_predict_position = self._ground_position(track_predict)
         competitor_position = self._ground_position(competitor)
         if snapshot_key != self._last_snapshot_key:
@@ -105,6 +118,7 @@ class PersonalV3Agent(PersonalV3ControlAgent):
             self.submit_perception(
                 snapshot,
                 target_position=target_position,
+                stationary_position=stationary_position,
                 track_predict_position=track_predict_position,
                 competitor_position=competitor_position,
                 primary_is_target=(

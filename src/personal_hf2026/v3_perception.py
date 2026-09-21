@@ -7,6 +7,9 @@
 # 修改时间：2026-09-20（sensor 契约适配）。
 # 修改目的：确保 V3 无结果时不会静默回退原生理想感知。
 # 修改内容：增加只读合法观测的提交适配，并把主目标显式转换为空列表或单个 SDK Detection。
+# 修改时间：2026-09-21（静止位置投影修复）。
+# 修改目的：避免车辆包围框中心的物体高度在无人机绕飞时制造虚假的 H=0 环形运动。
+# 修改内容：额外把包围框底边中心投影到 H=0，作为静止判断专用的地面接触位置。
 # 修改时间：2026-09-20。
 # 修改目的：为 V3 提供只依赖真实相机像素的模块化在线感知结果。
 # 修改内容：接入 YOLO-V2 单工作线程与每机最新帧槽，并输出目标、最近对象和最大竞争对象的可追溯像素及零高程投影信息。
@@ -54,6 +57,7 @@ class PixelObservation:
     track_hits: int
     motion_velocity_px_per_s: tuple[float, float]
     ground_point_h0: tuple[float, float, float] | None
+    ground_contact_h0: tuple[float, float, float] | None
     ground_distance_m: float | None
 
 
@@ -168,6 +172,9 @@ def select_observations(
             continue
         center = ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
         ground_point, distance = _ground_projection(center, image_size, own_pose)
+        contact_pixel = (center[0], max(box[1], box[3] - 1.0))
+        ground_contact, _ = _ground_projection(
+            contact_pixel, image_size, own_pose)
         real_probability, decoy_probability = _probabilities(record)
         detector_confidence = float(record.get("detector_confidence",
                                                record.get("confidence", 0.0)))
@@ -185,6 +192,7 @@ def select_observations(
             track_hits=int(record.get("track_hits", 1)),
             motion_velocity_px_per_s=(float(velocity[0]), float(velocity[1])),
             ground_point_h0=ground_point,
+            ground_contact_h0=ground_contact,
             ground_distance_m=distance,
         ))
     ordered = tuple(sorted(objects, key=lambda item: item.real_score, reverse=True))
