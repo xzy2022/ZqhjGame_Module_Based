@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（结束证据保留）。
+# 修改目的：避免第五个仅诱饵帧触发完成后因回到搜索而把审计计数立即清零。
+# 修改内容：在完成边沿的运行证据中保留本次达到阈值的连续诱饵帧数。
 # 修改时间：2026-09-21（简化协同控制接线）。
 # 修改目的：让主机持续盯住目标并让从机在两级距离门槛后一直指向主机广播坐标。
 # 修改内容：接入简化飞行与云台几何、连续五个仅诱饵新帧结束及有界运行证据。
@@ -362,6 +365,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         frame = self._perception
         is_new = frame is not None and self._submission_serial != self._consumed_serial
         fresh = frame is not None and self._frame_is_fresh(frame, now)
+        finished_decoy_only_count = None
         if (is_new and fresh
                 and self._coordinator.role == self._coordinator.MASTER
                 and self._coordinator.phase == self._coordinator.ACTIVE):
@@ -369,10 +373,12 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 self._decoy_only_count + 1 if frame.only_decoys else 0
             )
             if self._decoy_only_count >= self.DECOY_ONLY_END_FRAMES:
-                self.signal_coordination_end(
+                accepted = self.signal_coordination_end(
                     self._coordinator.FINISH_MASTER_DECOY_ONLY,
                     self._coordinator.follow_position,
                 )
+                if accepted:
+                    finished_decoy_only_count = self._decoy_only_count
         elif self._coordinator.role != self._coordinator.MASTER:
             self._decoy_only_count = 0
         if fresh:
@@ -500,7 +506,10 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 "is_target": bool(frame is not None and frame.is_target),
                 "only_decoys": bool(frame is not None and frame.only_decoys),
             },
-            "decoy_only_count": self._decoy_only_count,
+            "decoy_only_count": (
+                self._decoy_only_count if finished_decoy_only_count is None
+                else finished_decoy_only_count
+            ),
             "decoy_only_required": self.DECOY_ONLY_END_FRAMES,
         }
         return fixed

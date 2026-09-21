@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（边沿去重）。
+# 修改目的：避免周期采样重复保留的 transition 名称被误当成多次发起或接受事件。
+# 修改内容：按会话去重 MASTER 发起与 MASTER 收到 FOLLOWER 接受的审计边沿。
 # 修改时间：2026-09-21。
 # 修改目的：让真实场景简化协同的关键行为可以由有界运行轨迹逐项复核。
 # 修改内容：新增五帧、选从机、距离门控、持续瞄准、结束回搜索和计数传播的离线审计。
@@ -133,6 +136,7 @@ def _nearest_row(rows, uid, when):
 def _master_starts(decisions):
     """优先识别 proposal_started；旧轨迹回退到 MASTER 新会话边沿。"""
     starts = []
+    seen = set()
     for row in decisions:
         before = _state(row, "before")
         after = _state(row)
@@ -148,14 +152,17 @@ def _master_starts(decisions):
             _role(after) == "MASTER"
             and (_role(before) != "MASTER" or new_session)
         )
-        if event == "proposal_started" or proposal_advanced or legacy_master_edge:
+        if ((event == "proposal_started" or proposal_advanced or legacy_master_edge)
+                and session not in seen):
             starts.append(row)
+            seen.add(session)
     return starts
 
 
 def _pair_accepts(decisions):
     """识别 MASTER 收到 FOLLOWER 接受的边沿。"""
     accepts = []
+    seen = set()
     for row in decisions:
         before = _state(row, "before")
         after = _state(row)
@@ -168,8 +175,12 @@ def _pair_accepts(decisions):
             and partner is not None
         )
         partner_edge = partner != before.get("partner_uid")
-        if event == "follower_accept_received" or (active_master and partner_edge):
+        session = _session_key(after.get("session"))
+        edge = None if session is None or partner is None else (session, str(partner))
+        if ((event == "follower_accept_received" or (active_master and partner_edge))
+                and edge is not None and edge not in seen):
             accepts.append(row)
+            seen.add(edge)
     return accepts
 
 
