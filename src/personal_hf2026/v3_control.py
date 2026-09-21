@@ -1,3 +1,12 @@
+# 修改时间：2026-09-21（结束证据保留）。
+# 修改目的：避免第五个仅诱饵帧触发完成后因回到搜索而把审计计数立即清零。
+# 修改内容：在完成边沿的运行证据中保留本次达到阈值的连续诱饵帧数。
+# 修改时间：2026-09-21（简化协同控制接线）。
+# 修改目的：让主机持续盯住目标并让从机在两级距离门槛后一直指向主机广播坐标。
+# 修改内容：接入简化飞行与云台几何、连续五个仅诱饵新帧结束及有界运行证据。
+# 修改时间：2026-09-21。
+# 修改目的：让 V3 使用不依赖双机轨迹匹配和协同计时的专用简化协调器。
+# 修改内容：接入最近从机邀请、零高程目标广播、显式结束信号和结构化协调摘要。
 # 修改时间：2026-09-20（异步锁定门槛适配）。
 # 修改目的：避免不同真实视觉帧之间的空控制 tick 反复清零 V1 的半秒锁定计时。
 # 修改内容：V3 保留五个不同真车帧和运动轨迹确认，并把额外主锁定稳定时间设为零。
@@ -15,13 +24,17 @@
 from dataclasses import dataclass, replace
 from typing import Any
 
-from competition.sdk.core.commands import Command
+from competition.sdk.core.commands import (
+    Command, fly_to, point_gimbal,
+)
 from competition.sdk.core.observation import Detection
 
 from .competition_flight import CompetitionDirectionController
 from .coordination import CoopCoordinator
 from .gimbal_lock import GimbalLockConfig, GimbalLockController
 from .personal_v1 import PersonalV1Agent
+from .v3_simple_control import SimpleCoopControl
+from .v3_simple_coordination import V3SimpleCoordinator
 
 
 _MISSING = object()
@@ -68,6 +81,14 @@ def _is_target(value):
     return str(name or "").strip().lower() in {"real_vehicle", "target_vehicle"}
 
 
+def _is_decoy(value):
+    """仅接受真实模型的明确诱饵类别。"""
+    name = _field(value, "class_name", None)
+    if name is None:
+        name = _field(value, "target_type", None)
+    return str(name or "").strip().lower() in {"model_prop", "decoy_vehicle"}
+
+
 @dataclass(frozen=True)
 class V3PerceptionInput:
     """控制层输入；前三项可直接保存感知模块的 ``PixelObservation``。"""
@@ -75,6 +96,7 @@ class V3PerceptionInput:
     detection: Any = None
     track_predict: Any = None
     closest_others: Any = None
+    objects: tuple[Any, ...] = ()
     target_position: tuple[float, float] | None = None
     track_predict_position: tuple[float, float] | None = None
     competitor_position: tuple[float, float] | None = None
@@ -87,6 +109,12 @@ class V3PerceptionInput:
     def is_target(self):
         return (_is_target(self.detection) if self.primary_is_target is None
                 else bool(self.primary_is_target))
+
+    @property
+    def only_decoys(self):
+        """要求本帧至少有一个对象，且所有对象都被模型判为诱饵。"""
+        return (not self.is_target and bool(self.objects)
+                and all(_is_decoy(item) for item in self.objects))
 
     @property
     def new_frame_key(self):
@@ -134,21 +162,6 @@ class ConsecutiveTargetGate:
         return self.count >= self.required_frames
 
 
-class _GatedCoordinator(CoopCoordinator):
-    """仅收紧 SEARCH 发起条件，不改变 V1 的通信协议和协同状态机。"""
-
-    def __init__(self, *args, proposal_gate, **kwargs):
-        self._proposal_gate = proposal_gate
-        super().__init__(*args, **kwargs)
-
-    def step(self, now, local, inbox, can_propose=True, **kwargs):
-        return super().step(
-            now, local, inbox,
-            can_propose=bool(can_propose and self._proposal_gate()),
-            **kwargs,
-        )
-
-
 class _V3CompetitionDirectionController(CompetitionDirectionController):
     """用融合后的目标/竞争对象坐标覆盖 V1 的原生主锁定推断。"""
 
@@ -184,7 +197,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     SEARCH_FOV_DEG = 48.0
     FLIGHT_ALT_M = 500.0
     TARGET_ALT_M = 0.0
+    COOP_DURATION_S = 0.0
     TARGET_CONFIRM_FRAMES = 5
+    DECOY_ONLY_END_FRAMES = 5
     PERCEPTION_STALE_S = 1.0
 
     def reset(self):
@@ -200,7 +215,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             coop_reacquire_timeout_s=self.COOP_REACQUIRE_TIMEOUT_S,
         ))
         self._target_gate = ConsecutiveTargetGate(self.TARGET_CONFIRM_FRAMES)
-        self._coordinator = _GatedCoordinator(
+        self._coordinator = V3SimpleCoordinator(
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,
             self.COOP_REACQUIRE_TIMEOUT_S,
             proposal_gate=lambda: self._target_gate.ready,
@@ -209,15 +224,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self.COMPETITION_UPDATE_PERIOD_S, self.COMPETITION_OFFSET_STEP_MPS,
             self.COMPETITION_MAX_OFFSET_M,
         )
+        self._simple_control = SimpleCoopControl()
         self._perception = None
         self._submission_serial = 0
         self._consumed_serial = 0
         self._active_target_position = None
         self._active_track_predict_position = None
         self._active_competitor_position = None
+        self._decoy_only_count = 0
+        self._runtime_evidence = {}
 
     def submit_perception(self, snapshot=None, *, detection=None,
-                          track_predict=None, closest_others=None,
+                          track_predict=None, closest_others=None, objects=None,
                           target_position=None, track_predict_position=None,
                           competitor_position=None,
                           frame_id=None, source_sim_time=None,
@@ -234,6 +252,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                              else _field(snapshot, "track_predict", None))
             closest_others = (closest_others if closest_others is not None
                               else _field(snapshot, "closest_others", None))
+            objects = (objects if objects is not None
+                       else _field(snapshot, "objects", ()))
             target_position = (target_position if target_position is not None
                                else _field(snapshot, "target_position", None))
             track_predict_position = (
@@ -260,10 +280,13 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         )
         competitor_position = (_position(competitor_position)
                                or _position(closest_others))
+        if objects is None:
+            objects = ()
         frame = V3PerceptionInput(
             detection=detection,
             track_predict=track_predict,
             closest_others=closest_others,
+            objects=tuple(objects),
             target_position=target_position,
             track_predict_position=track_predict_position,
             competitor_position=competitor_position,
@@ -305,6 +328,15 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._active_target_position, self._active_competitor_position)
             if position is not None)
 
+    def signal_coordination_end(self, reason, position=None):
+        """把连续诱饵等真实感知结论显式交给简化协调器。"""
+        return self._coordinator.signal_end(reason, position)
+
+    @property
+    def runtime_evidence(self):
+        """返回 Runner 可以低频采样的合法 Agent 内部证据。"""
+        return dict(self._runtime_evidence)
+
     @property
     def completion_summary(self):
         summary = dict(super().completion_summary)
@@ -320,6 +352,10 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "v3_fov_deg": self.SEARCH_FOV_DEG,
             "v3_flight_alt_m": self.FLIGHT_ALT_M,
             "v3_target_alt_m": self.TARGET_ALT_M,
+            "v3_decoy_only_count": self._decoy_only_count,
+            "v3_decoy_only_required": self.DECOY_ONLY_END_FRAMES,
+            "v3_runtime_evidence": self.runtime_evidence,
+            "v3_simple_coordination": self._coordinator.event_summary,
         })
         return summary
 
@@ -329,6 +365,22 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         frame = self._perception
         is_new = frame is not None and self._submission_serial != self._consumed_serial
         fresh = frame is not None and self._frame_is_fresh(frame, now)
+        finished_decoy_only_count = None
+        if (is_new and fresh
+                and self._coordinator.role == self._coordinator.MASTER
+                and self._coordinator.phase == self._coordinator.ACTIVE):
+            self._decoy_only_count = (
+                self._decoy_only_count + 1 if frame.only_decoys else 0
+            )
+            if self._decoy_only_count >= self.DECOY_ONLY_END_FRAMES:
+                accepted = self.signal_coordination_end(
+                    self._coordinator.FINISH_MASTER_DECOY_ONLY,
+                    self._coordinator.follow_position,
+                )
+                if accepted:
+                    finished_decoy_only_count = self._decoy_only_count
+        elif self._coordinator.role != self._coordinator.MASTER:
+            self._decoy_only_count = 0
         if fresh:
             self._active_target_position = frame.target_position
             self._active_track_predict_position = frame.track_predict_position
@@ -362,10 +414,72 @@ class PersonalV3ControlAgent(PersonalV1Agent):
 
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
-        if (phase_before == CoopCoordinator.SEARCH
-                and self._coordinator.phase != CoopCoordinator.SEARCH):
-            # 协同资格按每次发起消费，回到 SEARCH 后必须重新累计五个新帧。
+        if ((phase_before == CoopCoordinator.SEARCH)
+                != (self._coordinator.phase == CoopCoordinator.SEARCH)):
+            # 发起时消费资格，结束回到 SEARCH 时也清掉协同期间积累的旧帧。
             self._target_gate.reset()
+            self._decoy_only_count = 0
+        coordinator = self._coordinator
+        role = coordinator.role
+        phase = coordinator.phase
+        session = coordinator.current_session
+        control_evidence = {
+            "guidance_enabled": False,
+            "aiming_enabled": False,
+            "master_gate_m": self._simple_control.config.master_gate_m,
+            "target_gate_m": self._simple_control.config.target_gate_m,
+            "rendezvous_ready": False,
+        }
+        if (role == coordinator.FOLLOWER
+                and phase in (coordinator.INIT, coordinator.ACTIVE)):
+            guidance = self._simple_control.follower(
+                self_position=(obs.self.lat, obs.self.lon),
+                self_alt_m=obs.self.alt,
+                self_heading_deg=obs.self.heading_deg,
+                master_position=coordinator.master_position,
+                follow_position=coordinator.follow_position,
+                session_key=session,
+            )
+            control_evidence = guidance.as_evidence()
+            if guidance.guidance_enabled:
+                commands = [command for command in commands
+                            if command.verb != "set_destination"]
+                commands.append(fly_to(
+                    *guidance.fly_to_position,
+                    alt=self.FLIGHT_ALT_M,
+                    speed=guidance.fly_to_speed_mps,
+                    loiter_radius=guidance.fly_to_loiter_radius_m,
+                ))
+            if guidance.aiming_enabled:
+                commands = [command for command in commands if command.verb
+                            != "component.gimbal_tracking.set_orientation"]
+                commands.append(point_gimbal(
+                    guidance.gimbal_pan_cmd_deg,
+                    guidance.gimbal_tilt_cmd_deg,
+                ))
+        else:
+            self._simple_control.reset()
+            if (role == coordinator.MASTER
+                    and phase in (coordinator.HOLD, coordinator.ACTIVE)):
+                aim = self._simple_control.master_aim(
+                    self_position=(obs.self.lat, obs.self.lon),
+                    self_alt_m=obs.self.alt,
+                    self_heading_deg=obs.self.heading_deg,
+                    target_position=coordinator.follow_position,
+                )
+                if aim is not None:
+                    commands = [command for command in commands if command.verb
+                                != "component.gimbal_tracking.set_orientation"]
+                    commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
+                    control_evidence.update({
+                        "guidance_enabled": True,
+                        "aiming_enabled": True,
+                        "aim_target_lat": aim.target_position[0],
+                        "aim_target_lon": aim.target_position[1],
+                        "target_distance_m": aim.ground_distance_m,
+                        "gimbal_pan_cmd_deg": aim.pan_deg,
+                        "gimbal_tilt_cmd_deg": aim.tilt_deg,
+                    })
         fixed = []
         for command in commands:
             if command.verb == "set_destination":
@@ -375,4 +489,27 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             elif command.verb == "set_fov":
                 command = Command(command.verb, {"angle": self.SEARCH_FOV_DEG})
             fixed.append(command)
+        coordination = coordinator.event_summary
+        self._runtime_evidence = {
+            **coordination,
+            **control_evidence,
+            "agent_time_s": now,
+            "confirmation": {
+                "count": self._target_gate.count,
+                "required": self._target_gate.required_frames,
+                "ready": self._target_gate.ready,
+            },
+            "perception": {
+                "frame_id": None if frame is None else frame.frame_id,
+                "is_new": bool(is_new),
+                "fresh": bool(fresh),
+                "is_target": bool(frame is not None and frame.is_target),
+                "only_decoys": bool(frame is not None and frame.only_decoys),
+            },
+            "decoy_only_count": (
+                self._decoy_only_count if finished_decoy_only_count is None
+                else finished_decoy_only_count
+            ),
+            "decoy_only_required": self.DECOY_ONLY_END_FRAMES,
+        }
         return fixed
