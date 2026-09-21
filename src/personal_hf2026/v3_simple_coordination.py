@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止完成去重）。
+# 修改目的：避免已完成的同一停止目标被不同会话反复重捕获并重复增加协同完成数。
+# 修改内容：master_static 在已有完成位置空间门内时广播取消并回到 SEARCH，不记录新的完成会话。
 # 修改时间：2026-09-21（静止速度实测校准）。
 # 修改目的：适配停止车辆接触点仍有投影摆动、二米每秒连续门限在销毁后始终无法触发的问题。
 # 修改内容：依据销毁前零低速连续段和销毁后八帧低速段，把鲁棒速度门限校准为四米每秒。
@@ -386,6 +389,18 @@ class V3SimpleCoordinator(CoopCoordinator):
         position = position or self.follow_position
         if session is None or position is None:
             return False
+        duplicate_static = (
+            reason == self.FINISH_MASTER_STATIC
+            and any(_haversine_m(*position, *old) < self.COMPLETED_GATE_M
+                    for old in self.completed_positions)
+        )
+        if duplicate_static:
+            payloads.append(self._session_payload("C"))
+            self.cancelled_sessions.add(session)
+            self._return_to_search(
+                now, "session_cancelled", "duplicate_completed_position")
+            self._last_stationary_evidence = stationary_evidence
+            return True
         self._record_completion(session, reason, position)
         payloads.append(self._completion_payload(session))
         super()._to_search(False)
