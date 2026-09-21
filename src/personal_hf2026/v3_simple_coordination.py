@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（完成计数与目标位置记忆）。
+# 修改目的：只让静止确认增加完成数，并阻止三机对已识别目标重复发起协同搜索。
+# 修改内容：诱饵结束改为取消广播，静止完成记录窗口均值并以五十米水平门限广播去重。
 # 修改时间：2026-09-21（静止完成去重）。
 # 修改目的：避免已完成的同一停止目标被不同会话反复重捕获并重复增加协同完成数。
 # 修改内容：master_static 在已有完成位置空间门内时广播取消并回到 SEARCH，不记录新的完成会话。
@@ -74,6 +77,7 @@ class V3SimpleCoordinator(CoopCoordinator):
     STATIONARY_SPEED_MPS = 4.0
     STATIONARY_MOVING_SPEED_MPS = 8.0
     STATIONARY_CONFIRM_FRAMES = 7
+    COMPLETED_GATE_M = 50.0
 
     FINISH_MASTER_STATIC = "master_static"
     FINISH_MASTER_DECOY_ONLY = "master_decoy_only"
@@ -155,6 +159,8 @@ class V3SimpleCoordinator(CoopCoordinator):
             "finish_reason": self.finish_reason,
             "completed_count": self.completed_count,
             "completed_sessions": tuple(sorted(self.completed_sessions)),
+            "completed_positions": tuple(self.completed_positions),
+            "last_completed_position": self.last_completed_position,
             "stage_reason": self.stage_reason,
             "master_position": self.master_position,
             "follow_position": self.follow_position,
@@ -348,6 +354,9 @@ class V3SimpleCoordinator(CoopCoordinator):
         }
 
     def _record_completion(self, session, reason, position, announced_count=None):
+        if reason == self.FINISH_MASTER_DECOY_ONLY:
+            self.finish_reason = reason
+            return False
         if session[0] is None or position is None:
             return False
         added = session not in self.completed_sessions
@@ -389,6 +398,13 @@ class V3SimpleCoordinator(CoopCoordinator):
         position = position or self.follow_position
         if session is None or position is None:
             return False
+        if reason == self.FINISH_MASTER_DECOY_ONLY:
+            self.finish_reason = reason
+            self.cancelled_sessions.add(session)
+            payloads.append(self._session_payload("C"))
+            self._return_to_search(now, "coordination_ended", reason)
+            self._last_stationary_evidence = stationary_evidence
+            return True
         duplicate_static = (
             reason == self.FINISH_MASTER_STATIC
             and any(_haversine_m(*position, *old) < self.COMPLETED_GATE_M
@@ -524,9 +540,10 @@ class V3SimpleCoordinator(CoopCoordinator):
                 self.stage_reason = "follower_aim_target"
 
     def should_suppress(self, position, now):
-        """零高程估计误差较大，不再用旧空间门限压制搜索候选。"""
-        del position, now
-        return False
+        """搜索时忽略五十米内已经由静止判定确认并广播的目标。"""
+        del now
+        return any(_haversine_m(*position, *old) < self.COMPLETED_GATE_M
+                   for old in self.completed_positions)
 
     def _append_completion_gossip(self, now, payloads):
         if (not self.completed_sessions
@@ -772,7 +789,7 @@ class V3SimpleCoordinator(CoopCoordinator):
             elif stop_ready:
                 if self._complete_current(
                         now, self.FINISH_MASTER_STATIC,
-                        self._last_stationary_evidence.get("position_h0"),
+                        self._last_stationary_evidence.get("mean_position_h0"),
                         payloads):
                     reset_local = True
 

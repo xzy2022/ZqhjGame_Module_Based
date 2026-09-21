@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止位置均值）。
+# 修改目的：用静止判定最后窗口的整体位置代表已识别目标，降低单帧零高程投影抖动。
+# 修改内容：计算并暴露鲁棒速度窗口内全部 H=0 位置的经纬度均值。
 # 修改时间：2026-09-21（静止证据连续性修复）。
 # 修改目的：避免视觉轨迹编号切换清空同一目标历史，并区分拟合点数与 ACTIVE 连续确认帧数。
 # 修改内容：以 H=0 时空门控续接轨迹编号、暴露拟合最小点数，并允许 HOLD 只更新运动历史。
@@ -202,6 +205,7 @@ class StoppedTargetDetector:
         self.frame_id = None
         self.source_sim_time = None
         self.position_h0 = None
+        self.mean_position_h0 = None
         self.window_span_s = 0.0
         self.distinct_frame_count = 0
         self.speed_mps = None
@@ -223,6 +227,7 @@ class StoppedTargetDetector:
             "frame_id": self.frame_id,
             "source_sim_time": self.source_sim_time,
             "position_h0": self.position_h0,
+            "mean_position_h0": self.mean_position_h0,
             "window_span_s": self.window_span_s,
             "distinct_frame_count": self.distinct_frame_count,
             "fit_min_points": self.robust_min_points,
@@ -274,6 +279,7 @@ class StoppedTargetDetector:
             self.window_span_s = 0.0
             self.distinct_frame_count = 0
             self.speed_mps = None
+            self.mean_position_h0 = None
             self.near_zero = False
             self.ready = False
         self._last_source_time = source_sim_time
@@ -281,6 +287,7 @@ class StoppedTargetDetector:
         if position is None:
             # 新帧未给出同一真目标的 H=0 点，不能延续连续静止确认。
             self.position_h0 = None
+            self.mean_position_h0 = None
             self.stationary_points = 0
             self.near_zero = False
             self.ready = False
@@ -330,6 +337,7 @@ class StoppedTargetDetector:
                 self.window_span_s = 0.0
                 self.distinct_frame_count = 0
                 self.speed_mps = None
+                self.mean_position_h0 = None
                 self.near_zero = False
                 self.ready = False
             self.visual_track_id = track_id
@@ -344,6 +352,10 @@ class StoppedTargetDetector:
         while (self._observations
                and point.t - self._observations[0].t > window_s):
             self._observations.popleft()
+        self.mean_position_h0 = (
+            sum(item.lat for item in self._observations) / len(self._observations),
+            sum(item.lon for item in self._observations) / len(self._observations),
+        )
         self.distinct_frame_count = len(self._observations)
         self.window_span_s = (0.0 if len(self._observations) < 2 else
                               self._observations[-1].t - self._observations[0].t)
