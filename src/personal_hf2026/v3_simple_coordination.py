@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止速度门限收紧）。
+# 修改目的：阻止移动目标在中心投影短暂降到约四米每秒时被误判为明显静止。
+# 修改内容：静止专用接触点的鲁棒速度门限收紧为二米每秒，窗口和七帧确认保持不变。
 # 修改时间：2026-09-21（静止会话接续修复）。
 # 修改目的：让视觉轨迹编号变化时按 H=0 连续性接续，并阻止 HOLD 帧提前贡献完成计数。
 # 修改内容：以会话作为稳定身份传入视觉编号，只有 ACTIVE 新帧累计七帧静止确认。
@@ -59,7 +62,7 @@ class V3SimpleCoordinator(CoopCoordinator):
     STATIONARY_WINDOW_S = 2.5
     STATIONARY_MIN_SPAN_S = 2.0
     STATIONARY_MIN_POINTS = 5
-    STATIONARY_SPEED_MPS = 5.0
+    STATIONARY_SPEED_MPS = 2.0
     STATIONARY_MOVING_SPEED_MPS = 8.0
     STATIONARY_CONFIRM_FRAMES = 7
 

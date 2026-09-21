@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止地面接触点接线）。
+# 修改目的：把静止判定与瞄准中心投影分开，消除物体高度导致的绕飞投影漂移。
+# 修改内容：感知输入新增 stationary_position，并只把该 H=0 接触点送入停止判定器。
 # 修改时间：2026-09-21（MASTER 跟踪连续性）。
 # 修改目的：让 V3 主机在 ACTIVE 中容忍约五秒缺测，并在滑行期持续瞄准运动预测点。
 # 修改内容：仅为 ACTIVE MASTER 动态延长轨迹丢失门限，并用 predict_position(now) 更新 COASTING 云台与广播目标。
@@ -104,6 +107,7 @@ class V3PerceptionInput:
     closest_others: Any = None
     objects: tuple[Any, ...] = ()
     target_position: tuple[float, float] | None = None
+    stationary_position: tuple[float, float] | None = None
     track_predict_position: tuple[float, float] | None = None
     competitor_position: tuple[float, float] | None = None
     frame_id: Any = None
@@ -245,7 +249,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
 
     def submit_perception(self, snapshot=None, *, detection=None,
                           track_predict=None, closest_others=None, objects=None,
-                          target_position=None, track_predict_position=None,
+                          target_position=None, stationary_position=None,
+                          track_predict_position=None,
                           competitor_position=None,
                           frame_id=None, source_sim_time=None,
                           observed_sim_time=None, primary_is_target=None):
@@ -265,6 +270,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                        else _field(snapshot, "objects", ()))
             target_position = (target_position if target_position is not None
                                else _field(snapshot, "target_position", None))
+            stationary_position = (
+                stationary_position if stationary_position is not None
+                else _field(snapshot, "stationary_position", None))
             track_predict_position = (
                 track_predict_position if track_predict_position is not None
                 else _field(snapshot, "track_predict_position", None))
@@ -284,6 +292,11 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 else _field(snapshot, "primary_is_target", None))
 
         target_position = _position(target_position) or _position(detection)
+        stationary_position = (
+            _position(stationary_position)
+            or _position(_field(detection, "ground_contact_h0", None))
+            or target_position
+        )
         track_predict_position = (
             _position(track_predict_position) or _position(track_predict)
         )
@@ -297,6 +310,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             closest_others=closest_others,
             objects=tuple(objects),
             target_position=target_position,
+            stationary_position=stationary_position,
             track_predict_position=track_predict_position,
             competitor_position=competitor_position,
             frame_id=frame_id,
@@ -444,7 +458,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 frame_id=frame.frame_id,
                 source_sim_time=source_time,
                 track_id=frame.primary_key if frame.is_target else None,
-                position_h0=(frame.target_position if frame.is_target else None),
+                position_h0=(frame.stationary_position if frame.is_target else None),
             )
 
         phase_before = self._coordinator.phase

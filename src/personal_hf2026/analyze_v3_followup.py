@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止完成时序交叉核对）。
+# 修改目的：避免 Agent 侧形式证据合格但在裁判销毁前发生的 master_static 假阳性被汇总为通过。
+# 修改内容：新增只用于离线审计的裁判时序旁路检查，不把裁判状态送入 Agent。
 # 修改时间：2026-09-21（静止帧审计修复）。
 # 修改目的：避免把二点五秒拟合窗口点数误当成跨窗口累计的七帧静止确认数。
 # 修改内容：分别验证拟合最小点数和 ACTIVE 连续静止帧数，并要求完成帧处于确认阶段。
@@ -368,6 +371,60 @@ def _judge(run, directory):
     }
 
 
+def _judge_timing_check(decisions, judge):
+    """用裁判时间线排除预销毁静止完成；该证据不会进入 Agent 决策。"""
+    cases, seen = [], set()
+    for row in decisions:
+        state = _state(row)
+        event, reason, session, transition_at = _transition(state)
+        if event != "coordination_finished" or reason != "master_static":
+            continue
+        completed_at = _num(transition_at)
+        completed_at = _time(row) if completed_at is None else completed_at
+        key = (str(row.get("uid")), session, completed_at)
+        if key in seen:
+            continue
+        seen.add(key)
+        cases.append({
+            "uid": str(row.get("uid")),
+            "session": list(session or ()),
+            "completed_at_s": completed_at,
+        })
+    if not cases:
+        return _check("not_observed", "本轮没有触发 master_static，无法核对销毁先后。")
+
+    tolerance_s = 0.75
+    destroyed = sorted(
+        item["time_s"] for item in judge.get("completion_rate_transitions", ())
+        if _num(item.get("time_s")) is not None
+    )
+    for case in cases:
+        prior = [value for value in destroyed
+                 if value <= case["completed_at_s"] + tolerance_s]
+        case["judge_destroyed_time_s"] = prior[-1] if prior else None
+        case["after_judge_destroy"] = bool(prior)
+        case["lag_s"] = (None if not prior else
+                         case["completed_at_s"] - prior[-1])
+    destroyed_count = judge.get("n_destroyed")
+    count_ok = (isinstance(destroyed_count, int)
+                and destroyed_count >= len(cases))
+    passed = bool(destroyed and count_ok
+                  and all(item["after_judge_destroy"] for item in cases))
+    evidence = {
+        "basis": "judge_side_corroboration_not_agent_input",
+        "tolerance_s": tolerance_s,
+        "judge_destroyed_count": destroyed_count,
+        "judge_destroyed_times_s": destroyed,
+        "cases": cases,
+    }
+    return _check(
+        "passed" if passed else "failed",
+        ("每个 master_static 均发生在已有裁判销毁之后。" if passed else
+         "至少一个 master_static 早于裁判销毁，或完成数超过销毁数。"),
+        evidence,
+    )
+
+
 def _legacy(decisions, run, judge):
     terminal = []
     for uid, agent in sorted((run.get("agents") or {}).items()):
@@ -463,12 +520,14 @@ def analyze_run(directory: Path, byte_cap=MAX_TRACE_BYTES, record_cap=MAX_TRACE_
     run = _json(directory / "run.json", {}) or {}
     aim, timeout = _a_checks(decisions)
     fit, frames, edge = _b_checks(decisions)
+    judge = _judge(run, directory)
+    judge_timing = _judge_timing_check(decisions, judge)
     checks = {
         "a_coasting_predict_aim": aim, "a_master_timeout_exit": timeout,
         "b_robust_h0_stationary_fit": fit, "b_distinct_visual_frames": frames,
         "b_static_completion_edge": edge,
+        "b_judge_timing_cross_check": judge_timing,
     }
-    judge = _judge(run, directory)
     integrity["source_summary"] = summary
     integrity["trace_loss"] = bool(
         integrity["invalid_lines"] or integrity["truncated_by_reader"]
@@ -491,7 +550,7 @@ def analyze_run(directory: Path, byte_cap=MAX_TRACE_BYTES, record_cap=MAX_TRACE_
         "legacy_baseline_diagnosis": _legacy(decisions, run, judge),
         "judge_cross_check": judge,
         "limitations": [
-            "A/B 通过判定只使用 Agent 本机 trace；裁判销毁只定位旧故障窗口。",
+            "前五项通过判定只使用 Agent 本机 trace；b_judge_timing_cross_check 仅用裁判销毁时间做离线旁路核对。",
             "source_sim_time 不是已验证的相机曝光时刻。",
             "旧 follow_position 不是逐帧 H=0 原始位置。",
         ],
