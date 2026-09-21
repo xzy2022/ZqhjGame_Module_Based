@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止帧审计修复）。
+# 修改目的：避免把二点五秒拟合窗口点数误当成跨窗口累计的七帧静止确认数。
+# 修改内容：分别验证拟合最小点数和 ACTIVE 连续静止帧数，并要求完成帧处于确认阶段。
 # 修改时间：2026-09-21。
 # 修改目的：为 V3 MASTER 丢失退出和鲁棒静止完成提供有界、可复用的离线验收入口。
 # 修改内容：审计预测瞄准、五秒退出、H=0 鲁棒拟合和不同视觉帧，并把裁判销毁仅作旁路交叉核对。
@@ -273,10 +276,11 @@ def _b_checks(decisions):
         span = _num(item.get("window_span_s"))
         try:
             distinct = int(item.get("distinct_frame_count"))
+            fit_min_points = int(item.get("fit_min_points"))
             consecutive = int(item.get("stationary_consecutive_frames"))
             required = int(item.get("required_stationary_frames"))
         except (TypeError, ValueError):
-            distinct = consecutive = required = None
+            distinct = fit_min_points = consecutive = required = None
         fit_ok = bool(
             _position(item.get("position_h0")) and span is not None
             and STATIC_WINDOW_S[0] <= span <= STATIC_WINDOW_S[1]
@@ -285,8 +289,10 @@ def _b_checks(decisions):
         )
         frames_ok = bool(
             item.get("frame_id") is not None and _num(item.get("source_sim_time")) is not None
-            and None not in (distinct, consecutive, required)
-            and distinct >= required and consecutive >= required and item.get("ready") is True
+            and None not in (distinct, fit_min_points, consecutive, required)
+            and distinct >= fit_min_points and consecutive >= required
+            and item.get("confirmation_enabled") is True
+            and item.get("ready") is True
         )
         cases.append({
             "uid": str(row.get("uid")), "time_s": _time(row),

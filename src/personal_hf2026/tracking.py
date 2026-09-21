@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止证据连续性修复）。
+# 修改目的：避免视觉轨迹编号切换清空同一目标历史，并区分拟合点数与 ACTIVE 连续确认帧数。
+# 修改内容：以 H=0 时空门控续接轨迹编号、暴露拟合最小点数，并允许 HOLD 只更新运动历史。
 # 修改时间：2026-09-21。
 # 修改目的：让 V3 能用不同真实视觉帧的零高程位置鲁棒判断目标是否停止。
 # 修改内容：为停止判定器增加局部 ENU 的 Theil-Sen 速度窗口与有界审计证据，同时保留原默认路径。
@@ -169,7 +172,9 @@ class StoppedTargetDetector:
     def __init__(self, required_points=3, stationary_distance_m=0.05,
                  moving_speed_mps=3.0, *, robust_window_s=None,
                  robust_min_span_s=2.0, robust_min_points=5,
-                 stationary_speed_mps=5.0, max_frame_gap_s=1.5):
+                 stationary_speed_mps=5.0, max_frame_gap_s=1.5,
+                 track_switch_base_gate_m=8.0,
+                 track_switch_speed_gate_mps=25.0):
         self.required_points = required_points
         self.stationary_distance_m = stationary_distance_m
         self.moving_speed_mps = moving_speed_mps
@@ -178,6 +183,8 @@ class StoppedTargetDetector:
         self.robust_min_points = robust_min_points
         self.stationary_speed_mps = stationary_speed_mps
         self.max_frame_gap_s = max_frame_gap_s
+        self.track_switch_base_gate_m = track_switch_base_gate_m
+        self.track_switch_speed_gate_mps = track_switch_speed_gate_mps
         self.config = TrackConfig()
         self.reset()
 
@@ -191,6 +198,7 @@ class StoppedTargetDetector:
         self._observations = deque()
         self._last_frame_key = None
         self._last_source_time = None
+        self.visual_track_id = None
         self.frame_id = None
         self.source_sim_time = None
         self.position_h0 = None
@@ -201,6 +209,12 @@ class StoppedTargetDetector:
         self.ready = False
         self.duplicate_frames_ignored = 0
         self.out_of_order_frames_ignored = 0
+        self.track_switch_count = 0
+        self.track_switch_reset_count = 0
+        self.last_track_switch_continuous = None
+        self.last_track_switch_distance_m = None
+        self.last_track_switch_gate_m = None
+        self.confirmation_enabled = False
 
     @property
     def evidence(self):
@@ -211,6 +225,7 @@ class StoppedTargetDetector:
             "position_h0": self.position_h0,
             "window_span_s": self.window_span_s,
             "distinct_frame_count": self.distinct_frame_count,
+            "fit_min_points": self.robust_min_points,
             "east_velocity_mps": self.velocity[0] if self.speed_mps is not None else None,
             "north_velocity_mps": self.velocity[1] if self.speed_mps is not None else None,
             "speed_mps": self.speed_mps,
@@ -220,13 +235,21 @@ class StoppedTargetDetector:
             "near_zero": self.near_zero,
             "stationary_consecutive_frames": self.stationary_points,
             "required_stationary_frames": self.required_points,
+            "confirmation_enabled": self.confirmation_enabled,
             "ready": self.ready,
             "duplicate_frames_ignored": self.duplicate_frames_ignored,
             "out_of_order_frames_ignored": self.out_of_order_frames_ignored,
+            "visual_track_id": self.visual_track_id,
+            "track_switch_count": self.track_switch_count,
+            "track_switch_reset_count": self.track_switch_reset_count,
+            "last_track_switch_continuous": self.last_track_switch_continuous,
+            "last_track_switch_distance_m": self.last_track_switch_distance_m,
+            "last_track_switch_gate_m": self.last_track_switch_gate_m,
         }
 
     def update_observation(self, identity, position, *, frame_key,
-                           frame_id, source_sim_time, valid):
+                           frame_id, source_sim_time, valid, track_id=None,
+                           confirm=True):
         """消费一张 V3 新视觉帧；同一帧在当前身份内最多消费一次。"""
         if not valid or frame_key is None or source_sim_time is None:
             return False
@@ -242,6 +265,7 @@ class StoppedTargetDetector:
         self._last_frame_key = frame_key
         self.frame_id = frame_id
         self.source_sim_time = source_sim_time
+        self.confirmation_enabled = bool(confirm)
         if (self._last_source_time is not None
                 and source_sim_time - self._last_source_time > self.max_frame_gap_s):
             self._observations.clear()
@@ -267,12 +291,50 @@ class StoppedTargetDetector:
             ignored_out_of_order = self.out_of_order_frames_ignored
             self.reset()
             self.identity = identity
+            self.visual_track_id = track_id
+            self.confirmation_enabled = bool(confirm)
             self._last_frame_key = seen_key
             self.duplicate_frames_ignored = ignored_duplicates
             self.out_of_order_frames_ignored = ignored_out_of_order
             self.frame_id = frame_id
             self.source_sim_time = source_sim_time
             self._last_source_time = source_sim_time
+
+        if (track_id is not None and self.visual_track_id is not None
+                and track_id != self.visual_track_id):
+            self.track_switch_count += 1
+            previous = self._observations[-1] if self._observations else None
+            distance = None
+            gate = None
+            continuous = False
+            if previous is not None:
+                dt = source_sim_time - previous.t
+                if 0.0 < dt <= self.max_frame_gap_s:
+                    offset = _offset_m(
+                        (previous.lat, previous.lon),
+                        (float(position[0]), float(position[1])),
+                    )
+                    distance = math.hypot(*offset)
+                    gate = (self.track_switch_base_gate_m
+                            + self.track_switch_speed_gate_mps * dt)
+                    continuous = distance <= gate
+            self.last_track_switch_continuous = continuous
+            self.last_track_switch_distance_m = distance
+            self.last_track_switch_gate_m = gate
+            if not continuous:
+                self.track_switch_reset_count += 1
+                self._observations.clear()
+                self.was_moving = False
+                self.stationary_points = 0
+                self.velocity = (0.0, 0.0)
+                self.window_span_s = 0.0
+                self.distinct_frame_count = 0
+                self.speed_mps = None
+                self.near_zero = False
+                self.ready = False
+            self.visual_track_id = track_id
+        elif track_id is not None:
+            self.visual_track_id = track_id
 
         point = TrackPoint(source_sim_time, float(position[0]), float(position[1]))
         self.position_h0 = (point.lat, point.lon)
@@ -297,7 +359,8 @@ class StoppedTargetDetector:
             self.speed_mps = None
         self.near_zero = bool(
             enough and self.was_moving and self.speed_mps <= self.stationary_speed_mps)
-        self.stationary_points = self.stationary_points + 1 if self.near_zero else 0
+        self.stationary_points = (
+            self.stationary_points + 1 if self.near_zero and confirm else 0)
         self.ready = bool(
             self.was_moving and self.stationary_points >= self.required_points)
         return self.ready

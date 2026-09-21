@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止会话接续修复）。
+# 修改目的：让视觉轨迹编号变化时按 H=0 连续性接续，并阻止 HOLD 帧提前贡献完成计数。
+# 修改内容：以会话作为稳定身份传入视觉编号，只有 ACTIVE 新帧累计七帧静止确认。
 # 修改时间：2026-09-21（MASTER 丢失退出）。
 # 修改目的：让 V3 主机超过 ACTIVE 跟踪容忍期后直接结束本次协同跟踪。
 # 修改内容：主机滑行时广播预测位置，轨迹 LOST 或 epoch 断裂时广播取消并直接返回 SEARCH。
@@ -726,12 +729,14 @@ class V3SimpleCoordinator(CoopCoordinator):
                 and self.current_session is not None
             )
             stop_ready = self.stopped_target.update_observation(
-                (self.current_session, stationary_observation["track_id"]),
+                self.current_session,
                 stationary_observation["position_h0"],
                 frame_key=stationary_observation["frame_key"],
                 frame_id=stationary_observation["frame_id"],
                 source_sim_time=stationary_observation["source_sim_time"],
                 valid=stationary_valid,
+                track_id=stationary_observation["track_id"],
+                confirm=self.phase == self.ACTIVE,
             )
             if stationary_valid:
                 self._last_stationary_evidence = dict(self.stopped_target.evidence)
