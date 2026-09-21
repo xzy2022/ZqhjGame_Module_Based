@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21。
+# 修改目的：让 V3 使用不依赖双机轨迹匹配和协同计时的专用简化协调器。
+# 修改内容：接入最近从机邀请、零高程目标广播、显式结束信号和结构化协调摘要。
 # 修改时间：2026-09-20（异步锁定门槛适配）。
 # 修改目的：避免不同真实视觉帧之间的空控制 tick 反复清零 V1 的半秒锁定计时。
 # 修改内容：V3 保留五个不同真车帧和运动轨迹确认，并把额外主锁定稳定时间设为零。
@@ -22,6 +25,7 @@ from .competition_flight import CompetitionDirectionController
 from .coordination import CoopCoordinator
 from .gimbal_lock import GimbalLockConfig, GimbalLockController
 from .personal_v1 import PersonalV1Agent
+from .v3_simple_coordination import V3SimpleCoordinator
 
 
 _MISSING = object()
@@ -134,21 +138,6 @@ class ConsecutiveTargetGate:
         return self.count >= self.required_frames
 
 
-class _GatedCoordinator(CoopCoordinator):
-    """仅收紧 SEARCH 发起条件，不改变 V1 的通信协议和协同状态机。"""
-
-    def __init__(self, *args, proposal_gate, **kwargs):
-        self._proposal_gate = proposal_gate
-        super().__init__(*args, **kwargs)
-
-    def step(self, now, local, inbox, can_propose=True, **kwargs):
-        return super().step(
-            now, local, inbox,
-            can_propose=bool(can_propose and self._proposal_gate()),
-            **kwargs,
-        )
-
-
 class _V3CompetitionDirectionController(CompetitionDirectionController):
     """用融合后的目标/竞争对象坐标覆盖 V1 的原生主锁定推断。"""
 
@@ -184,6 +173,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     SEARCH_FOV_DEG = 48.0
     FLIGHT_ALT_M = 500.0
     TARGET_ALT_M = 0.0
+    COOP_DURATION_S = 0.0
     TARGET_CONFIRM_FRAMES = 5
     PERCEPTION_STALE_S = 1.0
 
@@ -200,7 +190,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             coop_reacquire_timeout_s=self.COOP_REACQUIRE_TIMEOUT_S,
         ))
         self._target_gate = ConsecutiveTargetGate(self.TARGET_CONFIRM_FRAMES)
-        self._coordinator = _GatedCoordinator(
+        self._coordinator = V3SimpleCoordinator(
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,
             self.COOP_REACQUIRE_TIMEOUT_S,
             proposal_gate=lambda: self._target_gate.ready,
@@ -305,6 +295,10 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._active_target_position, self._active_competitor_position)
             if position is not None)
 
+    def signal_coordination_end(self, reason, position=None):
+        """把连续诱饵等真实感知结论显式交给简化协调器。"""
+        return self._coordinator.signal_end(reason, position)
+
     @property
     def completion_summary(self):
         summary = dict(super().completion_summary)
@@ -320,6 +314,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "v3_fov_deg": self.SEARCH_FOV_DEG,
             "v3_flight_alt_m": self.FLIGHT_ALT_M,
             "v3_target_alt_m": self.TARGET_ALT_M,
+            "v3_simple_coordination": self._coordinator.event_summary,
         })
         return summary
 
@@ -362,9 +357,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
 
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
-        if (phase_before == CoopCoordinator.SEARCH
-                and self._coordinator.phase != CoopCoordinator.SEARCH):
-            # 协同资格按每次发起消费，回到 SEARCH 后必须重新累计五个新帧。
+        if ((phase_before == CoopCoordinator.SEARCH)
+                != (self._coordinator.phase == CoopCoordinator.SEARCH)):
+            # 发起时消费资格，结束回到 SEARCH 时也清掉协同期间积累的旧帧。
             self._target_gate.reset()
         fixed = []
         for command in commands:
