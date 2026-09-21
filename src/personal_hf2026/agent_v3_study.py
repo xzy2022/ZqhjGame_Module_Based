@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21。
+# 修改目的：为 V3 单局运行增加可选的 YOLO 完成帧图像与离线可视化审计日志。
+# 修改内容：新增 --save-images 和 --detailed-log，只保存已完成 YOLO 推理的原图并隔离裁判真值。
 # 修改时间：2026-09-21（后续协同审计证据）。
 # 修改目的：让丢失超时退出和鲁棒静止完成可由有界运行轨迹直接复核。
 # 修改内容：透出轨迹与静止拟合摘要，封顶确认指纹并省略周期样本中重复的 before 快照以延长 trace 覆盖时间。
@@ -41,6 +44,7 @@ from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SIM_ROOT
 from .personal_v3 import PersonalV3Agent
 from .redis_runtime import RedisRuntime
 from .sdk_compat import IdleCompatibleCoopDecoyRunner
+from .v3_logging import V3VisualLog
 from .v3_perception import V3PerceptionWorker, submit_observation
 
 
@@ -517,10 +521,13 @@ def _horizontal_distance_m(first, current):
 class FreshPhotoCache(PhotoCache):
     """只在本轮最新相机键越过启动基线后交付图片。"""
 
-    def __init__(self, redis_client, uids):
+    def __init__(self, redis_client, uids, *, capture_metadata=False):
         super().__init__(redis_client=redis_client, uids=uids)
         self._baseline = {str(uid): self._scan(str(uid)) for uid in uids}
         self._run_keys = {str(uid): set() for uid in uids}
+        self._capture_metadata = bool(capture_metadata)
+        self._latest_metadata = {}
+        self._recent_frames = {str(uid): {} for uid in uids}
 
     def _scan(self, uid):
         signatures = {}
@@ -550,9 +557,50 @@ class FreshPhotoCache(PhotoCache):
         if not candidates:
             return
         _, key = max(candidates)
+        try:
+            source_time = float(current[key])
+        except (KeyError, TypeError, ValueError):
+            return
         image = self._redis.hget(key, "image")
         if image is not None:
             self._cache[uid] = image
+            if self._capture_metadata:
+                raw_boxes = self._redis.hget(key, "detections")
+                try:
+                    boxes = json.loads(raw_boxes) if raw_boxes else []
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    boxes = []
+                match = _FRAME_NUMBER.search(key)
+                self._latest_metadata[uid] = {
+                    "frame_no": int(match.group(1)) if match else None,
+                    "frame_id": hashlib.sha256(image).hexdigest(),
+                    "source_sim_time": source_time,
+                    "source_time_basis": "redis_camera_sim_time_not_verified_exposure",
+                    "ue_projected_objects": boxes,
+                    "ue_metadata_status": "runner_side_redis_audit_not_exposed_to_agent",
+                }
+                recent = self._recent_frames[uid]
+                recent[self._latest_metadata[uid]["frame_id"]] = (
+                    image, dict(self._latest_metadata[uid]))
+                while len(recent) > 128:
+                    del recent[next(iter(recent))]
+
+    def metadata_for(self, uid, photo):
+        """只给 Runner 审计器返回与当前图片哈希相同的 Redis 元数据。"""
+        metadata = self._latest_metadata.get(str(uid))
+        if not metadata or not isinstance(photo, bytes):
+            return {}
+        if metadata.get("frame_id") != hashlib.sha256(photo).hexdigest():
+            return {}
+        return dict(metadata)
+
+    def frame_for(self, uid, frame_id):
+        """返回还在有界缓存中的原图和 Runner 审计元数据。"""
+        entry = self._recent_frames.get(str(uid), {}).get(str(frame_id))
+        if entry is None:
+            return None
+        photo, metadata = entry
+        return photo, dict(metadata)
 
 
 class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
@@ -561,7 +609,8 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
     def __init__(self, cfg, output, runtime_root, weather, *, device="0",
                  detector_config=None, weights=None,
                  trace_max_records=_TRACE_DEFAULT_MAX_RECORDS,
-                 trace_max_bytes=_TRACE_DEFAULT_MAX_BYTES, log=print):
+                 trace_max_bytes=_TRACE_DEFAULT_MAX_BYTES,
+                 save_images=False, detailed_log=False, log=print):
         super().__init__(cfg, PersonalV3Agent, log=log)
         self.output = Path(output)
         self.runtime_root = Path(runtime_root).resolve()
@@ -582,6 +631,10 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             self.output,
             max_records=trace_max_records,
             max_bytes=trace_max_bytes,
+        )
+        self.visual_log = (
+            V3VisualLog(self.output, save_images=save_images, detailed_log=detailed_log)
+            if save_images or detailed_log else None
         )
         self.perception_worker = None
         if not self.cfg.dry_run:
@@ -638,7 +691,10 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                 port=self.cfg.redis_port,
                 socket_timeout=2,
             )
-            self.photo_cache = FreshPhotoCache(redis_client=client, uids=uids)
+            self.photo_cache = FreshPhotoCache(
+                redis_client=client, uids=uids,
+                capture_metadata=bool(self.visual_log),
+            )
             self.photo_cache.start()
             self.renderer = StudyRenderer(
                 self.runtime_root,
@@ -659,6 +715,19 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
 
         def recorded_sensor(obs, dt):
             result = sensor(obs, dt)
+            if self.visual_log is not None:
+                try:
+                    snapshot = getattr(agent, "_last_snapshot", None)
+                    frame_id = _field(snapshot, "frame_id")
+                    entry = (self.photo_cache.frame_for(uid, frame_id)
+                             if self.photo_cache is not None and frame_id else None)
+                    if entry is not None:
+                        self.visual_log.record_processed_frame(
+                            uid, entry[0], entry[1], snapshot)
+                    else:
+                        self.visual_log.record_prediction(uid, snapshot)
+                except BaseException as exc:
+                    self.coordination_trace.capture_error(uid, "visual_log_sensor", exc)
             try:
                 self.coordination_trace.record_sensor(uid, agent, obs)
             except BaseException as exc:
@@ -703,6 +772,11 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
     def _observe_scoring(self, evaluator, ws, sim_t0, destroyed, all_cmds=()):
         # 仅在裁判侧旁路记录车辆位移；Agent observation 和决策输入保持不变。
         relative_time = float(max(0.0, ws.sim_time - sim_t0))
+        if self.visual_log is not None:
+            try:
+                self.visual_log.record_truth(relative_time, ws)
+            except BaseException as exc:
+                self.coordination_trace.capture_error("runner", "visual_log_truth", exc)
         for vehicle_type, entities in (("target", ws.targets), ("decoy", ws.decoys)):
             for uid, entity in entities.items():
                 current = (float(entity.lat), float(entity.lon))
@@ -787,6 +861,11 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             except BaseException as exc:
                 errors.append(exc)
             self.photo_cache = None
+        if self.visual_log is not None:
+            try:
+                self.visual_log.close()
+            except BaseException as exc:
+                errors.append(exc)
         try:
             self.coordination_trace.close()
         except BaseException as exc:
@@ -837,6 +916,8 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                 "source_scenario": self.source_scenario_profile,
                 "motion_audit": self._motion_audit_summary(),
                 "coordination_evidence": self.coordination_trace.summary,
+                "visual_logging": (self.visual_log.summary if self.visual_log is not None
+                                   else {"schema_version": 1, "enabled": False}),
                 "formal_inputs": [
                     "obs.self.photo",
                     "obs.self_pose_and_gimbal",
@@ -889,6 +970,14 @@ def _parser():
     parser.add_argument(
         "--trace-max-bytes", type=int, default=_TRACE_DEFAULT_MAX_BYTES,
         help="协同证据 UTF-8 字节上限，默认 16 MiB",
+    )
+    parser.add_argument(
+        "--save-images", action="store_true",
+        help="保存三机已完成 YOLO 推理的相机图像到 images/<uav-id>/",
+    )
+    parser.add_argument(
+        "--detailed-log", action="store_true",
+        help="记录可视化所需的帧、YOLO 快照和裁判侧真值 JSONL（不暴露给 Agent）",
     )
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--visualization-port", type=int, default=0)
@@ -966,6 +1055,11 @@ def main(argv=None):
                 "max_records": args.trace_max_records,
                 "max_bytes": args.trace_max_bytes,
             },
+            "visual_logging": {
+                "save_images": args.save_images,
+                "detailed_log": args.detailed_log,
+                "starts_simulation": False,
+            },
             "source_scenario": source_profile,
         }
         (args.output / "run.json").write_text(
@@ -1027,6 +1121,8 @@ def main(argv=None):
             weights=args.weights,
             trace_max_records=args.trace_max_records,
             trace_max_bytes=args.trace_max_bytes,
+            save_images=args.save_images,
+            detailed_log=args.detailed_log,
             log=log,
         )
         if args.visualize and not args.dry_run:
