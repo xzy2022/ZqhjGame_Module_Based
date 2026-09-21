@@ -1,3 +1,6 @@
+# 修改时间：2026-09-21（静止速度实测校准）。
+# 修改目的：适配停止车辆接触点仍有投影摆动、二米每秒连续门限在销毁后始终无法触发的问题。
+# 修改内容：依据销毁前零低速连续段和销毁后八帧低速段，把鲁棒速度门限校准为四米每秒。
 # 修改时间：2026-09-21（MASTER 等待超时退出）。
 # 修改目的：避免 HOLD 中已经跟丢超过五秒的过期会话继续等待从机并延后退出。
 # 修改内容：MASTER 在 HOLD 与 ACTIVE 的轨迹 LOST 或 epoch 断裂时统一取消会话并回到 SEARCH。
@@ -65,7 +68,7 @@ class V3SimpleCoordinator(CoopCoordinator):
     STATIONARY_WINDOW_S = 2.5
     STATIONARY_MIN_SPAN_S = 2.0
     STATIONARY_MIN_POINTS = 5
-    STATIONARY_SPEED_MPS = 2.0
+    STATIONARY_SPEED_MPS = 4.0
     STATIONARY_MOVING_SPEED_MPS = 8.0
     STATIONARY_CONFIRM_FRAMES = 7
 
