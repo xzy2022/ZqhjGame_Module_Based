@@ -1,4 +1,7 @@
 # 修改时间：2026-09-22。
+# 修改目的：允许 V3 单次与批量运行将结果写入外置输出盘。
+# 修改内容：删除单次入口对 --output 必须位于默认输出根的限制。
+# 修改时间：2026-09-22。
 # 修改目的：为 V3 开发诊断提供可组合的同帧 UE 投影框识别结果矫正开关。
 # 修改内容：新增 --vision-diagnostic 三位模式，只在 Runner 的开发诊断 provider 返回已完成 YOLO 快照前矫正类别、误检或漏检。
 # 修改时间：2026-09-21。
@@ -459,14 +462,6 @@ class CoordinationEvidenceRecorder:
             json.dumps(self.summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
             encoding="utf-8",
         )
-
-
-def _is_relative_to(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
 
 
 def _scenario_profile(path: Path) -> dict:
@@ -1283,8 +1278,6 @@ def main(argv=None):
         parser.error(f"官方场景天气不受支持：{args.weather}")
     if not args.dry_run and not (args.runtime_root / "opensim-sim.exe").is_file():
         parser.error(f"运行底座缺少 opensim-sim.exe：{args.runtime_root}")
-    if not _is_relative_to(args.output, OUTPUT_ROOT.resolve()):
-        parser.error(f"--output 必须位于 {OUTPUT_ROOT.resolve()} 下")
     if args.output.exists():
         parser.error(f"输出目录已存在，拒绝覆盖：{args.output}")
     if args.duration <= 0:

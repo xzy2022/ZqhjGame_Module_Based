@@ -1,3 +1,9 @@
+# 修改时间：2026-09-22。
+# 修改目的：让 V3 串行批量入口可显式选择同帧 UE 投影框开发诊断模式。
+# 修改内容：新增默认 000 的 --vision-diagnostic 参数，并向每个单次子运行透传。
+# 修改时间：2026-09-22。
+# 修改目的：让 V3 串行批量入口支持单次运行的可视化与完整视觉审计开关，并允许外置输出盘。
+# 修改内容：透传 --save-images、--detailed-log、--visualize，删除 --output 必须位于默认输出根的限制。
 # 修改时间：2026-09-20。
 # 修改目的：提供 PersonalV3 多天气多随机种子的严格串行批量入口。
 # 修改内容：默认只生成计划，显式 execute 后逐轮启动单个 UE 并校验必要产物。
@@ -11,7 +17,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from .agent_v3_study import DEFAULT_LAYOUT, WEATHERS, _is_relative_to
+from .agent_v3_study import DEFAULT_LAYOUT, WEATHERS, _vision_diagnostic_mode
 from .paths import OUTPUT_ROOT, PROJECT_ROOT, RUNTIME_ROOT, SIM_ROOT
 
 
@@ -54,11 +60,19 @@ def _child_command(item, args):
         str(args.device),
         "--output",
         item["output"],
+        "--vision-diagnostic",
+        args.vision_diagnostic,
     ]
     if args.detector_config is not None:
         command.extend(["--detector-config", str(args.detector_config)])
     if args.weights is not None:
         command.extend(["--weights", str(args.weights)])
+    if args.save_images:
+        command.append("--save-images")
+    if args.detailed_log:
+        command.append("--detailed-log")
+    if args.visualize:
+        command.append("--visualize")
     return command
 
 
@@ -181,6 +195,13 @@ def _parser():
     parser.add_argument("--device", default="0")
     parser.add_argument("--detector-config", type=Path, default=None)
     parser.add_argument("--weights", type=Path, default=None)
+    parser.add_argument("--save-images", action="store_true")
+    parser.add_argument("--detailed-log", action="store_true")
+    parser.add_argument("--visualize", action="store_true")
+    parser.add_argument(
+        "--vision-diagnostic", type=_vision_diagnostic_mode, default="000",
+        help="开发诊断三位开关，默认 000；透传给每个 agent_v3_study 子运行",
+    )
     parser.add_argument("--execute", action="store_true")
     return parser
 
@@ -193,8 +214,6 @@ def main(argv=None):
     args.output = args.output.resolve()
     if not args.layout.is_file():
         parser.error(f"--layout 不存在：{args.layout}")
-    if not _is_relative_to(args.output, OUTPUT_ROOT.resolve()):
-        parser.error(f"--output 必须位于 {OUTPUT_ROOT.resolve()} 下")
     if args.output.exists():
         parser.error(f"输出目录已存在，拒绝覆盖：{args.output}")
     if args.duration <= 0:

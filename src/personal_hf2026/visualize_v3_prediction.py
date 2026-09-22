@@ -1,3 +1,12 @@
+# 修改时间：2026-09-22。
+# 修改目的：确保本机起止标记严格按所选时段的观测仿真时间确定。
+# 修改内容：绘制前按 observed_sim_time_s 对本机坐标排序，再取首尾点标记。
+# 修改时间：2026-09-22。
+# 修改目的：突出本机在所选时段的起止位置，同时降低密集位置点对轨迹的遮挡。
+# 修改内容：本机起点和终点分别绘制红色方形与红色叉号，紫色三角形改为半透明。
+# 修改时间：2026-09-22。
+# 修改目的：使密集本机位置采样点更易辨识且不遮挡附近轨迹。
+# 修改内容：缩小紫色本机坐标三角形并改为完全不透明。
 # 修改时间：2026-09-21。
 # 修改目的：使位置审计图聚焦轨迹关系，避免对象编号和高度文字遮挡曲线。
 # 修改内容：取消真值轨迹的对象编号与高度标注，保留线条、点位和图例。
@@ -138,6 +147,7 @@ def render(run: Path, uid: str, time_range: tuple[float, float], link_every_s: f
                     match = min(right, key=lambda other: (float(other["lat"]) - float(item["lat"])) ** 2
                                 + (float(other["lon"]) - float(item["lon"])) ** 2)
                     links.append((item, match))
+    own_positions.sort(key=lambda item: item["time_s"])
     if not all_points:
         raise ValueError("指定时段没有同时可绘制的真值或预测位置；请检查无人机 ID、时段或 UE 框元数据")
     origin = (sum(point[0] for point in all_points) / len(all_points),
@@ -164,8 +174,12 @@ def render(run: Path, uid: str, time_range: tuple[float, float], link_every_s: f
     if own_positions:
         own_xy = [_meters(item["lat"], item["lon"], origin) for item in own_positions]
         axis.scatter([item[0] for item in own_xy], [item[1] for item in own_xy],
-                     s=28, marker="^", color="#800080", edgecolors="white",
-                     linewidths=0.35, alpha=0.9, zorder=3)
+                     s=4, marker="^", color="#800080", edgecolors="white",
+                     linewidths=0.35, alpha=0.2, zorder=3)
+        axis.scatter([own_xy[0][0]], [own_xy[0][1]], s=44, marker="s",
+                     color="#d00000", edgecolors="white", linewidths=0.5, zorder=6)
+        axis.scatter([own_xy[-1][0]], [own_xy[-1][1]], s=52, marker="x",
+                     color="#d00000", linewidths=1.6, zorder=6)
     for truth_item, prediction_item in links:
         first, second = _meters(truth_item["lat"], truth_item["lon"], origin), _meters(
             prediction_item["lat"], prediction_item["lon"], origin)
@@ -183,6 +197,10 @@ def render(run: Path, uid: str, time_range: tuple[float, float], link_every_s: f
         Line2D([0], [0], color="black", lw=1, ls="--", label="nearest same-class link"),
         Line2D([0], [0], color="#800080", marker="^", markeredgecolor="white",
                markersize=7, linestyle="None", label="own UAV position"),
+        Line2D([0], [0], color="#d00000", marker="s", markeredgecolor="white",
+               markersize=7, linestyle="None", label="own UAV start"),
+        Line2D([0], [0], color="#d00000", marker="x", markersize=7,
+               linestyle="None", label="own UAV end"),
     ], loc="best")
     output = run / "visual_prediction" / f"uav_{uid}_{start:g}-{end:g}s.png"
     output.parent.mkdir(parents=True, exist_ok=True)
