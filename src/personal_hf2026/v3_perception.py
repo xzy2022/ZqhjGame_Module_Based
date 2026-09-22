@@ -1,3 +1,6 @@
+# 修改时间：2026-09-22。
+# 修改目的：使 V3 开发诊断能在 YOLO 输出转成观测前按同帧 Runner 元数据矫正检测列表。
+# 修改内容：FrameJob 可携带仅显式注入的诊断元数据和变换器，并在 detector.predict 后、select_observations 前调用。
 # 修改时间：2026-09-20（异步姿态绑定与初始化门控）。
 # 修改目的：避免用推理返回时姿态解释旧图片，并让模型加载失败可在启动仿真前暴露。
 # 修改内容：快照固化提交时相机位姿，并增加可等待 ready 或明确失败的启动接口。
@@ -94,6 +97,7 @@ class _FrameJob:
     sequence_id: str
     own_pose: Mapping[str, float] | None
     submission_sequence: int
+    diagnostic_metadata: Mapping | None
 
 
 def _probabilities(record: Mapping) -> tuple[float, float]:
@@ -211,6 +215,7 @@ def submit_observation(
     obs,
     *,
     sequence_id: str = "run",
+    diagnostic_metadata: Mapping | None = None,
 ) -> PerceptionSnapshot | None:
     """供 ``sensor()`` 调用的轻量适配；不会读取原有 detection(s)。"""
     score_view = getattr(getattr(obs, "briefing", None), "score_view", None)
@@ -233,6 +238,7 @@ def submit_observation(
                 "lat", "lon", "alt", "heading_deg", "gimbal_pan",
                 "gimbal_tilt", "gimbal_fov_deg",
             )},
+            diagnostic_metadata=diagnostic_metadata,
         )
     return worker.latest(own.uid, now_sim_time=now, max_age_s=1.5)
 
@@ -272,9 +278,11 @@ class V3PerceptionWorker:
         *,
         detector_factory: Callable[[], object] | None = None,
         detector_kwargs: Mapping | None = None,
+        diagnostic_transform: Callable | None = None,
     ) -> None:
         self._detector_factory = detector_factory
         self._detector_kwargs = dict(detector_kwargs or {})
+        self._diagnostic_transform = diagnostic_transform
         self._condition = Condition()
         self._pending: dict[str, _FrameJob] = {}
         self._latest: dict[str, PerceptionSnapshot] = {}
@@ -312,6 +320,7 @@ class V3PerceptionWorker:
         fov_deg: float = FOV_DEG,
         sequence_id: str = "run",
         own_pose: Mapping[str, float] | None = None,
+        diagnostic_metadata: Mapping | None = None,
     ) -> str | None:
         """提交真实图片；返回像素哈希 frame_id，不等待推理。"""
         if not isinstance(photo, bytes) or not photo or len(photo) > MAX_PHOTO_BYTES:
@@ -356,6 +365,10 @@ class V3PerceptionWorker:
                 sequence_id=sequence_id,
                 own_pose=dict(own_pose) if own_pose is not None else None,
                 submission_sequence=self._submission_sequence,
+                diagnostic_metadata=(
+                    dict(diagnostic_metadata)
+                    if diagnostic_metadata is not None else None
+                ),
             )
             self._stats["submitted_frames"] += 1
             self._condition.notify()
@@ -457,6 +470,11 @@ class V3PerceptionWorker:
                 sequence_id=job.sequence_id,
                 stream_id=job.uid,
             )
+            if self._diagnostic_transform is not None:
+                detections = self._diagnostic_transform(
+                    job.uid, job.frame_id, detections, image_size,
+                    job.diagnostic_metadata,
+                )
             detection, track_predict, closest_others, objects = select_observations(
                 detections, image_size, job.own_pose)
             error = None
