@@ -1,4 +1,7 @@
 # 修改时间：2026-09-21。
+# 修改目的：使位置审计图聚焦轨迹关系，避免对象编号和高度文字遮挡曲线。
+# 修改内容：取消真值轨迹的对象编号与高度标注，保留线条、点位和图例。
+# 修改时间：2026-09-21。
 # 修改目的：让位置审计图同时展示本机轨迹，便于判断相机投影与飞行位置关系。
 # 修改内容：将同一时段各已处理帧的本机坐标以紫色三角形绘制到东北米制坐标。
 # 修改时间：2026-09-21。
@@ -141,7 +144,7 @@ def render(run: Path, uid: str, time_range: tuple[float, float], link_every_s: f
               sum(point[1] for point in all_points) / len(all_points))
     figure, axis = plt.subplots(figsize=(11, 9), constrained_layout=True)
     styles = {"target": ("#8b0000", "-"), "decoy": ("#ff8c00", "-")}
-    for (category, object_id), values in actual.items():
+    for (category, _object_id), values in actual.items():
         xy = [_meters(item["lat"], item["lon"], origin) for item in values]
         axis.plot([item[0] for item in xy], [item[1] for item in xy],
                   color=styles[category][0], linestyle=styles[category][1], linewidth=1.8)
@@ -149,11 +152,6 @@ def render(run: Path, uid: str, time_range: tuple[float, float], link_every_s: f
             axis.scatter([item[0] for item in xy], [item[1] for item in xy],
                          s=28, marker="o", color=styles[category][0],
                          edgecolors="white", linewidths=0.5, zorder=4)
-        for index, (item, point) in enumerate(zip(values, xy)):
-            if index == 0 or index == len(values) - 1 or index % 10 == 0:
-                axis.annotate(f"{object_id} {float(item.get('alt') or 0):.0f}m", point,
-                              xytext=(3, 3), textcoords="offset points",
-                              fontsize=6, color=styles[category][0], zorder=5)
     prediction_styles = {"target": "#90ee90", "decoy": "#87ceeb"}
     for (category, _track_id), values in predicted.items():
         xy = [_meters(item["lat"], item["lon"], origin) for item in values]
