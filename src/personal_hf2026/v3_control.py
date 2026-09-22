@@ -1,4 +1,7 @@
 # 修改时间：2026-09-22。
+# 修改目的：将公开的机体航向和云台全姿态转换为横移视差所需的完整世界相机位姿。
+# 修改内容：按水平飞行且相机无滚转的官方接口约定构造 ENU 中心和正交相机矩阵，不读取运行器真值。
+# 修改时间：2026-09-22。
 # 修改目的：把单机横移视差的动静结论接入 V3 发起门、协同取消和飞行控制。
 # 修改内容：仅 moving 放行协同，static/uncertain 局部恢复搜索，ACTIVE 双机改用反相轨道并停用竞争者规避。
 # 修改时间：2026-09-21（MASTER 等待阶段连续性）。
@@ -37,6 +40,7 @@
 """V3 控制层：把真实感知结果适配到 PersonalV1 的协同状态机。"""
 
 from dataclasses import dataclass, replace
+import math
 from typing import Any
 
 from competition.sdk.core.commands import (
@@ -58,6 +62,7 @@ except ImportError:  # 集成分支尚未合入估计器时保持保守拒绝，
 
 
 _MISSING = object()
+EARTH_RADIUS_M = 6_378_137.0
 
 
 def _field(value, name, default=None):
@@ -267,6 +272,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._motion_cooperation_allowed = False
         self._motion_recovery_pending = False
         self._motion_rejected_position = None
+        self._motion_enu_origin = None
         self._motion_evidence = {
             "decision": "rejected",
             "allow_cooperation": False,
@@ -357,17 +363,52 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         if self._motion_estimator is not None:
             self._motion_estimator.reset()
         self._motion_snapshot = None
+        self._motion_enu_origin = None
         self._motion_cooperation_allowed = False
         if not keep_rejected_position:
             self._motion_rejected_position = None
 
+    def _camera_pose_from_source_pose(self, snapshot):
+        """由公开的 heading、pan、tilt 生成无滚转相机的完整 ENU 姿态。"""
+        source_pose = _field(snapshot, "source_pose", {})
+        if not isinstance(source_pose, dict):
+            return None
+        values = {}
+        try:
+            for name in ("lat", "lon", "alt", "heading_deg", "gimbal_pan", "gimbal_tilt"):
+                values[name] = float(source_pose[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not all(math.isfinite(value) for value in values.values()):
+            return None
+        if self._motion_enu_origin is None:
+            self._motion_enu_origin = (values["lat"], values["lon"], values["alt"])
+        origin_lat, origin_lon, origin_alt = self._motion_enu_origin
+        east = math.radians(values["lon"] - origin_lon) * EARTH_RADIUS_M * math.cos(
+            math.radians((values["lat"] + origin_lat) * 0.5))
+        north = math.radians(values["lat"] - origin_lat) * EARTH_RADIUS_M
+        yaw = math.radians(values["heading_deg"] + values["gimbal_pan"])
+        pitch = math.radians(values["gimbal_tilt"])
+        forward = (math.cos(pitch) * math.sin(yaw), math.cos(pitch) * math.cos(yaw), math.sin(pitch))
+        right = (math.cos(yaw), -math.sin(yaw), 0.0)
+        down = (math.sin(pitch) * math.sin(yaw), math.sin(pitch) * math.cos(yaw), -math.cos(pitch))
+        # 列向量为相机 right/down/forward；估计器按行矩阵乘相机射线，故在此转置。
+        return {
+            "center_world_m": (east, north, values["alt"] - origin_alt),
+            "camera_to_world": (
+                (right[0], down[0], forward[0]),
+                (right[1], down[1], forward[1]),
+                (right[2], down[2], forward[2]),
+            ),
+            "source": "public_heading_pan_tilt_no_roll",
+        }
+
     def _observe_static_motion(self, now, frame):
-        """只把完整相机位姿交给估计器，缺失时明确保守拒绝。"""
+        """只把本机公开姿态构造的完整相机位姿交给估计器。"""
         snapshot = self._motion_snapshot
         if self._motion_estimator is None:
             return dict(self._motion_evidence)
-        source_pose = _field(snapshot, "source_pose", {})
-        camera_pose = _field(source_pose, "camera_pose", None)
+        camera_pose = self._camera_pose_from_source_pose(snapshot)
         source_time = frame.source_sim_time
         evidence = self._motion_estimator.observe(
             snapshot,
