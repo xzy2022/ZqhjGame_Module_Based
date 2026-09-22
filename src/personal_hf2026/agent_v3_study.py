@@ -1,4 +1,7 @@
 # 修改时间：2026-09-22。
+# 修改目的：让六百秒 V3 运行默认保留完整协同轨迹。
+# 修改内容：将协同轨迹默认字节上限从十六 MiB 提高到四十八 MiB。
+# 修改时间：2026-09-22。
 # 修改目的：允许 V3 单次与批量运行将结果写入外置输出盘。
 # 修改内容：删除单次入口对 --output 必须位于默认输出根的限制。
 # 修改时间：2026-09-22。
@@ -67,7 +70,7 @@ DEFAULT_LAYOUT = SIM_ROOT / "competition/scenarios/coop_decoy/scenario.json"
 _FRAME_NUMBER = re.compile(r"frame:(\d+)$")
 _TRACE_SAMPLE_PERIOD_S = 0.5
 _TRACE_DEFAULT_MAX_RECORDS = 12_000
-_TRACE_DEFAULT_MAX_BYTES = 16 * 1024 * 1024
+_TRACE_DEFAULT_MAX_BYTES = 48 * 1024 * 1024
 _VISION_DIAGNOSTIC_MODE_RE = re.compile(r"[01]{3}")
 _UE_CLASS_TO_YOLO_CLASS = {
     "TargetVehicle": "real_vehicle",
