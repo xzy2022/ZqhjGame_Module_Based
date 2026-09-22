@@ -1,3 +1,6 @@
+# 修改时间：2026-09-22。
+# 修改目的：让 MASTER 的视差静止结论按任务语义取消会话而非宣称目标完成。
+# 修改内容：master_static 改发取消广播并令主从回到 SEARCH，不写完成位置或持久抑制记录。
 # 修改时间：2026-09-21（完成计数与目标位置记忆）。
 # 修改目的：只让静止确认增加完成数，并阻止三机对已识别目标重复发起协同搜索。
 # 修改内容：诱饵结束改为取消广播，静止完成记录窗口均值并以五十米水平门限广播去重。
@@ -398,11 +401,11 @@ class V3SimpleCoordinator(CoopCoordinator):
         position = position or self.follow_position
         if session is None or position is None:
             return False
-        if reason == self.FINISH_MASTER_DECOY_ONLY:
+        if reason in (self.FINISH_MASTER_DECOY_ONLY, self.FINISH_MASTER_STATIC):
             self.finish_reason = reason
             self.cancelled_sessions.add(session)
             payloads.append(self._session_payload("C"))
-            self._return_to_search(now, "coordination_ended", reason)
+            self._return_to_search(now, "session_cancelled", reason)
             self._last_stationary_evidence = stationary_evidence
             return True
         duplicate_static = (

@@ -1,3 +1,6 @@
+# 修改时间：2026-09-22。
+# 修改目的：把单机横移视差的动静结论接入 V3 发起门、协同取消和飞行控制。
+# 修改内容：仅 moving 放行协同，static/uncertain 局部恢复搜索，ACTIVE 双机改用反相轨道并停用竞争者规避。
 # 修改时间：2026-09-21（MASTER 等待阶段连续性）。
 # 修改目的：避免 MASTER 在等待从机确认时先按零点七五秒丢失并带着过期目标进入 ACTIVE。
 # 修改内容：V3 MASTER 的 HOLD 与 ACTIVE 统一使用五秒丢失门限，其余角色和 SEARCH 保持原门限。
@@ -45,8 +48,13 @@ from .competition_flight import CompetitionDirectionController
 from .coordination import CoopCoordinator
 from .gimbal_lock import GimbalLockConfig, GimbalLockController
 from .personal_v1 import PersonalV1Agent
-from .v3_simple_control import SimpleCoopControl
+from .v3_simple_control import SimpleCoopControl, ground_distance_m
 from .v3_simple_coordination import V3SimpleCoordinator
+
+try:
+    from .static_motion_parallax import StaticMotionParallaxEstimator
+except ImportError:  # 集成分支尚未合入估计器时保持保守拒绝，不能绕过动静门。
+    StaticMotionParallaxEstimator = None
 
 
 _MISSING = object()
@@ -215,6 +223,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     DECOY_ONLY_END_FRAMES = 5
     PERCEPTION_STALE_S = 1.0
     MASTER_ACTIVE_LOST_AFTER_S = 5.0
+    SEARCH_REJECT_CLEAR_M = 120.0
 
     def reset(self):
         super().reset()
@@ -233,7 +242,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._coordinator = V3SimpleCoordinator(
             self.my_uid, (self.A, self.B, self.C), self.COOP_DURATION_S,
             self.COOP_REACQUIRE_TIMEOUT_S,
-            proposal_gate=lambda: self._target_gate.ready,
+            proposal_gate=lambda: (
+                self._target_gate.ready and self._motion_cooperation_allowed),
             master_prediction=lambda now: self._track.predict_position(now),
         )
         self._competition_flight = _V3CompetitionDirectionController(
@@ -249,6 +259,19 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._active_competitor_position = None
         self._decoy_only_count = 0
         self._runtime_evidence = {}
+        self._motion_estimator = (
+            StaticMotionParallaxEstimator()
+            if StaticMotionParallaxEstimator is not None else None
+        )
+        self._motion_snapshot = None
+        self._motion_cooperation_allowed = False
+        self._motion_recovery_pending = False
+        self._motion_rejected_position = None
+        self._motion_evidence = {
+            "decision": "rejected",
+            "allow_cooperation": False,
+            "reason": "static_motion_estimator_unavailable",
+        }
 
     def submit_perception(self, snapshot=None, *, detection=None,
                           track_predict=None, closest_others=None, objects=None,
@@ -326,7 +349,52 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             return self._perception
         self._submission_serial = next_serial
         self._perception = frame
+        self._motion_snapshot = snapshot
         return frame
+
+    def _reset_static_motion(self, *, keep_rejected_position=False):
+        """结束局部候选后清空视差窗口，不把拒绝区域变成持久记忆。"""
+        if self._motion_estimator is not None:
+            self._motion_estimator.reset()
+        self._motion_snapshot = None
+        self._motion_cooperation_allowed = False
+        if not keep_rejected_position:
+            self._motion_rejected_position = None
+
+    def _observe_static_motion(self, now, frame):
+        """只把完整相机位姿交给估计器，缺失时明确保守拒绝。"""
+        snapshot = self._motion_snapshot
+        if self._motion_estimator is None:
+            return dict(self._motion_evidence)
+        source_pose = _field(snapshot, "source_pose", {})
+        camera_pose = _field(source_pose, "camera_pose", None)
+        source_time = frame.source_sim_time
+        evidence = self._motion_estimator.observe(
+            snapshot,
+            camera_pose,
+            frame_time_s=now if source_time is None else source_time,
+        )
+        return dict(evidence)
+
+    def _apply_motion_evidence(self, now, frame):
+        """把视差结论转换为协同门和局部搜索恢复，不解释或复制估计器算法。"""
+        evidence = self._observe_static_motion(now, frame)
+        self._motion_evidence = evidence
+        decision = evidence.get("decision")
+        self._motion_cooperation_allowed = bool(evidence.get("allow_cooperation"))
+        if decision != "rejected":
+            return
+        self._motion_cooperation_allowed = False
+        rejected_position = frame.stationary_position or frame.target_position
+        if rejected_position is not None:
+            self._motion_rejected_position = rejected_position
+        if self._coordinator.role == self._coordinator.MASTER and self._coordinator.phase == self._coordinator.ACTIVE:
+            self.signal_coordination_end(
+                self._coordinator.FINISH_MASTER_STATIC,
+                rejected_position,
+            )
+        elif self._coordinator.phase == self._coordinator.SEARCH:
+            self._motion_recovery_pending = True
 
     def _frame_is_fresh(self, frame, now):
         observed = frame.observed_sim_time
@@ -345,11 +413,21 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         )
 
     def _eligible_positions(self, detections, positions):
-        # 轨迹管理器只接收融合后的目标预测，不允许竞争对象串入主轨迹。
-        return ((self._active_target_position,)
-                if self._active_target_position is not None else ())
+        """只接收融合主目标，并短暂遮蔽已拒绝的局部区域。"""
+        target = self._active_target_position
+        blocked = self._motion_rejected_position
+        if target is None or (blocked is not None and ground_distance_m(
+                target, blocked) < self.SEARCH_REJECT_CLEAR_M):
+            return ()
+        return (target,)
 
     def _competition_positions(self, eligible_positions, all_positions):
+        if self._coordinator.phase in (
+                self._coordinator.HOLD, self._coordinator.INIT,
+                self._coordinator.ACTIVE):
+            # 协同时两机使用共同轨道，不再将最大竞争者转换成规避偏移。
+            return tuple(position for position in (self._active_target_position,)
+                         if position is not None)
         return tuple(position for position in (
             self._active_target_position, self._active_competitor_position)
             if position is not None)
@@ -388,6 +466,12 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     def decide(self, obs, dt):
         score = getattr(getattr(obs, "briefing", None), "score_view", None)
         now = float(score.sim_time) if score is not None else self._t + max(0.0, dt)
+        if (self._motion_rejected_position is not None
+                and ground_distance_m(
+                    (obs.self.lat, obs.self.lon), self._motion_rejected_position)
+                >= self.SEARCH_REJECT_CLEAR_M):
+            # 飞离局部区域后不再记住它，之后返回应重新采样而非永久屏蔽。
+            self._reset_static_motion()
         master_tracking = (
             self._coordinator.role == self._coordinator.MASTER
             and self._coordinator.phase in (
@@ -429,8 +513,15 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._active_competitor_position = None
             if self._coordinator.phase == CoopCoordinator.SEARCH:
                 self._target_gate.reset()
+        if is_new and fresh and frame.is_target:
+            self._apply_motion_evidence(now, frame)
         self._competition_flight.set_perception(
-            self._active_target_position, self._active_competitor_position)
+            self._active_target_position,
+            (None if self._coordinator.phase in (
+                self._coordinator.HOLD, self._coordinator.INIT,
+                self._coordinator.ACTIVE)
+             else self._active_competitor_position),
+        )
 
         if is_new and fresh:
             # 单数 detection 表示本机预测的原生最近对象，而非意图真目标。
@@ -450,21 +541,6 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         if is_new:
             self._consumed_serial = self._submission_serial
 
-        self._coordinator.submit_stationary_observation()
-        if is_new and fresh:
-            source_time = (frame.source_sim_time if frame.source_sim_time is not None
-                           else frame.observed_sim_time)
-            source_time = now if source_time is None else source_time
-            frame_key = (frame.new_frame_key if frame.new_frame_key is not None
-                         else ("submission", self._submission_serial))
-            self._coordinator.submit_stationary_observation(
-                frame_key=frame_key,
-                frame_id=frame.frame_id,
-                source_sim_time=source_time,
-                track_id=frame.primary_key if frame.is_target else None,
-                position_h0=(frame.stationary_position if frame.is_target else None),
-            )
-
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
         if ((phase_before == CoopCoordinator.SEARCH)
@@ -472,6 +548,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             # 发起时消费资格，结束回到 SEARCH 时也清掉协同期间积累的旧帧。
             self._target_gate.reset()
             self._decoy_only_count = 0
+            self._reset_static_motion(
+                keep_rejected_position=self._motion_rejected_position is not None)
         coordinator = self._coordinator
         role = coordinator.role
         phase = coordinator.phase
@@ -483,8 +561,49 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "target_gate_m": self._simple_control.config.target_gate_m,
             "rendezvous_ready": False,
         }
-        if (role == coordinator.FOLLOWER
-                and phase in (coordinator.INIT, coordinator.ACTIVE)):
+        if (role in (coordinator.MASTER, coordinator.FOLLOWER)
+                and phase == coordinator.ACTIVE):
+            orbit = self._simple_control.dual_orbit(
+                target_position=coordinator.follow_position,
+                now_s=now,
+                role=role,
+            )
+            aim = self._simple_control.master_aim(
+                self_position=(obs.self.lat, obs.self.lon),
+                self_alt_m=obs.self.alt,
+                self_heading_deg=obs.self.heading_deg,
+                target_position=coordinator.follow_position,
+            )
+            if orbit is not None:
+                commands = [command for command in commands
+                            if command.verb != "set_destination"]
+                commands.append(fly_to(
+                    *orbit.fly_to_position,
+                    alt=self.FLIGHT_ALT_M,
+                    speed=self._simple_control.config.follower_speed_mps,
+                    loiter_radius=0.0,
+                ))
+                control_evidence.update({
+                    "guidance_enabled": True,
+                    "dual_orbit_enabled": True,
+                    "dual_orbit_radius_m": orbit.radius_m,
+                    "dual_orbit_phase_deg": orbit.phase_deg,
+                    "dual_orbit_planned_separation_m": orbit.planned_separation_m,
+                })
+            if aim is not None:
+                commands = [command for command in commands if command.verb
+                            != "component.gimbal_tracking.set_orientation"]
+                commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
+                control_evidence.update({
+                    "aiming_enabled": True,
+                    "aim_target_lat": aim.target_position[0],
+                    "aim_target_lon": aim.target_position[1],
+                    "target_distance_m": aim.ground_distance_m,
+                    "gimbal_pan_cmd_deg": aim.pan_deg,
+                    "gimbal_tilt_cmd_deg": aim.tilt_deg,
+                })
+        elif (role == coordinator.FOLLOWER
+                and phase == coordinator.INIT):
             guidance = self._simple_control.follower(
                 self_position=(obs.self.lat, obs.self.lon),
                 self_alt_m=obs.self.alt,
@@ -537,6 +656,63 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                         "gimbal_pan_cmd_deg": aim.pan_deg,
                         "gimbal_tilt_cmd_deg": aim.tilt_deg,
                     })
+        if (phase == coordinator.SEARCH
+                and self._motion_evidence.get("decision") == "collecting"
+                and self._active_target_position is not None):
+            sample_waypoint = self._simple_control.parallax_sample(
+                self_position=(obs.self.lat, obs.self.lon),
+                target_position=self._active_target_position,
+            )
+            aim = self._simple_control.master_aim(
+                self_position=(obs.self.lat, obs.self.lon),
+                self_alt_m=obs.self.alt,
+                self_heading_deg=obs.self.heading_deg,
+                target_position=self._active_target_position,
+            )
+            if sample_waypoint is not None:
+                commands = [command for command in commands
+                            if command.verb != "set_destination"]
+                commands.append(fly_to(
+                    *sample_waypoint,
+                    alt=self.FLIGHT_ALT_M,
+                    speed=self._simple_control.config.parallax_sample_speed_mps,
+                    loiter_radius=0.0,
+                ))
+                control_evidence.update({
+                    "parallax_sampling_enabled": True,
+                    "parallax_sample_lat": sample_waypoint[0],
+                    "parallax_sample_lon": sample_waypoint[1],
+                })
+            if aim is not None:
+                commands = [command for command in commands if command.verb
+                            != "component.gimbal_tracking.set_orientation"]
+                commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
+        if self._motion_recovery_pending and phase == coordinator.SEARCH:
+            self._motion_recovery_pending = False
+            self._track.reset_for_acquisition()
+            self._gimbal_lock.reset()
+            self._search_filter.reset_current()
+            self._target_gate.reset()
+            self._perception = None
+            self._reset_static_motion(keep_rejected_position=True)
+            search_lat, search_lon = self._search_route.target(
+                (obs.self.lat, obs.self.lon), obs.self.heading_deg)
+            scan_pan, scan_tilt = self._search_gimbal.scan(
+                now, obs.self.heading_deg, obs.self.heading_deg,
+                obs.self.gimbal_pan, obs.self.gimbal_tilt)
+            commands = [command for command in commands if command.verb not in (
+                "set_destination", "component.gimbal_tracking.set_orientation")]
+            commands.extend([
+                fly_to(search_lat, search_lon, alt=self.FLIGHT_ALT_M,
+                       speed=self._simple_control.config.parallax_sample_speed_mps,
+                       loiter_radius=0.0),
+                point_gimbal(scan_pan, scan_tilt),
+            ])
+            control_evidence.update({
+                "parallax_search_recovered": True,
+                "guidance_enabled": False,
+                "aiming_enabled": False,
+            })
         fixed = []
         for command in commands:
             if command.verb == "set_destination":
@@ -575,5 +751,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 else finished_decoy_only_count
             ),
             "decoy_only_required": self.DECOY_ONLY_END_FRAMES,
+            "static_motion": dict(self._motion_evidence),
+            "static_motion_cooperation_allowed": self._motion_cooperation_allowed,
+            "static_motion_rejected_position": self._motion_rejected_position,
         }
         return fixed
