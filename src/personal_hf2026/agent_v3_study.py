@@ -1,3 +1,6 @@
+# 修改时间：2026-09-22。
+# 修改目的：为 V3 开发诊断提供可组合的同帧 UE 投影框识别结果矫正开关。
+# 修改内容：新增 --vision-diagnostic 三位模式，只在 Runner 的开发诊断 provider 返回已完成 YOLO 快照前矫正类别、误检或漏检。
 # 修改时间：2026-09-21。
 # 修改目的：为 V3 单局运行增加可选的 YOLO 完成帧图像与离线可视化审计日志。
 # 修改内容：新增 --save-images 和 --detailed-log，只保存已完成 YOLO 推理的原图并隔离裁判真值。
@@ -26,6 +29,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from contextlib import nullcontext
 import hashlib
 import json
@@ -61,6 +65,11 @@ _FRAME_NUMBER = re.compile(r"frame:(\d+)$")
 _TRACE_SAMPLE_PERIOD_S = 0.5
 _TRACE_DEFAULT_MAX_RECORDS = 12_000
 _TRACE_DEFAULT_MAX_BYTES = 16 * 1024 * 1024
+_VISION_DIAGNOSTIC_MODE_RE = re.compile(r"[01]{3}")
+_UE_CLASS_TO_YOLO_CLASS = {
+    "TargetVehicle": "real_vehicle",
+    "DecoyVehicle": "model_prop",
+}
 
 
 def _field(value, name, default=None):
@@ -603,6 +612,235 @@ class FreshPhotoCache(PhotoCache):
         return photo, dict(metadata)
 
 
+def _vision_diagnostic_mode(value: str) -> str:
+    """校验从左到右对应标签、误检删除、漏检补全的三位开关。"""
+    value = str(value)
+    if _VISION_DIAGNOSTIC_MODE_RE.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("--vision-diagnostic 必须是 000 到 111 的三位二进制串")
+    return value
+
+
+class VisionDiagnosticCorrection:
+    """只供 V3 Runner 开发诊断路径使用的同帧 UE 投影框检测列表矫正器。"""
+
+    _COUNT_KEYS = (
+        "completed_frames_seen",
+        "frames_inference_error",
+        "frames_truth_unavailable",
+        "frames_truth_available",
+        "ue_entries_seen",
+        "ue_entries_invalid",
+        "ue_entries_unknown_class",
+        "yolo_objects_seen",
+        "overlap_pairs",
+        "ambiguous_prediction_matches",
+        "labels_replaced",
+        "unmatched_predictions_removed",
+        "unmatched_truth_added",
+        "frames_changed",
+    )
+
+    def __init__(self, mode: str) -> None:
+        self.mode = _vision_diagnostic_mode(mode)
+        self._counts = Counter()
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "000"
+
+    @property
+    def summary(self) -> dict:
+        """返回足以复核诊断 oracle 影响范围的有界计数。"""
+        return {
+            "enabled": self.enabled,
+            "mode": self.mode,
+            "bits_left_to_right": {
+                "replace_overlapping_prediction_label": self.mode[0] == "1",
+                "remove_prediction_without_any_ue_overlap": self.mode[1] == "1",
+                "add_ue_without_any_prediction_overlap": self.mode[2] == "1",
+            },
+            "truth_source": "redis_sync_camera_same_frame_ue_projected_boxes",
+            "truth_boundary": "development_diagnostic_runner_only_not_default_or_formal_path",
+            "overlap_rule": "strict_positive_intersection_area_no_iou_threshold",
+            "ambiguous_label_rule": "largest_intersection_area_then_ue_entry_order",
+            "counts": {key: int(self._counts[key]) for key in self._COUNT_KEYS},
+        }
+
+    @staticmethod
+    def _intersection_area(left, right) -> float:
+        width = min(float(left[2]), float(right[2])) - max(float(left[0]), float(right[0]))
+        height = min(float(left[3]), float(right[3])) - max(float(left[1]), float(right[1]))
+        return width * height if width > 0.0 and height > 0.0 else 0.0
+
+    def _truth_objects(self, metadata, image_size):
+        width, height = image_size
+        truths = []
+        raw_truths = metadata.get("ue_projected_objects", ())
+        if not isinstance(raw_truths, (list, tuple)):
+            raw_truths = ()
+        for entry_index, raw in enumerate(raw_truths):
+            self._counts["ue_entries_seen"] += 1
+            if not isinstance(raw, dict):
+                self._counts["ue_entries_invalid"] += 1
+                continue
+            class_name = _UE_CLASS_TO_YOLO_CLASS.get(str(raw.get("class", "")))
+            if class_name is None:
+                self._counts["ue_entries_unknown_class"] += 1
+                continue
+            raw_box = raw.get("bbox")
+            if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+                self._counts["ue_entries_invalid"] += 1
+                continue
+            try:
+                box = tuple(float(value) for value in raw_box)
+            except (TypeError, ValueError):
+                self._counts["ue_entries_invalid"] += 1
+                continue
+            if (
+                not all(math.isfinite(value) for value in box)
+                or not 0.0 <= box[0] < box[2] <= width
+                or not 0.0 <= box[1] < box[3] <= height
+            ):
+                self._counts["ue_entries_invalid"] += 1
+                continue
+            truths.append({
+                "entry_index": entry_index,
+                "target_id": str(raw.get("target_id", "")),
+                "class_name": class_name,
+                "bbox_xyxy": box,
+            })
+        return truths
+
+    @staticmethod
+    def _prediction_box(record, image_size):
+        raw_box = record.get("bbox_xyxy", record.get("xyxy"))
+        if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+            return None
+        try:
+            box = tuple(float(value) for value in raw_box)
+        except (TypeError, ValueError):
+            return None
+        width, height = image_size
+        if (
+            not all(math.isfinite(value) for value in box)
+            or not 0.0 <= box[0] < box[2] <= width
+            or not 0.0 <= box[1] < box[3] <= height
+        ):
+            return None
+        return box
+
+    @staticmethod
+    def _set_class(record: dict, class_name: str) -> None:
+        record["class_name"] = class_name
+        record["class_id"] = 0 if class_name == "real_vehicle" else 1
+        record["score"] = 1.0
+        record["class_confidence"] = 1.0
+        record["class_probabilities"] = (
+            [1.0, 0.0] if class_name == "real_vehicle" else [0.0, 1.0]
+        )
+
+    @staticmethod
+    def _temporary_track_id(truth) -> int:
+        target_id = truth["target_id"]
+        if target_id.isdecimal():
+            return -1_000_000 - int(target_id)
+        if not target_id:
+            return -1_000_000 - int(truth["entry_index"])
+        digest = hashlib.sha256(target_id.encode("utf-8")).hexdigest()
+        return -1_000_000 - int(digest[:12], 16)
+
+    def correct_detections(self, uid, frame_id, detections, image_size, metadata):
+        """在 worker 内 detector.predict 后、观测选择前按同帧 UE 条目矫正。"""
+        if not self.enabled:
+            return detections
+        self._counts["completed_frames_seen"] += 1
+        if (
+            not isinstance(metadata, dict)
+            or str(metadata.get("frame_id", "")) != str(frame_id)
+        ):
+            self._counts["frames_truth_unavailable"] += 1
+            return detections
+        self._counts["frames_truth_available"] += 1
+        predictions = []
+        passthrough = []
+        for raw in detections:
+            if not isinstance(raw, dict):
+                passthrough.append(raw)
+                continue
+            box = self._prediction_box(raw, image_size)
+            if box is None:
+                passthrough.append(dict(raw))
+                continue
+            record = dict(raw)
+            record["bbox_xyxy"] = box
+            predictions.append(record)
+        truths = self._truth_objects(metadata, image_size)
+        self._counts["yolo_objects_seen"] += len(predictions)
+        overlaps_by_prediction = [[] for _ in predictions]
+        overlaps_by_truth = [[] for _ in truths]
+        for prediction_index, prediction in enumerate(predictions):
+            for truth_index, truth in enumerate(truths):
+                area = self._intersection_area(
+                    prediction["bbox_xyxy"], truth["bbox_xyxy"]
+                )
+                if area <= 0.0:
+                    continue
+                self._counts["overlap_pairs"] += 1
+                overlaps_by_prediction[prediction_index].append((area, truth_index))
+                overlaps_by_truth[truth_index].append(prediction_index)
+
+        records = list(passthrough)
+        labels_replaced = 0
+        predictions_removed = 0
+        for prediction_index, prediction in enumerate(predictions):
+            matches = overlaps_by_prediction[prediction_index]
+            if self.mode[1] == "1" and not matches:
+                predictions_removed += 1
+                continue
+            record = dict(prediction)
+            if self.mode[0] == "1" and matches:
+                if len(matches) > 1:
+                    self._counts["ambiguous_prediction_matches"] += 1
+                _, truth_index = min(matches, key=lambda item: (-item[0], item[1]))
+                self._set_class(record, truths[truth_index]["class_name"])
+                labels_replaced += 1
+            records.append(record)
+
+        truths_added = 0
+        if self.mode[2] == "1":
+            for truth_index, truth in enumerate(truths):
+                if overlaps_by_truth[truth_index]:
+                    continue
+                class_name = truth["class_name"]
+                records.append({
+                    "bbox_xyxy": truth["bbox_xyxy"],
+                    "class_name": class_name,
+                    "class_id": 0 if class_name == "real_vehicle" else 1,
+                    "score": 1.0,
+                    "class_confidence": 1.0,
+                    "class_probabilities": (
+                        [1.0, 0.0] if class_name == "real_vehicle" else [0.0, 1.0]
+                    ),
+                    "single_frame_probabilities": (
+                        [1.0, 0.0] if class_name == "real_vehicle" else [0.0, 1.0]
+                    ),
+                    "detector_confidence": 1.0,
+                    "track_id": self._temporary_track_id(truth),
+                    "track_hits": 1,
+                    "motion_velocity_px_per_s": (0.0, 0.0),
+                    "recovered_low_score": False,
+                    "diagnostic_source": "ue_projected_box",
+                })
+                truths_added += 1
+
+        self._counts["labels_replaced"] += labels_replaced
+        self._counts["unmatched_predictions_removed"] += predictions_removed
+        self._counts["unmatched_truth_added"] += truths_added
+        if labels_replaced or predictions_removed or truths_added:
+            self._counts["frames_changed"] += 1
+        return records
+
+
 class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
     """只向 Agent 注入公开观测与相机字节的真实像素 Runner。"""
 
@@ -610,7 +848,8 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                  detector_config=None, weights=None,
                  trace_max_records=_TRACE_DEFAULT_MAX_RECORDS,
                  trace_max_bytes=_TRACE_DEFAULT_MAX_BYTES,
-                 save_images=False, detailed_log=False, log=print):
+                 save_images=False, detailed_log=False,
+                 vision_diagnostic="000", log=print):
         super().__init__(cfg, PersonalV3Agent, log=log)
         self.output = Path(output)
         self.runtime_root = Path(runtime_root).resolve()
@@ -636,6 +875,7 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             V3VisualLog(self.output, save_images=save_images, detailed_log=detailed_log)
             if save_images or detailed_log else None
         )
+        self.vision_diagnostic = VisionDiagnosticCorrection(vision_diagnostic)
         self.perception_worker = None
         if not self.cfg.dry_run:
             detector_kwargs = {"device": self.device}
@@ -644,7 +884,11 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             if self.weights is not None:
                 detector_kwargs["weights"] = self.weights
             self.perception_worker = V3PerceptionWorker(
-                detector_kwargs=detector_kwargs
+                detector_kwargs=detector_kwargs,
+                diagnostic_transform=(
+                    self.vision_diagnostic.correct_detections
+                    if self.vision_diagnostic.enabled else None
+                ),
             )
             self.perception_worker.wait_until_ready()
 
@@ -679,11 +923,11 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
         if not self.cfg.dry_run:
             import redis
 
-            for agent in self.agents.values():
+            for uid, agent in self.agents.items():
                 agent.set_perception_provider(
-                    lambda obs, dt, worker=self.perception_worker,
-                    sequence_id=self.sequence_id: submit_observation(
-                        worker, obs, sequence_id=sequence_id
+                    lambda obs, dt, uid=uid, worker=self.perception_worker,
+                    sequence_id=self.sequence_id: self._submit_diagnostic_observation(
+                        uid, worker, obs, dt, sequence_id
                     )
                 )
             client = redis.Redis(
@@ -693,7 +937,9 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             )
             self.photo_cache = FreshPhotoCache(
                 redis_client=client, uids=uids,
-                capture_metadata=bool(self.visual_log),
+                capture_metadata=(
+                    bool(self.visual_log) or self.vision_diagnostic.enabled
+                ),
             )
             self.photo_cache.start()
             self.renderer = StudyRenderer(
@@ -705,6 +951,16 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
             )
             self.renderer.start(self._scenario_cfg, uids)
         return self.photo_cache, DetectionResolver(default_detector=None)
+
+    def _submit_diagnostic_observation(self, uid, worker, obs, dt, sequence_id):
+        """默认只提交像素；显式诊断才以提交图片哈希绑定 Runner 侧 UE 元数据。"""
+        metadata = None
+        if self.vision_diagnostic.enabled and self.photo_cache is not None:
+            photo = getattr(getattr(obs, "self", None), "photo", None)
+            metadata = self.photo_cache.metadata_for(uid, photo)
+        return submit_observation(
+            worker, obs, sequence_id=sequence_id, diagnostic_metadata=metadata
+        )
 
     def make_agent_for(self, entity_type, entity_uid, world_state):
         agent = super().make_agent_for(entity_type, entity_uid, world_state)
@@ -918,6 +1174,7 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                 "coordination_evidence": self.coordination_trace.summary,
                 "visual_logging": (self.visual_log.summary if self.visual_log is not None
                                    else {"schema_version": 1, "enabled": False}),
+                "vision_diagnostic": self.vision_diagnostic.summary,
                 "formal_inputs": [
                     "obs.self.photo",
                     "obs.self_pose_and_gimbal",
@@ -925,10 +1182,13 @@ class AgentV3Runner(IdleCompatibleCoopDecoyRunner):
                     "obs.briefing.score_view.sim_time",
                 ],
                 "excluded_inputs": [
-                    "ue_projected_bbox",
                     "world_target_truth",
                     "central_cross_uav_redis_bridge",
-                ],
+                ] + ([] if self.vision_diagnostic.enabled else ["ue_projected_bbox"]),
+                "diagnostic_oracle_inputs": (
+                    ["redis_sync_camera_same_frame_ue_projected_boxes"]
+                    if self.vision_diagnostic.enabled else []
+                ),
             }
             try:
                 (self.output / "run.json").write_text(
@@ -978,6 +1238,13 @@ def _parser():
     parser.add_argument(
         "--detailed-log", action="store_true",
         help="记录可视化所需的帧、YOLO 快照和裁判侧真值 JSONL（不暴露给 Agent）",
+    )
+    parser.add_argument(
+        "--vision-diagnostic", type=_vision_diagnostic_mode, default="000",
+        help=(
+            "开发诊断三位开关：从左到右为相交预测改 UE 标签、"
+            "无 UE 相交预测删除、无预测相交 UE 补框；默认 000"
+        ),
     )
     parser.add_argument("--visualize", action="store_true")
     parser.add_argument("--visualization-port", type=int, default=0)
@@ -1060,6 +1327,9 @@ def main(argv=None):
                 "detailed_log": args.detailed_log,
                 "starts_simulation": False,
             },
+            "vision_diagnostic": VisionDiagnosticCorrection(
+                args.vision_diagnostic
+            ).summary,
             "source_scenario": source_profile,
         }
         (args.output / "run.json").write_text(
@@ -1123,6 +1393,7 @@ def main(argv=None):
             trace_max_bytes=args.trace_max_bytes,
             save_images=args.save_images,
             detailed_log=args.detailed_log,
+            vision_diagnostic=args.vision_diagnostic,
             log=log,
         )
         if args.visualize and not args.dry_run:
