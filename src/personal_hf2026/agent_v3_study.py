@@ -1,4 +1,7 @@
 # 修改时间：2026-09-22。
+# 修改目的：将单机横移视差的 Agent 侧判定证据写入有界协同轨迹以支持真实运行复核。
+# 修改内容：记录动静决策、放行标记和局部遮蔽位置，并将其加入传感状态变化指纹。
+# 修改时间：2026-09-22。
 # 修改目的：让六百秒 V3 运行默认保留完整协同轨迹。
 # 修改内容：将协同轨迹默认字节上限从十六 MiB 提高到四十八 MiB。
 # 修改时间：2026-09-22。
@@ -269,7 +272,8 @@ def _agent_evidence(agent):
     }
     for key in (
         "track_state", "track_last_seen_age_s", "master_lost_timeout_s",
-        "track_predict_position", "stationary", "last_transition",
+        "track_predict_position", "stationary", "last_transition", "static_motion",
+        "static_motion_cooperation_allowed", "static_motion_rejected_position",
     ):
         found = _safe_json(value((key,)))
         if found is not None:
@@ -322,6 +326,9 @@ def _state_fingerprint(state):
         state.get("follower_accept_count"), state.get("finish_reason"),
         state.get("decoy_only_count"), state.get("decoy_only_required"),
         (state.get("perception") or {}).get("only_decoys"),
+        (state.get("static_motion") or {}).get("decision"),
+        (state.get("static_motion") or {}).get("reason"),
+        state.get("static_motion_cooperation_allowed"),
         state.get("completed_count"), state.get("rendezvous_ready"),
         state.get("within_master_gate"), state.get("within_target_gate"),
         state.get("guidance_enabled"), state.get("aiming_enabled"),
@@ -382,6 +389,9 @@ class CoordinationEvidenceRecorder:
             perception.get("class_name"), perception.get("track_id"),
             state.get("decoy_only_count"), state.get("decoy_only_required"),
             perception.get("only_decoys"),
+            (state.get("static_motion") or {}).get("decision"),
+            (state.get("static_motion") or {}).get("reason"),
+            state.get("static_motion_cooperation_allowed"),
         )
         if fingerprint == self._last_sensor.get(str(uid)):
             return

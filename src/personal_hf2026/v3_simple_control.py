@@ -1,3 +1,6 @@
+# 修改时间：2026-09-22。
+# 修改目的：为动静视差采样和协同双螺旋提供最小的本机飞行几何。
+# 修改内容：新增横移采样航点和以目标为圆心的双机反相轨道航点，不参与动静算法判定。
 # 修改时间：2026-09-21。
 # 修改目的：为 V3 简化协同提供不依赖双机轨迹匹配的从机接近和定点瞄准几何。
 # 修改内容：新增 H=0 目标的实时云台反解、220/200 米双门槛及可直接转成 fly_to/point_gimbal 的导引结果。
@@ -41,6 +44,18 @@ def bearing_deg(first_position, second_position):
     north = (math.cos(phi1) * math.sin(phi2)
              - math.sin(phi1) * math.cos(phi2) * math.cos(delta_lon))
     return (math.degrees(math.atan2(east, north)) + 360.0) % 360.0
+
+
+def offset_position(origin, east_m, north_m):
+    """把局部东、北米偏移换成附近的经纬度航点。"""
+    lat, lon = map(float, origin)
+    cos_lat = math.cos(math.radians(lat))
+    if abs(cos_lat) <= 1e-6:
+        return lat, lon
+    return (
+        lat + float(north_m) / 111_320.0,
+        lon + float(east_m) / (111_320.0 * cos_lat),
+    )
 
 
 @dataclass(frozen=True)
@@ -94,6 +109,10 @@ class SimpleCoopControlConfig:
     target_alt_m: float = 0.0
     follower_speed_mps: float = 22.0
     follower_loiter_radius_m: float = 100.0
+    parallax_sample_baseline_m: float = 45.0
+    parallax_sample_speed_mps: float = 22.0
+    coop_orbit_radius_m: float = 130.0
+    coop_orbit_period_s: float = 48.0
 
 
 @dataclass(frozen=True)
@@ -127,6 +146,16 @@ class FollowerGuidance:
         return self.rendezvous_ready
 
 
+@dataclass(frozen=True)
+class OrbitGuidance:
+    """围绕共享目标的受控双螺旋航点。"""
+
+    fly_to_position: tuple[float, float]
+    planned_separation_m: float
+    radius_m: float
+    phase_deg: float
+
+
 class SimpleCoopControl:
     """FOLLOWER 赶赴 MASTER 目标坐标、到位后直指 H=0 坐标。"""
 
@@ -150,6 +179,39 @@ class SimpleCoopControl:
             self_heading_deg,
             target_position,
             target_alt_m=self.config.target_alt_m,
+        )
+
+    def parallax_sample(self, *, self_position, target_position):
+        """生成垂直当前视线的约四十五米采样航点。"""
+        if target_position is None:
+            return None
+        bearing = bearing_deg(self_position, target_position)
+        lateral = math.radians(bearing + 90.0)
+        distance = self.config.parallax_sample_baseline_m
+        return offset_position(
+            self_position,
+            distance * math.sin(lateral),
+            distance * math.cos(lateral),
+        )
+
+    def dual_orbit(self, *, target_position, now_s, role):
+        """返回 MASTER/FOLLOWER 反相的目标周围航点。
+
+        半径一百三十米时理想相对间距为二百六十米，高于二百二十米约束；
+        执行器仍须从当前实际位置追赶该航点，因此证据中同时保留计划间距。
+        """
+        if target_position is None:
+            return None
+        phase = math.tau * (float(now_s) / self.config.coop_orbit_period_s)
+        if str(role) == "FOLLOWER":
+            phase += math.pi
+        radius = self.config.coop_orbit_radius_m
+        return OrbitGuidance(
+            fly_to_position=offset_position(
+                target_position, radius * math.sin(phase), radius * math.cos(phase)),
+            planned_separation_m=2.0 * radius,
+            radius_m=radius,
+            phase_deg=math.degrees(phase) % 360.0,
         )
 
     def follower(self, *, self_position, self_alt_m, self_heading_deg,
@@ -228,9 +290,11 @@ class SimpleCoopControl:
 __all__ = [
     "FollowerGuidance",
     "GroundAim",
+    "OrbitGuidance",
     "SimpleCoopControl",
     "SimpleCoopControlConfig",
     "bearing_deg",
     "ground_distance_m",
+    "offset_position",
     "solve_ground_aim",
 ]

@@ -1,4 +1,7 @@
 # 修改时间：2026-09-22。
+# 修改目的：将 SDK 若公开的完整相机世界位姿原样绑定到同一像素快照，供横移视差估计使用。
+# 修改内容：仅透传 camera_pose 或 center_world_m/camera_to_world，不由 heading 或云台角近似构造姿态。
+# 修改时间：2026-09-22。
 # 修改目的：使 V3 开发诊断能在 YOLO 输出转成观测前按同帧 Runner 元数据矫正检测列表。
 # 修改内容：FrameJob 可携带仅显式注入的诊断元数据和变换器，并在 detector.predict 后、select_observations 前调用。
 # 修改时间：2026-09-20（异步姿态绑定与初始化门控）。
@@ -225,6 +228,21 @@ def submit_observation(
     now = float(score_view.sim_time)
     photo = own.photo
     if photo:
+        source_pose = {key: getattr(own, key) for key in (
+            "lat", "lon", "alt", "heading_deg", "gimbal_pan",
+            "gimbal_tilt", "gimbal_fov_deg",
+        )}
+        complete_pose = getattr(own, "camera_pose", None)
+        if isinstance(complete_pose, Mapping):
+            source_pose["camera_pose"] = dict(complete_pose)
+        else:
+            center = getattr(own, "center_world_m", None)
+            rotation = getattr(own, "camera_to_world", None)
+            if center is not None and rotation is not None:
+                source_pose["camera_pose"] = {
+                    "center_world_m": center,
+                    "camera_to_world": rotation,
+                }
         worker.submit(
             own.uid,
             photo,
@@ -234,10 +252,7 @@ def submit_observation(
             source_time_basis="observation_sim_time_not_verified_exposure",
             fov_deg=float(own.gimbal_fov_deg),
             sequence_id=sequence_id,
-            own_pose={key: getattr(own, key) for key in (
-                "lat", "lon", "alt", "heading_deg", "gimbal_pan",
-                "gimbal_tilt", "gimbal_fov_deg",
-            )},
+            own_pose=source_pose,
             diagnostic_metadata=diagnostic_metadata,
         )
     return worker.latest(own.uid, now_sim_time=now, max_age_s=1.5)
