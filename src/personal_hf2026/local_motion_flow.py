@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：让有限角点集中覆盖小目标周围，并防止无效轨迹编号的检测框污染背景光流。
+# 修改内容：局部道路 ROI 限定全图单次提点区域，同时在前后帧遮蔽所有合法车辆框。
+# 修改时间：2026-09-23。
 # 修改目的：只凭本机连续图像和同帧 YOLO 轨迹保守区分地面车辆的动静状态。
 # 修改内容：新增局部背景 KLT、前后向校验、仿射 RANSAC 和八次有效转换的双窗口确认。
 """单机局部背景光流动静判定，不读取位姿、地理投影或 Runner 真值。"""
@@ -67,6 +70,7 @@ class LocalMotionDetector:
     def reset(self) -> None:
         self._prev_gray: np.ndarray | None = None
         self._prev_boxes: dict[int, tuple[float, float, float, float]] = {}
+        self._prev_all_boxes: tuple[tuple[float, float, float, float], ...] = ()
         self._prev_frame_id: str | None = None
         self._prev_time: float | None = None
         self._tracks: dict[int, _TrackWindow] = {}
@@ -98,9 +102,21 @@ class LocalMotionDetector:
         return boxes
 
     @staticmethod
-    def _background_mask(shape: tuple[int, int], boxes: Sequence[tuple[float, float, float, float]]) -> np.ndarray:
+    def _background_mask(
+        shape: tuple[int, int],
+        boxes: Sequence[tuple[float, float, float, float]],
+        focus_boxes: Sequence[tuple[float, float, float, float]] = (),
+    ) -> np.ndarray:
         height, width = shape
-        mask = np.full((height, width), 255, dtype=np.uint8)
+        mask = np.zeros((height, width), dtype=np.uint8) if focus_boxes else np.full(
+            (height, width), 255, dtype=np.uint8)
+        # 有候选目标时把角点预算集中到其脚下及两侧。
+        for x1, y1, x2, y2 in focus_boxes:
+            bw, bh = x2 - x1, y2 - y1
+            cx = (x1 + x2) * 0.5
+            xa, ya = max(0, int(math.floor(cx - 2 * bw))), max(0, int(math.floor(y1 + 0.4 * bh)))
+            xb, yb = min(width, int(math.ceil(cx + 2 * bw))), min(height, int(math.ceil(y2 + 1.2 * bh)))
+            mask[ya:yb, xa:xb] = 255
         for x1, y1, x2, y2 in boxes:
             dx, dy = 0.2 * (x2 - x1), 0.2 * (y2 - y1)
             xa, ya = max(0, int(math.floor(x1 - dx))), max(0, int(math.floor(y1 - dy)))
@@ -111,10 +127,11 @@ class LocalMotionDetector:
     def _background_flow(
         self,
         gray: np.ndarray,
-        boxes: dict[int, tuple[float, float, float, float]],
+        all_boxes: tuple[tuple[float, float, float, float], ...],
     ) -> tuple[np.ndarray, np.ndarray]:
         assert self._prev_gray is not None
-        previous_mask = self._background_mask(gray.shape, tuple(self._prev_boxes.values()))
+        previous_mask = self._background_mask(
+            gray.shape, self._prev_all_boxes, tuple(self._prev_boxes.values()))
         corners = cv2.goodFeaturesToTrack(
             self._prev_gray, maxCorners=self.parameters.max_corners,
             qualityLevel=0.01, minDistance=7, blockSize=7, mask=previous_mask,
@@ -141,7 +158,7 @@ class LocalMotionDetector:
                 & np.isfinite(back).all(axis=1)
                 & (np.linalg.norm(old - back, axis=1) < self.parameters.fb_error_px))
         # 当前帧的目标框也要排除，防止背景点落入移动车辆或遮挡处。
-        current_mask = self._background_mask(gray.shape, tuple(boxes.values()))
+        current_mask = self._background_mask(gray.shape, all_boxes)
         x = np.clip(np.rint(new[:, 0]).astype(np.int32), 0, gray.shape[1] - 1)
         y = np.clip(np.rint(new[:, 1]).astype(np.int32), 0, gray.shape[0] - 1)
         good &= current_mask[y, x] != 0
@@ -243,6 +260,8 @@ class LocalMotionDetector:
         frame_id = frame_id or str(time_s)
         height, width = frame_bgr.shape[:2]
         boxes = self._detect_boxes(detections, width, height)
+        all_boxes = tuple(box for detection in detections
+                          if (box := _box(detection, width, height)) is not None)
         if frame_id == self._prev_frame_id:
             return {tid: {"track_id": tid, **self._unknown("duplicate_frame")}
                     for tid in boxes}
@@ -252,10 +271,11 @@ class LocalMotionDetector:
                 or time_s - self._prev_time > self.parameters.max_transition_gap_s):
             self.reset()
             self._prev_gray, self._prev_boxes = gray, boxes
+            self._prev_all_boxes = all_boxes
             self._prev_frame_id, self._prev_time = frame_id, time_s
             return {tid: {"track_id": tid, **self._unknown("first_or_discontinuous_frame")}
                     for tid in boxes}
-        old_points, new_points = self._background_flow(gray, boxes)
+        old_points, new_points = self._background_flow(gray, all_boxes)
         results = {}
         for tid, box in boxes.items():
             old_box = self._prev_boxes.get(tid)
@@ -269,6 +289,7 @@ class LocalMotionDetector:
             results[tid] = {"track_id": tid, **result}
         self._tracks = {tid: state for tid, state in self._tracks.items() if tid in boxes}
         self._prev_gray, self._prev_boxes = gray, boxes
+        self._prev_all_boxes = all_boxes
         self._prev_frame_id, self._prev_time = frame_id, time_s
         return results
 
