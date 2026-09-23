@@ -1,3 +1,9 @@
+# 修改时间：2026-09-23。
+# 修改目的：避免 ACTIVE 主机把另一辆静止车的光流结论误用于当前协同会话。
+# 修改内容：在发起会话时绑定确认运动的视觉轨迹，ACTIVE 只接受同一会话同一轨迹的静态证据。
+# 修改时间：2026-09-23。
+# 修改目的：让 V3 协同门和静态取消只由同帧局部光流证据驱动。
+# 修改内容：读取当前视觉轨迹的光流结论，移除旧射线视差与搜索横移接线，并保留现有协同飞行策略。
 # 修改时间：2026-09-22。
 # 修改目的：将公开的机体航向和云台全姿态转换为横移视差所需的完整世界相机位姿。
 # 修改内容：按水平飞行且相机无滚转的官方接口约定构造 ENU 中心和正交相机矩阵，不读取运行器真值。
@@ -55,14 +61,7 @@ from .personal_v1 import PersonalV1Agent
 from .v3_simple_control import SimpleCoopControl, ground_distance_m
 from .v3_simple_coordination import V3SimpleCoordinator
 
-try:
-    from .static_motion_parallax import StaticMotionParallaxEstimator
-except ImportError:  # 集成分支尚未合入估计器时保持保守拒绝，不能绕过动静门。
-    StaticMotionParallaxEstimator = None
-
-
 _MISSING = object()
-EARTH_RADIUS_M = 6_378_137.0
 
 
 def _field(value, name, default=None):
@@ -264,19 +263,16 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._active_competitor_position = None
         self._decoy_only_count = 0
         self._runtime_evidence = {}
-        self._motion_estimator = (
-            StaticMotionParallaxEstimator()
-            if StaticMotionParallaxEstimator is not None else None
-        )
         self._motion_snapshot = None
+        self._motion_session = None
+        self._motion_session_track_id = None
         self._motion_cooperation_allowed = False
         self._motion_recovery_pending = False
         self._motion_rejected_position = None
-        self._motion_enu_origin = None
         self._motion_evidence = {
-            "decision": "rejected",
+            "decision": "UNKNOWN",
             "allow_cooperation": False,
-            "reason": "static_motion_estimator_unavailable",
+            "reason": "no_motion_frame",
         }
 
     def submit_perception(self, snapshot=None, *, detection=None,
@@ -359,71 +355,48 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         return frame
 
     def _reset_static_motion(self, *, keep_rejected_position=False):
-        """结束局部候选后清空视差窗口，不把拒绝区域变成持久记忆。"""
-        if self._motion_estimator is not None:
-            self._motion_estimator.reset()
+        """结束局部候选后清空控制资格，不把拒绝区域变成持久记忆。"""
         self._motion_snapshot = None
-        self._motion_enu_origin = None
         self._motion_cooperation_allowed = False
         if not keep_rejected_position:
             self._motion_rejected_position = None
 
-    def _camera_pose_from_source_pose(self, snapshot):
-        """由公开的 heading、pan、tilt 生成无滚转相机的完整 ENU 姿态。"""
-        source_pose = _field(snapshot, "source_pose", {})
-        if not isinstance(source_pose, dict):
-            return None
-        values = {}
-        try:
-            for name in ("lat", "lon", "alt", "heading_deg", "gimbal_pan", "gimbal_tilt"):
-                values[name] = float(source_pose[name])
-        except (KeyError, TypeError, ValueError):
-            return None
-        if not all(math.isfinite(value) for value in values.values()):
-            return None
-        if self._motion_enu_origin is None:
-            self._motion_enu_origin = (values["lat"], values["lon"], values["alt"])
-        origin_lat, origin_lon, origin_alt = self._motion_enu_origin
-        east = math.radians(values["lon"] - origin_lon) * EARTH_RADIUS_M * math.cos(
-            math.radians((values["lat"] + origin_lat) * 0.5))
-        north = math.radians(values["lat"] - origin_lat) * EARTH_RADIUS_M
-        yaw = math.radians(values["heading_deg"] + values["gimbal_pan"])
-        pitch = math.radians(values["gimbal_tilt"])
-        forward = (math.cos(pitch) * math.sin(yaw), math.cos(pitch) * math.cos(yaw), math.sin(pitch))
-        right = (math.cos(yaw), -math.sin(yaw), 0.0)
-        down = (math.sin(pitch) * math.sin(yaw), math.sin(pitch) * math.cos(yaw), -math.cos(pitch))
-        # 列向量为相机 right/down/forward；估计器按行矩阵乘相机射线，故在此转置。
-        return {
-            "center_world_m": (east, north, values["alt"] - origin_alt),
-            "camera_to_world": (
-                (right[0], down[0], forward[0]),
-                (right[1], down[1], forward[1]),
-                (right[2], down[2], forward[2]),
-            ),
-            "source": "public_heading_pan_tilt_no_roll",
-        }
-
     def _observe_static_motion(self, now, frame):
-        """只把本机公开姿态构造的完整相机位姿交给估计器。"""
+        """只读取当前主视觉轨迹在同帧像素上得到的局部光流证据。"""
         snapshot = self._motion_snapshot
-        if self._motion_estimator is None:
-            return dict(self._motion_evidence)
-        camera_pose = self._camera_pose_from_source_pose(snapshot)
-        source_time = frame.source_sim_time
-        evidence = self._motion_estimator.observe(
-            snapshot,
-            camera_pose,
-            frame_time_s=now if source_time is None else source_time,
-        )
+        results = _field(snapshot, "motion_results", {}) or {}
+        track_id = _field(frame.detection, "track_id", None)
+        coordinator = self._coordinator
+        if (coordinator.role == coordinator.MASTER
+                and coordinator.phase == coordinator.ACTIVE
+                and (track_id is None
+                     or track_id != self._motion_session_track_id
+                     or coordinator.current_session != self._motion_session)):
+            return {
+                "decision": "UNKNOWN", "allow_cooperation": False,
+                "track_id": track_id,
+                "session_track_id": self._motion_session_track_id,
+                "reason": "active_session_track_mismatch",
+            }
+        evidence = results.get(track_id) if track_id is not None else None
+        if evidence is None:
+            motion_error = _field(snapshot, "motion_error", None)
+            return {
+                "decision": "UNKNOWN", "allow_cooperation": False,
+                "track_id": track_id,
+                "reason": ("motion_processing_failed" if motion_error
+                           else "no_motion_result"),
+                "motion_error": motion_error,
+            }
         return dict(evidence)
 
     def _apply_motion_evidence(self, now, frame):
-        """把视差结论转换为协同门和局部搜索恢复，不解释或复制估计器算法。"""
+        """只让确认运动的本机轨迹发起协同，确认静止才取消或恢复搜索。"""
         evidence = self._observe_static_motion(now, frame)
         self._motion_evidence = evidence
-        decision = evidence.get("decision")
-        self._motion_cooperation_allowed = bool(evidence.get("allow_cooperation"))
-        if decision != "rejected":
+        decision = str(evidence.get("decision", "UNKNOWN")).upper()
+        self._motion_cooperation_allowed = decision == "MOVING"
+        if decision != "STATIC":
             return
         self._motion_cooperation_allowed = False
         rejected_position = frame.stationary_position or frame.target_position
@@ -432,7 +405,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         if self._coordinator.role == self._coordinator.MASTER and self._coordinator.phase == self._coordinator.ACTIVE:
             self.signal_coordination_end(
                 self._coordinator.FINISH_MASTER_STATIC,
-                rejected_position,
+                rejected_position or self._coordinator.follow_position,
             )
         elif self._coordinator.phase == self._coordinator.SEARCH:
             self._motion_recovery_pending = True
@@ -556,6 +529,12 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 self._target_gate.reset()
         if is_new and fresh and frame.is_target:
             self._apply_motion_evidence(now, frame)
+        elif is_new or not fresh:
+            self._motion_cooperation_allowed = False
+            self._motion_evidence = {
+                "decision": "UNKNOWN", "allow_cooperation": False,
+                "reason": "no_fresh_target_frame",
+            }
         self._competition_flight.set_perception(
             self._active_target_position,
             (None if self._coordinator.phase in (
@@ -586,6 +565,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         commands = super().decide(control_obs, dt)
         if ((phase_before == CoopCoordinator.SEARCH)
                 != (self._coordinator.phase == CoopCoordinator.SEARCH)):
+            if (phase_before == CoopCoordinator.SEARCH
+                    and self._coordinator.role == self._coordinator.MASTER):
+                self._motion_session = self._coordinator.current_session
+                self._motion_session_track_id = (
+                    _field(frame.detection, "track_id", None)
+                    if (fresh and frame is not None and frame.is_target
+                        and self._motion_evidence.get("decision") == "MOVING")
+                    else None
+                )
+            elif self._coordinator.phase == CoopCoordinator.SEARCH:
+                self._motion_session = None
+                self._motion_session_track_id = None
             # 发起时消费资格，结束回到 SEARCH 时也清掉协同期间积累的旧帧。
             self._target_gate.reset()
             self._decoy_only_count = 0
@@ -697,37 +688,6 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                         "gimbal_pan_cmd_deg": aim.pan_deg,
                         "gimbal_tilt_cmd_deg": aim.tilt_deg,
                     })
-        if (phase == coordinator.SEARCH
-                and self._motion_evidence.get("decision") == "collecting"
-                and self._active_target_position is not None):
-            sample_waypoint = self._simple_control.parallax_sample(
-                self_position=(obs.self.lat, obs.self.lon),
-                target_position=self._active_target_position,
-            )
-            aim = self._simple_control.master_aim(
-                self_position=(obs.self.lat, obs.self.lon),
-                self_alt_m=obs.self.alt,
-                self_heading_deg=obs.self.heading_deg,
-                target_position=self._active_target_position,
-            )
-            if sample_waypoint is not None:
-                commands = [command for command in commands
-                            if command.verb != "set_destination"]
-                commands.append(fly_to(
-                    *sample_waypoint,
-                    alt=self.FLIGHT_ALT_M,
-                    speed=self._simple_control.config.parallax_sample_speed_mps,
-                    loiter_radius=0.0,
-                ))
-                control_evidence.update({
-                    "parallax_sampling_enabled": True,
-                    "parallax_sample_lat": sample_waypoint[0],
-                    "parallax_sample_lon": sample_waypoint[1],
-                })
-            if aim is not None:
-                commands = [command for command in commands if command.verb
-                            != "component.gimbal_tracking.set_orientation"]
-                commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
         if self._motion_recovery_pending and phase == coordinator.SEARCH:
             self._motion_recovery_pending = False
             self._track.reset_for_acquisition()
