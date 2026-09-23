@@ -363,9 +363,13 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         track_id = _field(frame.detection, "track_id", None)
         evidence = results.get(track_id) if track_id is not None else None
         if evidence is None:
+            motion_error = _field(snapshot, "motion_error", None)
             return {
                 "decision": "UNKNOWN", "allow_cooperation": False,
-                "track_id": track_id, "reason": "no_motion_result",
+                "track_id": track_id,
+                "reason": ("motion_processing_failed" if motion_error
+                           else "no_motion_result"),
+                "motion_error": motion_error,
             }
         return dict(evidence)
 

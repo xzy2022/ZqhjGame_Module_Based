@@ -87,6 +87,7 @@ class PerceptionSnapshot:
     closest_others: PixelObservation | None
     objects: tuple[PixelObservation, ...]
     motion_results: Mapping[int, Mapping]
+    motion_error: str | None
     inference_wall_ms: float
     completed_perf_counter: float
     error: str | None = None
@@ -472,10 +473,13 @@ class V3PerceptionWorker:
                 self._stats["completed_frames"] += 1
                 if result.error is not None:
                     self._stats["inference_failures"] += 1
+                if result.motion_error is not None:
+                    self._stats["motion_failures"] += 1
 
     def _infer(self, detector, job: _FrameJob) -> PerceptionSnapshot:
         started = time.perf_counter()
         image_size = (0, 0)
+        motion_error = None
         try:
             import cv2
             encoded = np.frombuffer(job.photo, dtype=np.uint8)
@@ -504,9 +508,10 @@ class V3PerceptionWorker:
                 motion_results = motion_detector.update(
                     image, detections, job.source_sim_time,
                     frame_id=job.frame_id)
-            except Exception:
+            except Exception as exc:
                 # 动静证据不可用时保守关闭协同门，但不丢弃本帧检测。
                 motion_results = {}
+                motion_error = f"{type(exc).__name__}: {exc}"[:240]
             detection, track_predict, closest_others, objects = select_observations(
                 detections, image_size, job.own_pose)
             error = None
@@ -530,6 +535,7 @@ class V3PerceptionWorker:
             closest_others=closest_others,
             objects=objects,
             motion_results=motion_results,
+            motion_error=motion_error,
             inference_wall_ms=(completed - started) * 1000.0,
             completed_perf_counter=completed,
             error=error,
