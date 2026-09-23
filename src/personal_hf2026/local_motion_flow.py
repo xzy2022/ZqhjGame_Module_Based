@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：让小目标周围有足够道路角点，并避免单次光流失效抹除已有动静证据。
+# 修改内容：统一扩大局部 ROI，在跳过坏帧时保留窗口并补齐窗口内的目标锚点断层。
+# 修改时间：2026-09-23。
 # 修改目的：让有限角点集中覆盖小目标周围，并防止无效轨迹编号的检测框污染背景光流。
 # 修改内容：局部道路 ROI 限定全图单次提点区域，同时在前后帧遮蔽所有合法车辆框。
 # 修改时间：2026-09-23。
@@ -102,6 +105,21 @@ class LocalMotionDetector:
         return boxes
 
     @staticmethod
+    def _local_roi(
+        box: tuple[float, float, float, float], image_width: int, image_height: int,
+    ) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        cx = (x1 + x2) * 0.5
+        half_w = max(2.0 * bw, 50.0)
+        bottom_extra = max(1.5 * bh, 45.0)
+        xa = max(0, int(math.floor(cx - half_w)))
+        xb = min(image_width, int(math.ceil(cx + half_w)))
+        ya = max(0, int(math.floor(y1 + 0.3 * bh)))
+        yb = min(image_height, int(math.ceil(y2 + bottom_extra)))
+        return xa, ya, xb, yb
+
+    @staticmethod
     def _background_mask(
         shape: tuple[int, int],
         boxes: Sequence[tuple[float, float, float, float]],
@@ -111,11 +129,8 @@ class LocalMotionDetector:
         mask = np.zeros((height, width), dtype=np.uint8) if focus_boxes else np.full(
             (height, width), 255, dtype=np.uint8)
         # 有候选目标时把角点预算集中到其脚下及两侧。
-        for x1, y1, x2, y2 in focus_boxes:
-            bw, bh = x2 - x1, y2 - y1
-            cx = (x1 + x2) * 0.5
-            xa, ya = max(0, int(math.floor(cx - 2 * bw))), max(0, int(math.floor(y1 + 0.4 * bh)))
-            xb, yb = min(width, int(math.ceil(cx + 2 * bw))), min(height, int(math.ceil(y2 + 1.2 * bh)))
+        for box in focus_boxes:
+            xa, ya, xb, yb = LocalMotionDetector._local_roi(box, width, height)
             mask[ya:yb, xa:xb] = 255
         for x1, y1, x2, y2 in boxes:
             dx, dy = 0.2 * (x2 - x1), 0.2 * (y2 - y1)
@@ -174,13 +189,13 @@ class LocalMotionDetector:
         old_points: np.ndarray,
         new_points: np.ndarray,
     ) -> dict[str, Any]:
-        x1, y1, x2, y2 = old_box
-        width, height = x2 - x1, y2 - y1
-        cx = (x1 + x2) * 0.5
-        local = ((old_points[:, 0] >= cx - 2 * width)
-                 & (old_points[:, 0] <= cx + 2 * width)
-                 & (old_points[:, 1] >= y1 + 0.4 * height)
-                 & (old_points[:, 1] <= y2 + 1.2 * height))
+        assert self._prev_gray is not None
+        image_height, image_width = self._prev_gray.shape
+        xa, ya, xb, yb = self._local_roi(old_box, image_width, image_height)
+        local = ((old_points[:, 0] >= xa)
+                 & (old_points[:, 0] < xb)
+                 & (old_points[:, 1] >= ya)
+                 & (old_points[:, 1] < yb))
         p0, p1 = old_points[local], new_points[local]
         count = len(p0)
         if count < self.parameters.min_local_points:
@@ -213,8 +228,13 @@ class LocalMotionDetector:
             window.last_raw = "UNKNOWN"
             return self._unknown("warmup", **evidence)
         predicted = steps[0][1].copy()
-        for matrix, _, _, _, _ in steps:
+        previous_endpoint = None
+        for matrix, old_anchor, new_anchor, _, _ in steps:
+            # 坏帧没有仿射证据，用两侧已观测锚点补齐断层，不把该帧运动计入窗口。
+            if previous_endpoint is not None:
+                predicted += old_anchor - previous_endpoint
             predicted = matrix[:, :2] @ predicted + matrix[:, 2]
+            previous_endpoint = new_anchor
         actual = steps[-1][2]
         endpoint_error = float(np.linalg.norm(actual - predicted))
         median_height = float(np.median([step[3] for step in steps]))
@@ -284,8 +304,6 @@ class LocalMotionDetector:
                 results[tid] = {"track_id": tid, **self._unknown("new_track")}
                 continue
             result = self._transition(tid, old_box, box, old_points, new_points)
-            if result["reason"] in {"insufficient_local_features", "affine_failed", "weak_local_affine"}:
-                self._tracks.pop(tid, None)
             results[tid] = {"track_id": tid, **result}
         self._tracks = {tid: state for tid, state in self._tracks.items() if tid in boxes}
         self._prev_gray, self._prev_boxes = gray, boxes
