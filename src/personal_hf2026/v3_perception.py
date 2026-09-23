@@ -1,3 +1,6 @@
+# 修改时间：2026-09-23。
+# 修改目的：让本机连续像素帧的动静判定结果随同一张感知快照进入控制层。
+# 修改内容：在共享视觉 worker 内按无人机维护局部光流判定器，仅传递各轨迹证据而不保存原图。
 # 修改时间：2026-09-22。
 # 修改目的：将 SDK 若公开的完整相机世界位姿原样绑定到同一像素快照，供横移视差估计使用。
 # 修改内容：仅透传 camera_pose 或 center_world_m/camera_to_world，不由 heading 或云台角近似构造姿态。
@@ -83,6 +86,7 @@ class PerceptionSnapshot:
     track_predict: PixelObservation | None
     closest_others: PixelObservation | None
     objects: tuple[PixelObservation, ...]
+    motion_results: Mapping[int, Mapping]
     inference_wall_ms: float
     completed_perf_counter: float
     error: str | None = None
@@ -301,6 +305,7 @@ class V3PerceptionWorker:
         self._condition = Condition()
         self._pending: dict[str, _FrameJob] = {}
         self._latest: dict[str, PerceptionSnapshot] = {}
+        self._motion_detectors = {}
         self._last_signature: dict[str, tuple[str, str]] = {}
         self._uid_order: list[str] = []
         self._cursor = 0
@@ -490,12 +495,25 @@ class V3PerceptionWorker:
                     job.uid, job.frame_id, detections, image_size,
                     job.diagnostic_metadata,
                 )
+            try:
+                from .local_motion_flow import LocalMotionDetector
+                motion_detector = self._motion_detectors.get(job.uid)
+                if motion_detector is None:
+                    motion_detector = LocalMotionDetector()
+                    self._motion_detectors[job.uid] = motion_detector
+                motion_results = motion_detector.update(
+                    image, detections, job.source_sim_time,
+                    frame_id=job.frame_id)
+            except Exception:
+                # 动静证据不可用时保守关闭协同门，但不丢弃本帧检测。
+                motion_results = {}
             detection, track_predict, closest_others, objects = select_observations(
                 detections, image_size, job.own_pose)
             error = None
         except Exception as exc:
             detection = track_predict = closest_others = None
             objects = ()
+            motion_results = {}
             error = repr(exc)
         completed = time.perf_counter()
         return PerceptionSnapshot(
@@ -511,6 +529,7 @@ class V3PerceptionWorker:
             track_predict=track_predict,
             closest_others=closest_others,
             objects=objects,
+            motion_results=motion_results,
             inference_wall_ms=(completed - started) * 1000.0,
             completed_perf_counter=completed,
             error=error,
