@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：避免 ACTIVE 主机把另一辆静止车的光流结论误用于当前协同会话。
+# 修改内容：在发起会话时绑定确认运动的视觉轨迹，ACTIVE 只接受同一会话同一轨迹的静态证据。
+# 修改时间：2026-09-23。
 # 修改目的：让 V3 协同门和静态取消只由同帧局部光流证据驱动。
 # 修改内容：读取当前视觉轨迹的光流结论，移除旧射线视差与搜索横移接线，并保留现有协同飞行策略。
 # 修改时间：2026-09-22。
@@ -261,6 +264,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         self._decoy_only_count = 0
         self._runtime_evidence = {}
         self._motion_snapshot = None
+        self._motion_session = None
+        self._motion_session_track_id = None
         self._motion_cooperation_allowed = False
         self._motion_recovery_pending = False
         self._motion_rejected_position = None
@@ -361,6 +366,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         snapshot = self._motion_snapshot
         results = _field(snapshot, "motion_results", {}) or {}
         track_id = _field(frame.detection, "track_id", None)
+        coordinator = self._coordinator
+        if (coordinator.role == coordinator.MASTER
+                and coordinator.phase == coordinator.ACTIVE
+                and (track_id is None
+                     or track_id != self._motion_session_track_id
+                     or coordinator.current_session != self._motion_session)):
+            return {
+                "decision": "UNKNOWN", "allow_cooperation": False,
+                "track_id": track_id,
+                "session_track_id": self._motion_session_track_id,
+                "reason": "active_session_track_mismatch",
+            }
         evidence = results.get(track_id) if track_id is not None else None
         if evidence is None:
             motion_error = _field(snapshot, "motion_error", None)
@@ -548,6 +565,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         commands = super().decide(control_obs, dt)
         if ((phase_before == CoopCoordinator.SEARCH)
                 != (self._coordinator.phase == CoopCoordinator.SEARCH)):
+            if (phase_before == CoopCoordinator.SEARCH
+                    and self._coordinator.role == self._coordinator.MASTER):
+                self._motion_session = self._coordinator.current_session
+                self._motion_session_track_id = (
+                    _field(frame.detection, "track_id", None)
+                    if (fresh and frame is not None and frame.is_target
+                        and self._motion_evidence.get("decision") == "MOVING")
+                    else None
+                )
+            elif self._coordinator.phase == CoopCoordinator.SEARCH:
+                self._motion_session = None
+                self._motion_session_track_id = None
             # 发起时消费资格，结束回到 SEARCH 时也清掉协同期间积累的旧帧。
             self._target_gate.reset()
             self._decoy_only_count = 0
