@@ -1,3 +1,6 @@
+# 修改时间：2026-09-23。
+# 修改目的：让每张已消费视觉帧的云台纠偏和飞行锚点决策可复核。
+# 修改内容：在有界决策轨迹中写入本地视觉证据，并按视觉帧编号触发记录。
 # 修改时间：2026-09-22。
 # 修改目的：将单机横移视差的 Agent 侧判定证据写入有界协同轨迹以支持真实运行复核。
 # 修改内容：记录动静决策、放行标记和局部遮蔽位置，并将其加入传感状态变化指纹。
@@ -244,6 +247,7 @@ def _agent_evidence(agent):
     only_decoys = value(("only_decoys",))
     if only_decoys is not None:
         perception["only_decoys"] = bool(only_decoys)
+    perception["is_new"] = bool(value(("is_new",), False))
     result = {
         "revision": _safe_json(value(("revision",))),
         "event": _safe_json(value(("event",))),
@@ -278,6 +282,21 @@ def _agent_evidence(agent):
         found = _safe_json(value((key,)))
         if found is not None:
             result[key] = found
+    result["visual"] = {
+        key: _safe_json(value((key,))) for key in (
+            "visual_mode", "locked_track_id", "frame_id",
+            "bbox_center_x", "bbox_center_y", "pixel_error_x", "pixel_error_y",
+            "inside_inner", "outside_outer", "pixel_correction_applied",
+            "pan_delta_deg", "tilt_delta_deg", "gimbal_pan_cmd_deg",
+            "gimbal_tilt_cmd_deg", "motion_decision", "motion_reason",
+            "motion_window_valid_frames", "raw_h0_position",
+            "anchor_sample_count", "anchor_spread_m", "candidate_anchor",
+            "anchor_valid", "flight_anchor", "flight_anchor_age_s",
+            "anchor_update_accepted", "anchor_reject_reason", "anchor_jump_m",
+            "anchor_implied_speed_mps", "flight_command_source",
+            "visual_lost_age_s",
+        )
+    }
     control = _control_evidence(agent)
     result["control"] = control
     for key in (
@@ -321,6 +340,7 @@ def _state_fingerprint(state):
     return (
         state.get("revision"), state.get("event"), state.get("phase"),
         state.get("role"), state.get("track_state"),
+        (state.get("perception") or {}).get("frame_id"),
         json.dumps(state.get("session"), sort_keys=True),
         state.get("partner_uid"), state.get("proposal_count"),
         state.get("follower_accept_count"), state.get("finish_reason"),

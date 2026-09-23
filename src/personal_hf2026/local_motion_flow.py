@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：缩短局部光流确认运动目标所需的视觉时间。
+# 修改内容：将有效转换窗口从八次调整为五次，其余判定阈值保持不变。
+# 修改时间：2026-09-23。
 # 修改目的：让小目标周围有足够道路角点，并避免单次光流失效抹除已有动静证据。
 # 修改内容：统一扩大局部 ROI，在跳过坏帧时保留窗口并补齐窗口内的目标锚点断层。
 # 修改时间：2026-09-23。
@@ -53,7 +56,7 @@ class LocalMotionParameters:
     min_inliers: int = 8
     min_inlier_ratio: float = 0.55
     max_rmse_px: float = 2.0
-    window_transitions: int = 8
+    window_transitions: int = 5
     max_transition_gap_s: float = 1.5
 
 

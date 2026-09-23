@@ -1,3 +1,6 @@
+# 修改时间：2026-09-23。
+# 修改目的：避免稀疏传感状态行把真实的连续五帧确认误判为证据不足。
+# 修改内容：优先从逐新帧控制决策核对五帧链，旧轨迹仍回退到传感状态行。
 # 修改时间：2026-09-21（本地完成边沿限定）。
 # 修改目的：避免 MASTER 收到其他会话完成广播时把共享计数增长误判成本机会话完成。
 # 修改内容：结束原因、回搜索和计数传播审计只以 coordination_finished 本地边沿建立完成会话。
@@ -628,6 +631,10 @@ def analyze_run(input_dir: Path, output_path: Path | None = None):
     perceptions = [row for row in rows if row.get("kind") == "perception"]
     decisions.sort(key=lambda row: (_time(row), str(row.get("uid"))))
     perceptions.sort(key=lambda row: (_time(row), str(row.get("uid"))))
+    new_frame_decisions = [
+        row for row in decisions
+        if bool((_state(row).get("perception") or {}).get("is_new"))
+    ]
     starts = _master_starts(decisions)
     accepts = _pair_accepts(decisions)
     trace_loss = bool(
@@ -638,7 +645,8 @@ def analyze_run(input_dir: Path, output_path: Path | None = None):
     )
     returned, propagated = _return_and_propagation_checks(decisions, accepts)
     checks = {
-        "five_frame_confirmation": _five_frame_check(perceptions, starts),
+        "five_frame_confirmation": _five_frame_check(
+            new_frame_decisions or perceptions, starts),
         "master_initiated": _master_start_check(starts),
         "nearest_follower_accepted": _nearest_follower_check(decisions, accepts),
         "distance_gates_220m_200m": _distance_gate_check(decisions),

@@ -11,7 +11,7 @@
     "iou": 0.5,
     "expected_sha256": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2"
   },
-  "max_source_gap_s": 0.40,
+  "max_source_gap_s": 0.60,
   "motion_width": 384,
   "max_streams": 16,
   "tracker": {

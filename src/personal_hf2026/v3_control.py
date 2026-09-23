@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：验证像素云台闭环和稳定飞行锚点能否隔离候选目标及零高度投影跳变。
+# 修改内容：加入本地视觉模式、每帧一次的像素纠偏、五点锚点门和短暂失视冻结，并记录控制来源。
+# 修改时间：2026-09-23。
 # 修改目的：避免 ACTIVE 主机把另一辆静止车的光流结论误用于当前协同会话。
 # 修改内容：在发起会话时绑定确认运动的视觉轨迹，ACTIVE 只接受同一会话同一轨迹的静态证据。
 # 修改时间：2026-09-23。
@@ -45,8 +48,10 @@
 # 修改内容：新增鸭子类型感知输入、连续五个新帧门控、固定四十八度视场及目标竞争方向控制。
 """V3 控制层：把真实感知结果适配到 PersonalV1 的协同状态机。"""
 
+from collections import deque
 from dataclasses import dataclass, replace
 import math
+from statistics import median
 from typing import Any
 
 from competition.sdk.core.commands import (
@@ -228,6 +233,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
     PERCEPTION_STALE_S = 1.0
     MASTER_ACTIVE_LOST_AFTER_S = 5.0
     SEARCH_REJECT_CLEAR_M = 120.0
+    CANDIDATE_LOST_S = 0.8
+    TRACK_LOST_S = 2.0
 
     def reset(self):
         super().reset()
@@ -248,7 +255,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self.COOP_REACQUIRE_TIMEOUT_S,
             proposal_gate=lambda: (
                 self._target_gate.ready and self._motion_cooperation_allowed),
-            master_prediction=lambda now: self._track.predict_position(now),
+            master_prediction=lambda now: self._flight_anchor,
         )
         self._competition_flight = _V3CompetitionDirectionController(
             self.COMPETITION_UPDATE_PERIOD_S, self.COMPETITION_OFFSET_STEP_MPS,
@@ -274,6 +281,153 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "allow_cooperation": False,
             "reason": "no_motion_frame",
         }
+        self._reset_visual_lock()
+
+    def _reset_visual_lock(self):
+        """清除本地候选和飞行锚点，不改变协调器的角色或阶段。"""
+        self._visual_mode = "SEARCH_SCAN"
+        self._visual_track_id = None
+        self._visual_last_seen_s = None
+        self._visual_lost_since = None
+        self._last_pixel_control_frame_id = None
+        self._pixel_pan_cmd = None
+        self._pixel_tilt_cmd = None
+        self._pixel_correcting = False
+        self._pixel_stable_frames = 0
+        self._anchor_samples = deque(maxlen=5)
+        self._candidate_anchor = None
+        self._anchor_spread_m = None
+        self._anchor_valid = False
+        self._flight_anchor = None
+        self._flight_anchor_at = None
+        self._visual_evidence = {}
+
+    def _update_visual_lock(self, now, frame, is_new, fresh, own):
+        """仅在同一轨迹的新图像上积分云台，并在稳定后接纳 H0 锚点。"""
+        evidence = {
+            "bbox_center_x": None, "bbox_center_y": None,
+            "pixel_error_x": None, "pixel_error_y": None,
+            "inside_inner": None, "outside_outer": None,
+            "pixel_correction_applied": False,
+            "pan_delta_deg": 0.0, "tilt_delta_deg": 0.0,
+            "anchor_update_accepted": False, "anchor_reject_reason": None,
+            "anchor_jump_m": None, "anchor_implied_speed_mps": None,
+        }
+        track_id = (_field(frame.detection, "track_id", None)
+                    if frame is not None and frame.is_target else None)
+        visible = bool(is_new and fresh and track_id is not None)
+        same_track = visible and track_id == self._visual_track_id
+        if self._visual_mode != "SEARCH_SCAN" and not same_track:
+            was_tracking = self._visual_mode in ("TRACK_LOCK", "TEMP_LOST")
+            age = now - self._visual_last_seen_s
+            timeout = (self.CANDIDATE_LOST_S if self._visual_mode == "CANDIDATE_LOCK"
+                       else self.TRACK_LOST_S)
+            if age >= timeout:
+                self._reset_visual_lock()
+                self._target_gate.reset()
+                self._motion_cooperation_allowed = False
+                self._motion_snapshot = None
+                self._motion_evidence = {
+                    "decision": "UNKNOWN", "allow_cooperation": False,
+                    "reason": "visual_lock_timeout",
+                }
+                self._search_filter.reset_current()
+                if self._coordinator.phase == self._coordinator.SEARCH:
+                    self._track.reset_for_acquisition()
+                if was_tracking:
+                    # 旧会话先退出，下一张新图才允许选择另一条视觉轨迹。
+                    visible = False
+            elif (self._visual_mode != "CANDIDATE_LOCK"
+                  and (is_new or age >= self.PERCEPTION_STALE_S)):
+                self._visual_mode = "TEMP_LOST"
+                if self._visual_lost_since is None:
+                    self._visual_lost_since = self._visual_last_seen_s
+        if visible and self._visual_mode == "SEARCH_SCAN":
+            self._visual_mode = "CANDIDATE_LOCK"
+            self._visual_track_id = track_id
+            self._pixel_pan_cmd = float(own.gimbal_pan)
+            self._pixel_tilt_cmd = float(own.gimbal_tilt)
+            self._visual_last_seen_s = now
+            same_track = True
+        if same_track:
+            self._visual_last_seen_s = now
+            self._visual_lost_since = None
+            box = _field(frame.detection, "bbox_xyxy", None)
+            if box is not None and len(box) == 4:
+                x = (float(box[0]) + float(box[2])) * 0.5
+                y = (float(box[1]) + float(box[3])) * 0.5
+                dx, dy = x - 512.0, y - 384.0
+                inner = abs(dx) < 120.0 and abs(dy) < 90.0
+                outer = abs(dx) > 160.0 or abs(dy) > 120.0
+                if outer:
+                    self._pixel_correcting = True
+                elif inner:
+                    self._pixel_correcting = False
+                evidence.update({
+                    "bbox_center_x": x, "bbox_center_y": y,
+                    "pixel_error_x": dx, "pixel_error_y": dy,
+                    "inside_inner": inner, "outside_outer": outer,
+                })
+                if frame.frame_id != self._last_pixel_control_frame_id:
+                    self._last_pixel_control_frame_id = frame.frame_id
+                    if self._pixel_correcting:
+                        ex = math.copysign(max(0.0, abs(dx) - 120.0), dx)
+                        ey = math.copysign(max(0.0, abs(dy) - 90.0), dy)
+                        pan_delta = max(-2.5, min(2.5, 0.5 * ex * 48.0 / 1024.0))
+                        tilt_delta = max(-2.0, min(2.0, -0.5 * ey * 36.9 / 768.0))
+                        self._pixel_pan_cmd = max(-180.0, min(180.0, self._pixel_pan_cmd + pan_delta))
+                        self._pixel_tilt_cmd = max(-90.0, min(0.0, self._pixel_tilt_cmd + tilt_delta))
+                        evidence.update({
+                            "pixel_correction_applied": pan_delta != 0.0 or tilt_delta != 0.0,
+                            "pan_delta_deg": pan_delta, "tilt_delta_deg": tilt_delta,
+                        })
+                    self._pixel_stable_frames = self._pixel_stable_frames + 1 if inner else 0
+                    raw = frame.target_position
+                    if inner and self._pixel_stable_frames >= 2 and raw is not None:
+                        self._anchor_samples.append(raw)
+                        if len(self._anchor_samples) == 5:
+                            # 以窗口首点为局部 ENU 原点，分别取东、北方向中位数。
+                            lat0, lon0 = self._anchor_samples[0]
+                            east_scale = 111320.0 * math.cos(math.radians(lat0))
+                            north = median((point[0] - lat0) * 111320.0
+                                           for point in self._anchor_samples)
+                            east = median((point[1] - lon0) * east_scale
+                                          for point in self._anchor_samples)
+                            candidate = (lat0 + north / 111320.0,
+                                         lon0 + east / east_scale)
+                            spread = max(ground_distance_m(point, candidate)
+                                         for point in self._anchor_samples)
+                            self._anchor_spread_m = spread
+                            if spread <= 35.0:
+                                self._candidate_anchor = candidate
+                                self._anchor_valid = True
+                                jump = (None if self._flight_anchor is None else
+                                        ground_distance_m(self._flight_anchor, candidate))
+                                elapsed = (None if self._flight_anchor_at is None else
+                                           max(1e-6, now - self._flight_anchor_at))
+                                speed = (None if jump is None else jump / elapsed)
+                                evidence["anchor_jump_m"] = jump
+                                evidence["anchor_implied_speed_mps"] = speed
+                                if self._flight_anchor is None and not self._motion_cooperation_allowed:
+                                    evidence["anchor_reject_reason"] = "waiting_for_moving"
+                                elif jump is not None and jump > 40.0:
+                                    evidence["anchor_reject_reason"] = "jump_over_40m"
+                                elif speed is not None and speed > 30.0:
+                                    evidence["anchor_reject_reason"] = "speed_over_30mps"
+                                else:
+                                    self._flight_anchor = candidate
+                                    self._flight_anchor_at = now
+                                    evidence["anchor_update_accepted"] = True
+                            else:
+                                self._anchor_valid = False
+                                evidence["anchor_reject_reason"] = "spread_over_35m"
+            if (self._visual_mode in ("CANDIDATE_LOCK", "TEMP_LOST")
+                    and self._motion_cooperation_allowed and self._anchor_valid
+                    and self._flight_anchor is not None):
+                self._visual_mode = "TRACK_LOCK"
+            elif self._visual_mode == "TEMP_LOST":
+                self._visual_mode = "TRACK_LOCK"
+        self._visual_evidence = evidence
 
     def submit_perception(self, snapshot=None, *, detection=None,
                           track_predict=None, closest_others=None, objects=None,
@@ -493,7 +647,9 @@ class PersonalV3ControlAgent(PersonalV1Agent):
         )
         desired_lost_after_s = (
             self.MASTER_ACTIVE_LOST_AFTER_S
-            if master_tracking else self._default_track_lost_after_s
+            if master_tracking else
+            self.TRACK_LOST_S if self._visual_mode in ("TRACK_LOCK", "TEMP_LOST")
+            else self._default_track_lost_after_s
         )
         if self._track.config.lost_after_s != desired_lost_after_s:
             self._track.config = replace(
@@ -517,16 +673,6 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                     finished_decoy_only_count = self._decoy_only_count
         elif self._coordinator.role != self._coordinator.MASTER:
             self._decoy_only_count = 0
-        if fresh:
-            self._active_target_position = frame.target_position
-            self._active_track_predict_position = frame.track_predict_position
-            self._active_competitor_position = frame.competitor_position
-        else:
-            self._active_target_position = None
-            self._active_track_predict_position = None
-            self._active_competitor_position = None
-            if self._coordinator.phase == CoopCoordinator.SEARCH:
-                self._target_gate.reset()
         if is_new and fresh and frame.is_target:
             self._apply_motion_evidence(now, frame)
         elif is_new or not fresh:
@@ -535,6 +681,33 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 "decision": "UNKNOWN", "allow_cooperation": False,
                 "reason": "no_fresh_target_frame",
             }
+        if self._coordinator.role != self._coordinator.FOLLOWER:
+            self._update_visual_lock(now, frame, is_new, fresh, obs.self)
+            if (self._visual_mode == "TEMP_LOST"
+                    or (is_new and _field(frame.detection, "track_id", None)
+                        != self._visual_track_id)):
+                self._motion_cooperation_allowed = False
+            # 候选阶段保留原搜索航线；正式锁定后只把通过稳定门的锚点送入 V1。
+            authorized = self._visual_mode in ("TRACK_LOCK", "TEMP_LOST")
+            same_new_target = bool(is_new and fresh and frame.is_target
+                                   and _field(frame.detection, "track_id", None)
+                                   == self._visual_track_id)
+            self._active_target_position = (
+                self._flight_anchor if authorized and same_new_target else None)
+            # 原生最近轨迹必须与意图视觉轨迹同号，不能把意图点自证为主锁定。
+            self._active_track_predict_position = (
+                self._active_target_position
+                if frame is not None and _field(frame.track_predict, "track_id", None)
+                == self._visual_track_id else None)
+            self._active_competitor_position = None
+        elif fresh:
+            self._active_target_position = frame.target_position
+            self._active_track_predict_position = frame.track_predict_position
+            self._active_competitor_position = frame.competitor_position
+        else:
+            self._active_target_position = None
+            self._active_track_predict_position = None
+            self._active_competitor_position = None
         self._competition_flight.set_perception(
             self._active_target_position,
             (None if self._coordinator.phase in (
@@ -543,7 +716,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
              else self._active_competitor_position),
         )
 
-        if is_new and fresh:
+        if is_new and fresh and self._active_target_position is not None:
             # 单数 detection 表示本机预测的原生最近对象，而非意图真目标。
             primary = self._sdk_detection(frame, self._active_track_predict_position)
             multiple = tuple(
@@ -554,12 +727,26 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             own = replace(obs.self, detection=primary,
                           detections=multiple if len(multiple) > 1 else ())
             control_obs = replace(obs, self=own)
+            if (self._coordinator.phase == self._coordinator.SEARCH
+                    and self._track.state == self._track.LOST):
+                # 光流已证明运动，不能再要求抖动较小的锚点通过 V1 世界速度门。
+                self._search_filter.reset_current()
+                self._track.update(now, self._flight_anchor)
+                self._gimbal_lock.bind(
+                    self._track.epoch, self._flight_anchor, obs.self.gimbal_fov_deg)
         else:
             # 同一视觉帧不能在约十赫兹控制循环中伪造成连续新观测。
             own = replace(obs.self, detection=Detection(False, 0.0), detections=())
             control_obs = replace(obs, self=own)
         if is_new:
             self._consumed_serial = self._submission_serial
+
+        if (self._visual_mode == "SEARCH_SCAN"
+                and self._coordinator.role == self._coordinator.MASTER
+                and self._coordinator.phase in (self._coordinator.HOLD,
+                                                self._coordinator.ACTIVE)):
+            # 短失视期过后强制旧会话按现有 timeout 路径结束。
+            self._track.reset_for_acquisition()
 
         phase_before = self._coordinator.phase
         commands = super().decide(control_obs, dt)
@@ -582,6 +769,8 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._decoy_only_count = 0
             self._reset_static_motion(
                 keep_rejected_position=self._motion_rejected_position is not None)
+            if self._coordinator.phase == CoopCoordinator.SEARCH:
+                self._reset_visual_lock()
         coordinator = self._coordinator
         role = coordinator.role
         phase = coordinator.phase
@@ -696,6 +885,7 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             self._target_gate.reset()
             self._perception = None
             self._reset_static_motion(keep_rejected_position=True)
+            self._reset_visual_lock()
             search_lat, search_lon = self._search_route.target(
                 (obs.self.lat, obs.self.lon), obs.self.heading_deg)
             scan_pan, scan_tilt = self._search_gimbal.scan(
@@ -714,6 +904,18 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 "guidance_enabled": False,
                 "aiming_enabled": False,
             })
+        if (role != coordinator.FOLLOWER
+                and self._visual_mode in ("CANDIDATE_LOCK", "TRACK_LOCK", "TEMP_LOST")
+                and self._pixel_pan_cmd is not None):
+            # 旧帧之间保持上次云台指令，禁止控制循环对同一包围框重复积分。
+            commands = [command for command in commands if command.verb
+                        != "component.gimbal_tracking.set_orientation"]
+            commands.append(point_gimbal(self._pixel_pan_cmd, self._pixel_tilt_cmd))
+            control_evidence.update({
+                "aiming_enabled": True,
+                "gimbal_pan_cmd_deg": self._pixel_pan_cmd,
+                "gimbal_tilt_cmd_deg": self._pixel_tilt_cmd,
+            })
         fixed = []
         for command in commands:
             if command.verb == "set_destination":
@@ -724,6 +926,10 @@ class PersonalV3ControlAgent(PersonalV1Agent):
                 command = Command(command.verb, {"angle": self.SEARCH_FOV_DEG})
             fixed.append(command)
         coordination = coordinator.event_summary
+        flight_command_source = (
+            "frozen_anchor" if self._visual_mode == "TEMP_LOST" else
+            "flight_anchor" if self._visual_mode == "TRACK_LOCK" else "search"
+        ) if role != coordinator.FOLLOWER else "follower"
         self._runtime_evidence = {
             **coordination,
             **control_evidence,
@@ -755,5 +961,23 @@ class PersonalV3ControlAgent(PersonalV1Agent):
             "static_motion": dict(self._motion_evidence),
             "static_motion_cooperation_allowed": self._motion_cooperation_allowed,
             "static_motion_rejected_position": self._motion_rejected_position,
+            "visual_mode": self._visual_mode,
+            "locked_track_id": self._visual_track_id,
+            "frame_id": None if frame is None else frame.frame_id,
+            **self._visual_evidence,
+            "motion_decision": self._motion_evidence.get("decision"),
+            "motion_reason": self._motion_evidence.get("reason"),
+            "motion_window_valid_frames": self._motion_evidence.get("window_valid_frames"),
+            "raw_h0_position": None if frame is None else frame.target_position,
+            "anchor_sample_count": len(self._anchor_samples),
+            "anchor_spread_m": self._anchor_spread_m,
+            "candidate_anchor": self._candidate_anchor,
+            "anchor_valid": self._anchor_valid,
+            "flight_anchor": self._flight_anchor,
+            "flight_anchor_age_s": (None if self._flight_anchor_at is None else
+                                    max(0.0, now - self._flight_anchor_at)),
+            "flight_command_source": flight_command_source,
+            "visual_lost_age_s": (None if self._visual_lost_since is None else
+                                  max(0.0, now - self._visual_lost_since)),
         }
         return fixed

@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：让实时轨迹覆盖实际处理帧之间约零点六秒的间隔。
+# 修改内容：将源时间融合上限同步扩展到零点六秒。
+# 修改时间：2026-09-23。
 # 修改目的：允许检测器按已配置的 0.40 秒源帧间隔继续跟踪。
 # 修改内容：将流水线初始化的源时间融合上限从 0.25 秒同步调整为 0.40 秒。
 # 修改时间：2026-09-19。
@@ -10,7 +13,7 @@
 # 修改时间：2026-09-19。
 # 修改目的：将队友 V2 的单模型实时识别实现独立集成到模块仓库。
 # 修改内容：固定源码来源、改用包内导入与外置运行目录，并保留原始检测及因果跟踪算法。
-"""One shared detector, isolated per-UAV tracking, source-time fusion <= 0.40 s."""
+"""One shared detector, isolated per-UAV tracking, source-time fusion <= 0.60 s."""
 from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass
@@ -85,8 +88,8 @@ class RealtimePipeline:
             self.config['tracker']['high']=float(tracker_high)
         self.settings=dict(self.config.get('tracker',{}))
         self.settings['max_gap_s']=float(self.config.get('max_source_gap_s',.25))
-        if not 0<self.settings['max_gap_s']<=.40:
-            raise ValueError('Source-time fusion limit must be positive and <= 0.40 s')
+        if not 0<self.settings['max_gap_s']<=.60:
+            raise ValueError('Source-time fusion limit must be positive and <= 0.60 s')
         spec=dict(self.config.get('detector',{}))
         self.weights_path=(Path(weights).resolve() if weights is not None
                            else (PROJECT_ROOT/self.config['weights']).resolve())
