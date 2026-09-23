@@ -1,4 +1,7 @@
 # 修改时间：2026-09-23。
+# 修改目的：让长时 V3 运行保留超过四十八 MiB 的协调状态链。
+# 修改内容：将协同轨迹默认字节上限提高到一百九十二 MiB，并同步放宽记录条数上限与入口提示。
+# 修改时间：2026-09-23。
 # 修改目的：让每张已消费视觉帧的云台纠偏和飞行锚点决策可复核。
 # 修改内容：在有界决策轨迹中写入本地视觉证据，并按视觉帧编号触发记录。
 # 修改时间：2026-09-22。
@@ -75,8 +78,8 @@ WEATHERS = (
 DEFAULT_LAYOUT = SIM_ROOT / "competition/scenarios/coop_decoy/scenario.json"
 _FRAME_NUMBER = re.compile(r"frame:(\d+)$")
 _TRACE_SAMPLE_PERIOD_S = 0.5
-_TRACE_DEFAULT_MAX_RECORDS = 12_000
-_TRACE_DEFAULT_MAX_BYTES = 48 * 1024 * 1024
+_TRACE_DEFAULT_MAX_RECORDS = 48_000
+_TRACE_DEFAULT_MAX_BYTES = 192 * 1024 * 1024
 _VISION_DIAGNOSTIC_MODE_RE = re.compile(r"[01]{3}")
 _UE_CLASS_TO_YOLO_CLASS = {
     "TargetVehicle": "real_vehicle",
@@ -1253,11 +1256,11 @@ def _parser():
     parser.add_argument("--weights", type=Path, default=None)
     parser.add_argument(
         "--trace-max-records", type=int, default=_TRACE_DEFAULT_MAX_RECORDS,
-        help="协同证据内存记录上限，默认 12000 条",
+        help="协同证据内存记录上限，默认 48000 条",
     )
     parser.add_argument(
         "--trace-max-bytes", type=int, default=_TRACE_DEFAULT_MAX_BYTES,
-        help="协同证据 UTF-8 字节上限，默认 16 MiB",
+        help="协同证据 UTF-8 字节上限，默认 192 MiB",
     )
     parser.add_argument(
         "--save-images", action="store_true",
