@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：让从机远程奔袭使用比赛允许的最高飞行速度。
+# 修改内容：将 FOLLOWER_APPROACH 的飞行速度设为 40 m/s，协同跟踪仍使用 22 m/s。
+# 修改时间：2026-09-24。
 # 修改目的：让云台冷却间隔基于实际视觉帧的仿真时间。
 # 修改内容：传入快照的 source_sim_time，并仅在产生新纠偏时发送云台命令。
 # 修改时间：2026-09-24。
@@ -206,7 +209,8 @@ class V4Control:
                         destination = orbit.fly_to_position
                     else:
                         destination = target
-                    commands.append(fly_to(*destination, alt=500.0, speed=22.0,
+                    speed = 40.0 if self.state == "FOLLOWER_APPROACH" else 22.0
+                    commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                            loiter_radius=0.0))
                     aim = solve_ground_aim(own, pose["alt"], pose["heading_deg"], target)
                     commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
