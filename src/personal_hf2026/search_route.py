@@ -1,3 +1,6 @@
+# 修改时间：2026-09-24。
+# 修改目的：避免搜索中断后命令无人机返回中断前的位置。
+# 修改内容：暂停时仅停止航点推进，并移除旧位置恢复航点。
 # 修改时间：2026-09-14。
 # 修改目的：将个人算法迁移为独立 Git 仓库中的可安装模块。
 # 修改内容：复制现有算法并调整包导入及模型路径，保持算法逻辑不变。
@@ -27,8 +30,6 @@ class StripSearchRoute:
         self.completed_waypoints = 0
         self.completed_passes = 0
         self._active = False
-        self._last_route_position = None
-        self._resume_position = None
         self.visited_cells = set()
         self.current_cell = None
         self.cell_entries = 0
@@ -68,21 +69,13 @@ class StripSearchRoute:
             self.current_cell = cell
 
     def pause(self):
-        """第一次中断时保存位置，候选追踪和协同期间不推进航点。"""
-        if self._active:
-            if self._resume_position is None:
-                self._resume_position = self._last_route_position
-            self._active = False
+        """候选追踪和协同期间暂停航点推进。"""
+        self._active = False
 
     def target(self, position):
         if not self.waypoints:
             self._build(position)
         self._active = True
-        self._last_route_position = position
-        if self._resume_position is not None:
-            if self._distance(position, self._resume_position) > self.arrival_radius_m:
-                return self._resume_position
-            self._resume_position = None
         if self._distance(position, self.waypoints[self.index]) <= self.arrival_radius_m:
             self.completed_waypoints += 1
             next_index = self.index + self.direction
@@ -106,7 +99,6 @@ class StripSearchRoute:
             "completed_waypoints": self.completed_waypoints,
             "completed_passes": self.completed_passes,
             "waypoint": self.waypoints[self.index] if self.waypoints else None,
-            "resume_position": self._resume_position,
             "active": self._active,
             "grid_size_m": self.grid_size_m,
             "current_cell": self.current_cell,

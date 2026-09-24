@@ -1,3 +1,6 @@
+# 修改时间：2026-09-24。
+# 修改目的：搜索被 VERIFY 打断后从当前前方并回原航段，避免掉头回旧位置。
+# 修改内容：保存航段最大投影进度，恢复时生成前方 250 米接入点，越过终点则推进下一段。
 # 修改时间：2026-09-14。
 # 修改目的：将个人算法迁移为独立 Git 仓库中的可安装模块。
 # 修改内容：复制现有算法并调整包导入及模型路径，保持算法逻辑不变。
@@ -84,6 +87,11 @@ class SurveySearchRoute(StripSearchRoute):
         self.actual_spacing_m = None
         self.supplement_legs = 0
         self.survey_completed = False
+        self.rejoin_lookahead_m = 250.0
+        self._max_leg_progress_m = 0.0
+        self._resume_pending = False
+        self._rejoin_target = None
+        self._rejoin_progress_m = None
 
     def _point(self, along, across):
         return self.coverage.point(across, along) if self.north_south else self.coverage.point(along, across)
@@ -148,26 +156,77 @@ class SurveySearchRoute(StripSearchRoute):
             self.phase="REVISIT"
         self.waypoints=[a,b] if a!=b else [a]
         self.index=0
+        self._max_leg_progress_m=0.0
+        self._rejoin_target=None
+        self._rejoin_progress_m=None
         self.supplement_legs+=1
+
+    def pause(self):
+        if self._active:
+            self._resume_pending = True
+            self._rejoin_target = None
+            self._rejoin_progress_m = None
+        self._active = False
+
+    def _leg_projection(self, position):
+        if self.index == 0:
+            return None
+        start, end = self.waypoints[self.index - 1:self.index + 1]
+        east = (end[1] - start[1]) * self._lon_scale
+        north = (end[0] - start[0]) * 111320.0
+        length = math.hypot(east, north)
+        if length <= 1e-6:
+            return None
+        own_east = (position[1] - start[1]) * self._lon_scale
+        own_north = (position[0] - start[0]) * 111320.0
+        progress = max(0.0, min(length, (own_east * east + own_north * north) / length))
+        return progress, length, start, end
+
+    def _advance(self, position):
+        self.completed_waypoints += 1
+        self.index += 1
+        self._max_leg_progress_m = 0.0
+        self._rejoin_target = None
+        self._rejoin_progress_m = None
+        if self.index == len(self.waypoints):
+            if self.phase == "SURVEY":
+                self.survey_completed = True
+                self.completed_passes += 1
+            self._next_supplement(position)
 
     def target(self, position, heading=0.0):
         if not self.waypoints:
             self.initial_heading=heading
             self._build(position)
         self._active=True
-        self._last_route_position=position
-        if self._resume_position is not None:
-            if self._distance(position,self._resume_position)>self.arrival_radius_m:
-                return self._resume_position
-            self._resume_position=None
+        if self._resume_pending:
+            self._resume_pending = False
+            leg = self._leg_projection(position)
+            if leg is not None:
+                projected, length, start, end = leg
+                progress = max(projected, self._max_leg_progress_m)
+                self._max_leg_progress_m = progress
+                if progress >= length:
+                    self._advance(position)
+                else:
+                    rejoin_progress = min(progress + self.rejoin_lookahead_m, length)
+                    if rejoin_progress < length:
+                        fraction = rejoin_progress / length
+                        self._rejoin_target = (
+                            start[0] + (end[0] - start[0]) * fraction,
+                            start[1] + (end[1] - start[1]) * fraction)
+                        self._rejoin_progress_m = rejoin_progress
+        leg = self._leg_projection(position)
+        if leg is not None:
+            self._max_leg_progress_m = max(self._max_leg_progress_m, leg[0])
+        if self._rejoin_target is not None:
+            if (self._distance(position, self._rejoin_target) > self.arrival_radius_m
+                    and (leg is None or leg[0] < self._rejoin_progress_m)):
+                return self._rejoin_target
+            self._rejoin_target = None
+            self._rejoin_progress_m = None
         if self._distance(position,self.waypoints[self.index])<=self.arrival_radius_m:
-            self.completed_waypoints+=1
-            self.index+=1
-            if self.index==len(self.waypoints):
-                if self.phase=="SURVEY":
-                    self.survey_completed=True
-                    self.completed_passes+=1
-                self._next_supplement(position)
+            self._advance(position)
         return self.waypoints[self.index]
 
     def clamp_position(self, position):
