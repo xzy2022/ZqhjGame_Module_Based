@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：让双机使用同一个绕目标起始相位与旋转起点。
+# 修改内容：START 携带主机相位和仿真起始时间，并用主机心跳更新从机可见的主机位置。
+# 修改时间：2026-09-24。
 # 修改目的：避免长时运行时旧收件记录被逐出后再次当成新消息。
 # 修改内容：保留本轮已见消息键，数量只随真实通信条数增长。
 # 修改时间：2026-09-24。
@@ -56,6 +59,8 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
+        self.orbit_phase_deg = None
+        self.orbit_start_s = None
         self.last_master_message_s = -1e9
         self.accepted = False
         self.ready = False
@@ -73,6 +78,8 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
+        self.orbit_phase_deg = None
+        self.orbit_start_s = None
         self.accepted = False
         self.ready = False
         self.started = False
@@ -109,7 +116,10 @@ class V4Coordinator:
             self.received_events += 1
             if kind == "H" and len(parts) == 5:
                 try:
-                    self.peers[sender] = (_decode_position(parts[2], parts[3]), now, parts[4])
+                    position = _decode_position(parts[2], parts[3])
+                    self.peers[sender] = (position, now, parts[4])
+                    if sender == self.master_uid:
+                        self.master_position = position
                 except ValueError:
                     pass
                 continue
@@ -118,6 +128,7 @@ class V4Coordinator:
                     and len(parts) == 6 and parts[3] == self.uid):
                 self.session = session
                 self.master_uid = sender
+                self.master_position = self.peers.get(sender, (None,))[0]
                 self.last_master_message_s = now
                 try:
                     self.target = _decode_position(parts[4], parts[5])
@@ -144,7 +155,12 @@ class V4Coordinator:
                         events.append("TARGET")
                     except ValueError:
                         pass
-                elif kind == "START":
+                elif kind == "START" and len(parts) == 5:
+                    try:
+                        self.orbit_phase_deg = _from36(parts[3]) / 10.0
+                        self.orbit_start_s = _from36(parts[4]) / 1000.0
+                    except ValueError:
+                        continue
                     self.started = True
                     events.append("START")
                 elif kind in ("DONE", "CANCEL"):
@@ -152,7 +168,7 @@ class V4Coordinator:
         return events
 
     def queue_message(self, kind, now, *, position=None, target=None, state=None,
-                      period_s=0.0):
+                      phase_deg=None, start_s=None, period_s=0.0):
         if kind not in KINDS:
             raise ValueError(kind)
         if kind not in ("H",) and self.session is None:
@@ -171,6 +187,9 @@ class V4Coordinator:
                 parts.extend((self.partner_uid, *_position(target)))
             elif kind == "TARGET" and target is not None and position is not None:
                 parts.extend((*_position(target), *_position(position)))
+            elif kind == "START" and phase_deg is not None and start_s is not None:
+                parts.extend((_base36(round(float(phase_deg) * 10.0)),
+                              _base36(round(float(start_s) * 1000.0))))
         payload = "|".join(parts)
         if len(payload.encode("utf-8")) > 50:
             raise ValueError("Agent4 通信载荷超过官方 50 字节上限")
