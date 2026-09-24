@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：让协同跟踪阶段的主机向裁判上报实体粗坐标以参与定位评分。
+# 修改内容：主机在 COOP_TRACK 中使用已有的 rough.position 每秒发送一次 report_target。
+# 修改时间：2026-09-24。
 # 修改目的：让从机远程奔袭使用比赛允许的最高飞行速度。
 # 修改内容：将 FOLLOWER_APPROACH 的飞行速度设为 40 m/s，协同跟踪仍使用 22 m/s。
 # 修改时间：2026-09-24。
@@ -22,7 +25,7 @@ from __future__ import annotations
 import math
 
 from competition.baselines.coop_distributed import _BBOX
-from competition.sdk.core.commands import fly_to, point_gimbal, set_gimbal_fov
+from competition.sdk.core.commands import fly_to, point_gimbal, report_target, set_gimbal_fov
 
 from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
@@ -58,6 +61,7 @@ class V4Control:
         self.events = []
         self.completed_sessions = 0
         self._last_coverage_s = -1e9
+        self._last_report_s = -1e9
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -234,9 +238,13 @@ class V4Control:
                 self.coord.queue_message("TARGET", now, target=self.rough.position,
                                          position=own, period_s=0.5)
         elif self.state == "COOP_TRACK" and self.coord.master_uid == self.uid:
-            if self.rough.position is not None:
-                self.coord.queue_message("TARGET", now, target=self.rough.position,
+            target = self.rough.position
+            if target is not None:
+                self.coord.queue_message("TARGET", now, target=target,
                                          position=own, period_s=0.5)
+                if now - self._last_report_s >= 1.0:
+                    commands.append(report_target(*target))
+                    self._last_report_s = now
             self.coord.queue_message("START", now, period_s=1.0)
         elif self.state == "FOLLOWER_APPROACH":
             self.coord.queue_message("ACCEPT", now, period_s=1.0)
