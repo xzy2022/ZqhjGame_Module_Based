@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：让云台冷却间隔基于实际视觉帧的仿真时间。
+# 修改内容：传入快照的 source_sim_time，并仅在产生新纠偏时发送云台命令。
+# 修改时间：2026-09-24。
 # 修改目的：减少主从已建立会话后的重复邀请广播。
 # 修改内容：主机收到 ACCEPT 后停止周期性发送 INVITE。
 # 修改时间：2026-09-24。
@@ -112,7 +115,7 @@ class V4Control:
         self.last_visual_box = entity.bbox_xyxy
         self.last_visual_size = snapshot.image_size
         self.last_visual_pose = dict(snapshot.source_pose)
-        self.gimbal.update(entity.bbox_xyxy, snapshot.image_size, snapshot.source_pose)
+        self.gimbal.update(entity.bbox_xyxy, snapshot.image_size, snapshot.source_pose, now)
         other = [item.bbox_xyxy for item in snapshot.effective_yolo_objects
                  if item.bbox_xyxy != entity.bbox_xyxy]
         previous_motion = self.motion.decision
@@ -191,8 +194,9 @@ class V4Control:
                                                  self.last_visual_size, origin_position=own)
                     commands.append(fly_to(*target, alt=500.0, speed=22.0,
                                            loiter_radius=0.0))
-                if self.gimbal.pan is not None:
+                if self.gimbal.command_pending:
                     commands.append(point_gimbal(self.gimbal.pan, self.gimbal.tilt))
+                    self.gimbal.command_pending = False
             else:
                 target = self.coord.target
                 if target is not None:
