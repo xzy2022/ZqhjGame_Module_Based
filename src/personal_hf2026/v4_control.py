@@ -1,4 +1,10 @@
 # 修改时间：2026-09-24。
+# 修改目的：将搜索阶段的三帧候选与正式实体分开计数。
+# 修改内容：候选框连续匹配三帧后才创建 Entity，之前不增加实体编号或实体观测帧数。
+# 修改时间：2026-09-24。
+# 修改目的：搜索时连续三帧确认同一真目标后才进入实体锁定阶段。
+# 修改内容：SEARCH 保持航线飞行，候选匹配满三帧才切换 VERIFY，识别中断则重置计数。
+# 修改时间：2026-09-24。
 # 修改目的：让从机先按主机实时方位飞往目标对侧的外圈入口。
 # 修改内容：从机入口半径设为 180 米并以 35 m/s 奔袭，协同旋转半径仍为 130 米。
 # 修改时间：2026-09-24。
@@ -50,6 +56,7 @@ COOP_ORBIT_RADIUS_M = 130.0
 FOLLOWER_ENTRY_RADIUS_M = 180.0
 COOP_ORBIT_PERIOD_S = 60.0
 COOP_SPEED_MPS = 35.0
+SEARCH_CONFIRM_FRAMES = 3
 
 
 class V4Control:
@@ -74,6 +81,8 @@ class V4Control:
         self._entry_phase_deg = None
         self._orbit_phase_deg = None
         self._orbit_start_s = None
+        self._search_candidate_box = None
+        self._search_candidate_frames = 0
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -87,6 +96,9 @@ class V4Control:
         if self.state != state:
             old = self.state
             self.state = state
+            if old == "SEARCH":
+                self._search_candidate_box = None
+                self._search_candidate_frames = 0
             self._event("state_changed", now, previous=old, reason=reason)
 
     def _return_search(self, now, reason, terminal=None):
@@ -101,8 +113,38 @@ class V4Control:
         self._entry_phase_deg = None
         self._orbit_phase_deg = None
         self._orbit_start_s = None
+        self._search_candidate_box = None
+        self._search_candidate_frames = 0
         self.route.pause()
         self._state("SEARCH", now, reason)
+
+    def _update_search_candidate(self, objects, image_size):
+        real = [item for item in objects if item.class_name == "real_vehicle"]
+        if not real:
+            self._search_candidate_box = None
+            self._search_candidate_frames = 0
+            return None
+        center = lambda box: ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+        last_box = self._search_candidate_box
+        if last_box is None:
+            width, height = image_size
+            candidate = min(real, key=lambda item: math.dist(
+                center(item.bbox_xyxy), (width * 0.5, height * 0.5)))
+            self._search_candidate_frames = 1
+        else:
+            last_center = center(last_box)
+            candidate = min(real, key=lambda item: math.dist(
+                center(item.bbox_xyxy), last_center))
+            diagonal = math.hypot(last_box[2] - last_box[0], last_box[3] - last_box[1])
+            if math.dist(center(candidate.bbox_xyxy), last_center) <= max(220.0, 1.5 * diagonal):
+                self._search_candidate_frames += 1
+            else:
+                width, height = image_size
+                candidate = min(real, key=lambda item: math.dist(
+                    center(item.bbox_xyxy), (width * 0.5, height * 0.5)))
+                self._search_candidate_frames = 1
+        self._search_candidate_box = candidate.bbox_xyxy
+        return candidate if self._search_candidate_frames >= SEARCH_CONFIRM_FRAMES else None
 
     def consume_visual(self, snapshot):
         """外层保证同一 frame_id 只调用一次。"""
@@ -113,21 +155,30 @@ class V4Control:
                     effective_count=len(snapshot.effective_yolo_objects))
         if snapshot.error:
             self._event("perception_error", now, error=snapshot.error)
+            if self.state == "SEARCH":
+                self._search_candidate_box = None
+                self._search_candidate_frames = 0
             return
         if self.state == "FOLLOWER_APPROACH" or (
                 self.state == "COOP_TRACK" and self.coord.master_uid != self.uid):
             return
-        entity, event = self.entity.update(snapshot.effective_yolo_objects,
-                                           snapshot.image_size, now)
+        if self.state == "SEARCH":
+            candidate = self._update_search_candidate(snapshot.effective_yolo_objects,
+                                                      snapshot.image_size)
+            if candidate is None:
+                return
+            entity, event = self.entity.update((candidate,), snapshot.image_size, now)
+            self.motion.reset()
+            self.rough.reset()
+            self._state("VERIFY", now, "real_vehicle_three_frames")
+        else:
+            entity, event = self.entity.update(snapshot.effective_yolo_objects,
+                                               snapshot.image_size, now)
         if event:
             self._event(event, now, frame_id=snapshot.frame_id,
                         entity_id=entity.entity_id, entity_visible=entity.visible,
                         entity_bbox=entity.bbox_xyxy, entity_missing_s=entity.missing_s,
                         entity_observed_frames=entity.observed_frames)
-        if event == "entity_created":
-            self.motion.reset()
-            self.rough.reset()
-            self._state("VERIFY", now, "real_vehicle_entity_created")
         if event == "entity_lost":
             self._return_search(now, "entity_lost",
                                 "CANCEL" if self.state in ("CALLING", "COOP_TRACK") else None)
