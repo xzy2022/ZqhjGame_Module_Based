@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：避免云台快速转动时速度外推放大框中心跳变并误判实体丢失。
+# 修改内容：以最近有效框中心匹配并把单帧距离门放宽到 220 像素。
+# 修改时间：2026-09-24。
 # 修改目的：用本机唯一实体容忍短暂分类抖动且避免切换到旁边目标。
 # 修改内容：仅匹配 real_vehicle 包围框并按最近中心及时间门管理实体生命周期。
 """每机唯一视觉 Entity。"""
@@ -25,8 +28,6 @@ class Entity:
     observed_frames: int
     last_box: tuple[float, float, float, float]
     last_seen_s: float
-    previous_box: tuple[float, float, float, float] | None = None
-    previous_seen_s: float | None = None
 
 
 class EntityManager:
@@ -57,22 +58,12 @@ class EntityManager:
             self.current = entity
             return entity, "entity_created"
         prediction = _center(entity.last_box)
-        if entity.previous_box is not None and entity.previous_seen_s is not None:
-            delta = entity.last_seen_s - entity.previous_seen_s
-            if delta > 1e-6:
-                speed = ((_center(entity.last_box)[0] - _center(entity.previous_box)[0]) / delta,
-                         (_center(entity.last_box)[1] - _center(entity.previous_box)[1]) / delta)
-                ahead = min(1.0, max(0.0, now_s - entity.last_seen_s))
-                prediction = (prediction[0] + speed[0] * ahead,
-                              prediction[1] + speed[1] * ahead)
         diagonal = math.hypot(entity.last_box[2] - entity.last_box[0],
                               entity.last_box[3] - entity.last_box[1])
-        gate = max(80.0, 1.5 * diagonal)
+        gate = max(220.0, 1.5 * diagonal)
         nearest = min(real, key=lambda obj: math.dist(_center(obj.bbox_xyxy), prediction),
                       default=None)
         if nearest is not None and math.dist(_center(nearest.bbox_xyxy), prediction) <= gate:
-            entity.previous_box = entity.last_box
-            entity.previous_seen_s = entity.last_seen_s
             entity.last_box = nearest.bbox_xyxy
             entity.last_seen_s = now_s
             entity.bbox_xyxy = nearest.bbox_xyxy
