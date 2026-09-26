@@ -85,6 +85,12 @@ class CoordinatedSweepRouteTest(unittest.TestCase):
         self.assertAlmostEqual(route._uv(target)[1], 1100.0)
         self.assertAlmostEqual(route.frontier_v, 1100.0)
 
+        # 尚未收到三机位置时即使暂停，首次初始化也必须完成共同对齐。
+        early = self.route()
+        early.pause()
+        early.target(self.positions["20003"], 10.0, peers(others))
+        self.assertEqual(early.mode, "ALIGN")
+
     def test_sweep_flip_and_long_axis_reflection(self):
         route, own, others = self.start_sweep()
         target = route.target(own, 10.2, peers(others, now=10.2))

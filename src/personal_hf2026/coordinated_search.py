@@ -174,15 +174,17 @@ class CoordinatedSweepRoute:
 
     def target(self, position, now, peers):
         positions = self._fresh_positions(position, now, peers)
+        newly_initialized = False
         if not self.initialized:
             if len(positions) != len(self.members):
                 self.last_target = None
                 return None
             self._initialize(positions)
+            newly_initialized = True
         own_u, own_v = self._uv(position)
-        resumed = self._resume_pending
+        resumed = self._resume_pending and not newly_initialized
+        self._resume_pending = False
         if resumed:
-            self._resume_pending = False
             self._restore_sweep(own_v)
 
         if self.mode == "ALIGN":
