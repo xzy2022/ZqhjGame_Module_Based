@@ -1,4 +1,7 @@
 # 修改时间：2026-09-24。
+# 修改目的：确认对象期间继续沿搜索航线飞行，并限制确认阶段时长。
+# 修改内容：VERIFY 复用 SEARCH 航点与飞行速度，满 2 秒未进入下一阶段即返回 SEARCH。
+# 修改时间：2026-09-24。
 # 修改目的：将搜索阶段的三帧候选与正式实体分开计数。
 # 修改内容：候选框连续匹配三帧后才创建 Entity，之前不增加实体编号或实体观测帧数。
 # 修改时间：2026-09-24。
@@ -57,6 +60,7 @@ FOLLOWER_ENTRY_RADIUS_M = 180.0
 COOP_ORBIT_PERIOD_S = 60.0
 COOP_SPEED_MPS = 35.0
 SEARCH_CONFIRM_FRAMES = 3
+VERIFY_TIMEOUT_S = 2.0
 
 
 class V4Control:
@@ -83,6 +87,7 @@ class V4Control:
         self._orbit_start_s = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
+        self._verify_started_s = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -96,6 +101,7 @@ class V4Control:
         if self.state != state:
             old = self.state
             self.state = state
+            self._verify_started_s = None
             if old == "SEARCH":
                 self._search_candidate_box = None
                 self._search_candidate_frames = 0
@@ -115,7 +121,8 @@ class V4Control:
         self._orbit_start_s = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
-        self.route.pause()
+        if self.state != "VERIFY":
+            self.route.pause()
         self._state("SEARCH", now, reason)
 
     def _update_search_candidate(self, objects, image_size):
@@ -251,9 +258,14 @@ class V4Control:
                 and self.coord.master_uid != self.uid
                 and now - self.coord.last_master_message_s > 5.0):
             self._return_search(now, "master_communication_timeout")
+        if self.state == "VERIFY":
+            if self._verify_started_s is None:
+                self._verify_started_s = now
+            elif now - self._verify_started_s >= VERIFY_TIMEOUT_S:
+                self._return_search(now, "verify_timeout")
         self.coord.queue_message("H", now, position=own, state=self.state, period_s=1.0)
         commands = []
-        if self.state == "SEARCH":
+        if self.state in ("SEARCH", "VERIFY"):
             self.route.observe_search_position(own)
             if now - self._last_coverage_s >= 0.5:
                 self.route.coverage.observe(
@@ -264,13 +276,18 @@ class V4Control:
             heading = bearing_deg(own, target)
             delta = abs((heading - pose["heading_deg"] + 180.0) % 360.0 - 180.0)
             speed = 15.0 if delta > 45.0 else 22.0
-            pan, tilt = self.search_gimbal.scan(
-                now, heading, pose["heading_deg"], pose["gimbal_pan"], pose["gimbal_tilt"])
-            commands.extend((fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0),
-                             point_gimbal(pan, tilt), set_gimbal_fov(48.0)))
+            commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
+            if self.state == "SEARCH":
+                pan, tilt = self.search_gimbal.scan(
+                    now, heading, pose["heading_deg"], pose["gimbal_pan"], pose["gimbal_tilt"])
+                commands.append(point_gimbal(pan, tilt))
+            elif self.gimbal.command_pending:
+                commands.append(point_gimbal(self.gimbal.pan, self.gimbal.tilt))
+                self.gimbal.command_pending = False
+            commands.append(set_gimbal_fov(48.0))
         else:
             self.route.pause()
-            if self.state in ("VERIFY", "CALLING") or (
+            if self.state == "CALLING" or (
                     self.state == "COOP_TRACK" and self.coord.master_uid == self.uid):
                 if self.last_visual_box is not None and self.last_visual_size is not None:
                     if self.state == "COOP_TRACK" and self.rough.position is not None:
