@@ -1,4 +1,7 @@
 # 修改时间：2026-09-26。
+# 修改目的：核对正式通信的协作人选和五十字节载荷限制。
+# 修改内容：增加按允许 UID 筛选最近协作机及各心跳角色长度检查。
+# 修改时间：2026-09-26。
 # 修改目的：验证三机航线的分区、搜索翻转和中区接管主流程。
 # 修改内容：新增局部坐标、对齐、双机中点倒退与搜索恢复的聚焦测试。
 """三机协同 Z 字搜索的主流程测试。"""
@@ -6,6 +9,7 @@
 import unittest
 
 from personal_hf2026.coordinated_search import CoordinatedSweepRoute
+from personal_hf2026.v4_coordination import V4Coordinator
 
 
 MEMBERS = ("20003", "20001", "20002")
@@ -174,6 +178,22 @@ class CoordinatedSweepRouteTest(unittest.TestCase):
                          ["search_plan_initialized", "search_mode_changed", "search_mode_changed"])
         self.assertEqual(east.drain_events(), [])
         self.assertIn("covered_fraction", east.summary["coverage"])
+
+    def test_partner_filter_and_heartbeat_budget(self):
+        coordinator = V4Coordinator("20001")
+        own = point(500.0, 1100.0)
+        coordinator.peers = {
+            "20002": (point(600.0, 1100.0), 10.0, "SEARCH"),
+            "20003": (point(1500.0, 1100.0), 10.0, "SEARCH"),
+        }
+        self.assertEqual(coordinator.select_partner(own, 10.0, {"20003"}), "20003")
+        self.assertIsNone(coordinator.select_partner(own, 10.0, {"20004"}))
+        self.assertEqual(coordinator.select_partner(own, 10.0), "20002")
+        for state in ("SEARCH", "VERIFY", "CALLING", "FOLLOWER_APPROACH",
+                      "COOP_TRACK_M", "COOP_TRACK_F"):
+            heartbeat = V4Coordinator("20001")
+            heartbeat.queue_message("H", 10.0, position=(27.025, 125.020), state=state)
+            self.assertLessEqual(len(heartbeat.queue[0][1].encode("utf-8")), 50)
 
 
 if __name__ == "__main__":
