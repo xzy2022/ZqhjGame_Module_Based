@@ -1,3 +1,6 @@
+# 修改时间：2026-09-26。
+# 修改目的：在任务结束时保留紧凑的三机搜索航线摘要。
+# 修改内容：完成摘要增加规划器的 search summary。
 # 修改时间：2026-09-24。
 # 修改目的：兼容官方 Runner 启动时尚未提供 score_view 的首拍观测。
 # 修改内容：首拍使用本机累计 dt 并在传感回调等待正式仿真时间。
@@ -79,4 +82,5 @@ class PersonalV4Agent(Agent):
                               if self.control.entity.current else None),
                 "completed_sessions": self.control.completed_sessions,
                 "comm_sent": self.control.coord.sent_events,
-                "comm_received": self.control.coord.received_events}
+                "comm_received": self.control.coord.received_events,
+                "search": self.control.route.summary}

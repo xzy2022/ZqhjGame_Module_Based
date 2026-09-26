@@ -1,3 +1,6 @@
+# 修改时间：2026-09-26。
+# 修改目的：使双机协作人选遵守三机搜索的空间分区。
+# 修改内容：在原有心跳时效与 SEARCH 状态过滤之后按可选 UID 集合筛选候选人。
 # 修改时间：2026-09-24。
 # 修改目的：让双机使用同一个绕目标起始相位与旋转起点。
 # 修改内容：START 携带主机相位和仿真起始时间，并用主机心跳更新从机可见的主机位置。
@@ -90,9 +93,10 @@ class V4Coordinator:
         self.session = str(entity_id).removeprefix("uav_").replace("_entity_", ".")
         self.master_uid = self.uid
 
-    def select_partner(self, own_position, now):
+    def select_partner(self, own_position, now, allowed_uids=None):
         candidates = [(position, uid) for uid, (position, seen, state) in self.peers.items()
-                      if now - seen <= 5.0 and state == "SEARCH"]
+                      if now - seen <= 5.0 and state == "SEARCH"
+                      and (allowed_uids is None or uid in allowed_uids)]
         if not candidates:
             return None
         from .v3_simple_control import ground_distance_m

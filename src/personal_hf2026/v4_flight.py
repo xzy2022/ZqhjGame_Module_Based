@@ -1,3 +1,6 @@
+# 修改时间：2026-09-26。
+# 修改目的：让 V4 控制器能直接使用三机协同搜索规划器。
+# 修改内容：导出新规划器并保留旧搜索航线接口供比较。
 # 修改时间：2026-09-24。
 # 修改目的：配合从机先飞向半径 180 米的对侧入口点。
 # 修改内容：从机到位时要求距入口小于 30 米且距主机大于 280 米。
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import math
 
+from .coordinated_search import CoordinatedSweepRoute
 from .survey_search import SurveySearchRoute
 from .visual_geometry import pixel_ray
 from .v3_simple_control import SimpleCoopControl, ground_distance_m, offset_position, solve_ground_aim
@@ -48,5 +52,5 @@ def follower_ready(own, master, entry_slot):
             and ground_distance_m(own, master) > 280.0)
 
 
-__all__ = ["SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
+__all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
            "solve_ground_aim", "visual_waypoint", "orbit_waypoint", "follower_ready"]

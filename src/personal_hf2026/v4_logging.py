@@ -1,3 +1,6 @@
+# 修改时间：2026-09-26。
+# 修改目的：让三机搜索与接管航线可从 Agent 采样日志复核。
+# 修改内容：每个控制采样记录规划器状态和本机实际位置。
 # 修改时间：2026-09-24。
 # 修改目的：无详细日志时避免新视觉帧事件在内存里无限累积。
 # 修改内容：关闭 trace 输出时仍及时取走 Agent 内部事件队列。
@@ -86,6 +89,8 @@ class V4Trace:
             "gimbal_command_tilt": control.gimbal.tilt,
             "gimbal_deadzone_hit": control.gimbal.deadzone_hit,
             "rough_position": control.rough.position,
+            "search_plan": control.route.trace_state,
+            "own_position": control.last_own_position,
             "flight_command": [dict(verb=command.verb, params=command.params)
                                for command in commands if command.verb == "set_destination"],
         })
