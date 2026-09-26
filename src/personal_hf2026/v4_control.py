@@ -1,3 +1,6 @@
+# 修改时间：2026-09-26。
+# 修改目的：将 V4 搜索与协同接入三机分区 Z 字规划器。
+# 修改内容：传递心跳位置与协作角色，处理等待同伴和规划事件，并按固定分区筛选协作无人机。
 # 修改时间：2026-09-24。
 # 修改目的：确认对象期间继续沿搜索航线飞行，并限制确认阶段时长。
 # 修改内容：VERIFY 复用 SEARCH 航点与飞行速度，满 2 秒未进入下一阶段即返回 SEARCH。
@@ -45,7 +48,7 @@ from competition.sdk.core.commands import fly_to, point_gimbal, report_target, s
 from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
 from .v4_entity import EntityManager
-from .v4_flight import (SurveySearchRoute, follower_ready, orbit_waypoint,
+from .v4_flight import (CoordinatedSweepRoute, follower_ready, orbit_waypoint,
                         solve_ground_aim, visual_waypoint)
 from .v4_gimbal import VisualGimbal
 from .v4_motion import SingleEntityMotion
@@ -72,7 +75,7 @@ class V4Control:
         self.gimbal = VisualGimbal()
         self.rough = RoughPosition()
         self.coord = V4Coordinator(uid)
-        self.route = SurveySearchRoute(_BBOX, MEMBERS.index(self.uid), len(MEMBERS))
+        self.route = CoordinatedSweepRoute(_BBOX, self.uid, MEMBERS)
         self.search_gimbal = SearchGimbalController()
         self.last_visual_box = None
         self.last_visual_size = None
@@ -88,6 +91,7 @@ class V4Control:
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         self._verify_started_s = None
+        self.last_own_position = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -219,6 +223,11 @@ class V4Control:
     def _own_position(self, obs):
         return float(obs.self.lat), float(obs.self.lon)
 
+    def _heartbeat_state(self):
+        if self.state == "COOP_TRACK":
+            return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
+        return self.state
+
     def _orbit_waypoint(self, target, now, role):
         if self._orbit_phase_deg is None or self._orbit_start_s is None:
             return None
@@ -230,6 +239,7 @@ class V4Control:
         """消息跨 tick 生效；每拍只从本机观测生成本机 commands。"""
         now = float(now)
         own = self._own_position(obs)
+        self.last_own_position = own
         pose = {key: float(getattr(obs.self, key)) for key in (
             "lat", "lon", "alt", "heading_deg", "gimbal_pan", "gimbal_tilt",
             "gimbal_fov_deg")}
@@ -263,7 +273,8 @@ class V4Control:
                 self._verify_started_s = now
             elif now - self._verify_started_s >= VERIFY_TIMEOUT_S:
                 self._return_search(now, "verify_timeout")
-        self.coord.queue_message("H", now, position=own, state=self.state, period_s=1.0)
+        self.coord.queue_message("H", now, position=own,
+                                 state=self._heartbeat_state(), period_s=1.0)
         commands = []
         if self.state in ("SEARCH", "VERIFY"):
             self.route.observe_search_position(own)
@@ -272,11 +283,15 @@ class V4Control:
                     now, own, pose["heading_deg"], pose["gimbal_pan"],
                     pose["gimbal_tilt"], pose["gimbal_fov_deg"])
                 self._last_coverage_s = now
-            target = self.route.target(own, pose["heading_deg"])
-            heading = bearing_deg(own, target)
-            delta = abs((heading - pose["heading_deg"] + 180.0) % 360.0 - 180.0)
-            speed = 15.0 if delta > 45.0 else 22.0
-            commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
+            target = self.route.target(own, now, self.coord.peers)
+            for name, details in self.route.drain_events():
+                self._event(name, now, **details)
+            heading = pose["heading_deg"]
+            if target is not None:
+                heading = bearing_deg(own, target)
+                delta = abs((heading - pose["heading_deg"] + 180.0) % 360.0 - 180.0)
+                speed = 15.0 if delta > 45.0 else 22.0
+                commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
             if self.state == "SEARCH":
                 pan, tilt = self.search_gimbal.scan(
                     now, heading, pose["heading_deg"], pose["gimbal_pan"], pose["gimbal_tilt"])
@@ -334,7 +349,8 @@ class V4Control:
                          or peer[2] not in ("SEARCH", "FOLLOWER_APPROACH"))):
                 self.coord.partner_uid = None
             if self.coord.partner_uid is None:
-                self.coord.partner_uid = self.coord.select_partner(own, now)
+                self.coord.partner_uid = self.coord.select_partner(
+                    own, now, allowed_uids=self.route.preferred_partner_uids())
             if (not self.coord.accepted and self.coord.partner_uid is not None
                     and self.rough.position is not None):
                 self.coord.queue_message("INVITE", now, target=self.rough.position,
