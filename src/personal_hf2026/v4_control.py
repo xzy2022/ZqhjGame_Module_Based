@@ -1,4 +1,7 @@
 # 修改时间：2026-09-27。
+# 修改目的：分开从机槽位捕获与入圆后的双机相位同步。
+# 修改内容：捕获阶段使用限幅对置航点，跟踪阶段从既有位置消息选取双方速度并记录对应导引。
+# 修改时间：2026-09-27。
 # 修改目的：让双机协同飞行由实际位置和实际相位闭环引导。
 # 修改内容：统一主从轨道导航、按编队几何判断 READY，并记录每拍导航几何。
 # 修改时间：2026-09-26。
@@ -51,9 +54,10 @@ from competition.sdk.core.commands import fly_to, point_gimbal, report_target, s
 from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
 from .v4_entity import EntityManager
-from .v4_flight import (CoordinatedSweepRoute, follower_orbit_guidance,
+from .v4_flight import (CoordinatedSweepRoute, follower_capture_guidance,
+                        follower_orbit_guidance, pair_phase_geometry, phase_sync_speeds,
                         formation_ready, ground_distance_m, master_orbit_guidance,
-                        orbit_point, solve_ground_aim, visual_waypoint)
+                        solve_ground_aim, visual_waypoint)
 from .v4_gimbal import VisualGimbal
 from .v4_motion import SingleEntityMotion
 from .v4_position import RoughPosition
@@ -70,6 +74,8 @@ COOP_FAST_SPEED_MPS = 35.0
 COOP_LOOKAHEAD_S = 1.5
 COOP_ORBIT_DIRECTION = 1
 COOP_PHASE_SPEED_THRESHOLD_DEG = 20.0
+COOP_CAPTURE_SPEED_MPS = 35.0
+COOP_CAPTURE_MAX_PHASE_STEP_DEG = 30.0
 COOP_READY_RADIUS_TOL_M = 40.0
 COOP_READY_PHASE_TOL_DEG = 30.0
 SEARCH_CONFIRM_FRAMES = 3
@@ -234,32 +240,35 @@ class V4Control:
             return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
         return self.state
 
-    def _record_coop_guidance(self, role, target, own, destination, speed, master=None,
-                              pair_position=None):
-        # 长期对置点只供相位分析；真正的飞行命令始终使用短期导航点。
-        own_phase = bearing_deg(target, own)
-        master_phase = bearing_deg(target, master) if master is not None else own_phase
-        desired_phase = ((master_phase + 180.0) % 360.0
-                         if role == "FOLLOWER" else None)
-        phase_error = ((desired_phase - own_phase + 180.0) % 360.0 - 180.0
-                       if desired_phase is not None else None)
+    def _record_coop_guidance(self, role, mode, target, own, destination, speed,
+                              *, master=None, follower=None, guidance=None,
+                              master_speed=None, follower_speed=None):
+        # 两种阶段使用同一实际相位定义；缺少新鲜同伴位置时只记录本机轨道。
+        geometry = (pair_phase_geometry(target, master, follower)
+                    if master is not None and follower is not None else {})
         self.coop_guidance = {
-            "role": role,
-            "target": target,
-            "master_phase_deg": master_phase,
-            "own_phase_deg": own_phase,
-            "desired_phase_deg": desired_phase,
-            "phase_error_deg": phase_error,
-            "master_radius_m": ground_distance_m(target, master if master is not None else own),
+            "role": role, "guidance_mode": mode, "target": target,
+            "master_phase_deg": geometry.get("master_phase_deg", bearing_deg(target, own)),
+            "follower_phase_deg": geometry.get("follower_phase_deg"),
+            "own_phase_deg": bearing_deg(target, own),
+            "desired_phase_deg": geometry.get("desired_phase_deg"),
+            "phase_error_deg": geometry.get("phase_error_deg"),
+            "master_radius_m": geometry.get("master_radius_m",
+                                             ground_distance_m(target, own)),
+            "follower_radius_m": geometry.get("follower_radius_m"),
             "own_radius_m": ground_distance_m(target, own),
-            "long_slot": (orbit_point(target, desired_phase, COOP_ORBIT_RADIUS_M)
-                          if desired_phase is not None else None),
+            "pair_distance_m": geometry.get("pair_distance_m"),
+            "long_slot": guidance.get("long_slot") if guidance else None,
+            "capture_phase_step_deg": (guidance.get("capture_phase_step_deg")
+                                       if guidance else None),
+            "capture_phase_deg": guidance.get("capture_phase_deg") if guidance else None,
             "short_waypoint": destination,
             "commanded_speed_mps": speed,
-            "lookahead_deg": math.degrees(speed / COOP_ORBIT_RADIUS_M * COOP_LOOKAHEAD_S),
-            "nominal_period_s": 2.0 * math.pi * COOP_ORBIT_RADIUS_M / speed,
-            "pair_distance_m": (ground_distance_m(own, pair_position)
-                                if pair_position is not None else None),
+            "master_command_speed_mps": master_speed,
+            "follower_command_speed_mps": follower_speed,
+            "own_command_speed_mps": speed,
+            "lookahead_deg": (math.degrees(speed / COOP_ORBIT_RADIUS_M * COOP_LOOKAHEAD_S)
+                              if mode != "CAPTURE_SLOT" else None),
         }
 
     def step(self, obs, now):
@@ -328,18 +337,28 @@ class V4Control:
                     self.state == "COOP_TRACK" and self.coord.master_uid == self.uid):
                 target = self.rough.position
                 if target is not None:
+                    peer = self.coord.peers.get(self.coord.partner_uid)
+                    follower = (peer[0] if self.state == "COOP_TRACK" and peer is not None
+                                and now - peer[1] <= 5.0 else None)
+                    master_speed, follower_speed = COOP_BASE_SPEED_MPS, COOP_BASE_SPEED_MPS
+                    if follower is not None:
+                        geometry = pair_phase_geometry(target, own, follower)
+                        master_speed, follower_speed = phase_sync_speeds(
+                            geometry["phase_error_deg"], slow_speed_mps=COOP_SLOW_SPEED_MPS,
+                            base_speed_mps=COOP_BASE_SPEED_MPS,
+                            fast_speed_mps=COOP_FAST_SPEED_MPS,
+                            threshold_deg=COOP_PHASE_SPEED_THRESHOLD_DEG)
                     destination, speed, _guidance = master_orbit_guidance(
                         target, own, radius_m=COOP_ORBIT_RADIUS_M,
-                        speed_mps=COOP_BASE_SPEED_MPS,
+                        speed_mps=master_speed,
                         lookahead_s=COOP_LOOKAHEAD_S,
                         direction=COOP_ORBIT_DIRECTION)
                     commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                            loiter_radius=0.0))
-                    peer = self.coord.peers.get(self.coord.partner_uid)
-                    pair_position = (peer[0] if peer is not None and now - peer[1] <= 5.0
-                                     else None)
-                    self._record_coop_guidance("MASTER", target, own, destination, speed,
-                                               pair_position=pair_position)
+                    self._record_coop_guidance(
+                        "MASTER", "ORBIT_SYNC" if self.state == "COOP_TRACK" else "ORBIT_WAIT",
+                        target, own, destination, speed, master=own, follower=follower,
+                        master_speed=master_speed, follower_speed=follower_speed)
                 elif self.last_visual_box is not None and self.last_visual_size is not None:
                     destination = visual_waypoint(self.last_visual_pose, self.last_visual_box,
                                                   self.last_visual_size, origin_position=own)
@@ -355,19 +374,31 @@ class V4Control:
                 if target is not None:
                     master = self.coord.master_position
                     if master is not None:
-                        destination, speed, _guidance = follower_orbit_guidance(
-                            target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
-                            base_speed_mps=COOP_BASE_SPEED_MPS,
-                            slow_speed_mps=COOP_SLOW_SPEED_MPS,
-                            fast_speed_mps=COOP_FAST_SPEED_MPS,
-                            phase_threshold_deg=COOP_PHASE_SPEED_THRESHOLD_DEG,
-                            lookahead_s=COOP_LOOKAHEAD_S,
-                            direction=COOP_ORBIT_DIRECTION)
+                        if self.state == "FOLLOWER_APPROACH":
+                            destination, speed, guidance = follower_capture_guidance(
+                                target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
+                                speed_mps=COOP_CAPTURE_SPEED_MPS,
+                                max_phase_step_deg=COOP_CAPTURE_MAX_PHASE_STEP_DEG)
+                            master_speed, follower_speed = None, speed
+                            mode = "CAPTURE_SLOT"
+                        else:
+                            destination, speed, guidance = follower_orbit_guidance(
+                                target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
+                                base_speed_mps=COOP_BASE_SPEED_MPS,
+                                slow_speed_mps=COOP_SLOW_SPEED_MPS,
+                                fast_speed_mps=COOP_FAST_SPEED_MPS,
+                                phase_threshold_deg=COOP_PHASE_SPEED_THRESHOLD_DEG,
+                                lookahead_s=COOP_LOOKAHEAD_S,
+                                direction=COOP_ORBIT_DIRECTION)
+                            master_speed = guidance["master_command_speed_mps"]
+                            follower_speed = guidance["follower_command_speed_mps"]
+                            mode = "ORBIT_SYNC"
                         commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                                loiter_radius=0.0))
-                        self._record_coop_guidance("FOLLOWER", target, own, destination,
-                                                   speed, master=master,
-                                                   pair_position=master)
+                        self._record_coop_guidance(
+                            "FOLLOWER", mode, target, own, destination, speed,
+                            master=master, follower=own, guidance=guidance,
+                            master_speed=master_speed, follower_speed=follower_speed)
                         if self.state == "FOLLOWER_APPROACH" and formation_ready(
                                 target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
                                 radius_tol_m=COOP_READY_RADIUS_TOL_M,

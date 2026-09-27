@@ -1,4 +1,7 @@
 # 修改时间：2026-09-27。
+# 修改目的：让从机捕获真实对置槽位，并让双机共同修正入圆后的相位误差。
+# 修改内容：增加限幅相位捕获航点、统一相位几何及双机三档速度函数。
+# 修改时间：2026-09-27。
 # 修改目的：让 V4 双机绕目标飞行由实际机位闭环导引。
 # 修改内容：新增固定半径短期航点、主从三档速度导引及半径相位就位判断。
 # 修改时间：2026-09-26。
@@ -77,34 +80,72 @@ def master_orbit_guidance(target, own, *, radius_m=130.0, speed_mps=25.0,
     return destination, speed_mps, debug
 
 
+def pair_phase_geometry(target, master, follower):
+    """从双方实际位置计算同一对置相位误差。"""
+    master_phase = bearing_deg(target, master)
+    follower_phase = bearing_deg(target, follower)
+    desired_phase = (master_phase + 180.0) % 360.0
+    return {
+        "master_phase_deg": master_phase,
+        "follower_phase_deg": follower_phase,
+        "desired_phase_deg": desired_phase,
+        "phase_error_deg": wrap180(desired_phase - follower_phase),
+        "master_radius_m": ground_distance_m(target, master),
+        "follower_radius_m": ground_distance_m(target, follower),
+        "pair_distance_m": ground_distance_m(master, follower),
+    }
+
+
+def follower_capture_guidance(target, master, own, *, radius_m=130.0,
+                              speed_mps=35.0, max_phase_step_deg=30.0):
+    """每拍朝主机对侧槽位最多修正指定角度，航点始终在固定圆上。"""
+    geometry = pair_phase_geometry(target, master, own)
+    phase_error = geometry["phase_error_deg"]
+    phase_step = max(-max_phase_step_deg, min(max_phase_step_deg, phase_error))
+    capture_phase = (geometry["follower_phase_deg"] + phase_step) % 360.0
+    long_slot = orbit_point(target, geometry["desired_phase_deg"], radius_m)
+    destination = orbit_point(target, capture_phase, radius_m)
+    debug = {
+        **geometry,
+        "own_phase_deg": geometry["follower_phase_deg"],
+        "capture_phase_step_deg": phase_step,
+        "capture_phase_deg": capture_phase,
+        "long_slot": long_slot,
+        "short_waypoint": destination,
+        "commanded_speed_mps": speed_mps,
+    }
+    return destination, speed_mps, debug
+
+
+def phase_sync_speeds(phase_error_deg, *, slow_speed_mps=15.0,
+                      base_speed_mps=25.0, fast_speed_mps=35.0,
+                      threshold_deg=20.0):
+    """由对置相位误差同时选取主从三档速度。"""
+    if phase_error_deg > threshold_deg:
+        return slow_speed_mps, fast_speed_mps
+    if phase_error_deg < -threshold_deg:
+        return fast_speed_mps, slow_speed_mps
+    return base_speed_mps, base_speed_mps
+
+
 def follower_orbit_guidance(
         target, master, own, *, radius_m=130.0, base_speed_mps=25.0,
         slow_speed_mps=15.0, fast_speed_mps=35.0,
         phase_threshold_deg=20.0, lookahead_s=1.5, direction=1):
     """从机按主机实际对置相位选择速度，按自身实际相位生成航点。"""
-    master_phase = bearing_deg(target, master)
-    follower_phase = bearing_deg(target, own)
-    desired_phase = (master_phase + 180.0) % 360.0
-    # 固定绕圈方向为正方向；误差为正表示从机落后，应加速追赶。
-    phase_error = wrap180(desired_phase - follower_phase)
-    if phase_error > phase_threshold_deg:
-        speed = fast_speed_mps
-    elif phase_error < -phase_threshold_deg:
-        speed = slow_speed_mps
-    else:
-        speed = base_speed_mps
-    long_slot = orbit_point(target, desired_phase, radius_m)
+    geometry = pair_phase_geometry(target, master, own)
+    master_speed, speed = phase_sync_speeds(
+        geometry["phase_error_deg"], slow_speed_mps=slow_speed_mps,
+        base_speed_mps=base_speed_mps, fast_speed_mps=fast_speed_mps,
+        threshold_deg=phase_threshold_deg)
     destination, _, lookahead_deg = orbit_short_waypoint(
         target, own, speed, radius_m=radius_m,
         lookahead_s=lookahead_s, direction=direction)
     debug = {
-        "master_phase_deg": master_phase,
-        "follower_phase_deg": follower_phase,
-        "desired_follower_phase_deg": desired_phase,
-        "phase_error_deg": phase_error,
-        "master_radius_m": ground_distance_m(target, master),
-        "follower_radius_m": ground_distance_m(target, own),
-        "long_slot": long_slot,
+        **geometry,
+        "desired_follower_phase_deg": geometry["desired_phase_deg"],
+        "master_command_speed_mps": master_speed,
+        "follower_command_speed_mps": speed,
         "short_waypoint": destination,
         "commanded_speed_mps": speed,
         "lookahead_deg": lookahead_deg,
@@ -117,16 +158,14 @@ def formation_ready(target, master, own, *, radius_m=130.0,
     """双机都在指定圆环内且实际相位大体对置时就位。"""
     if master is None or own is None or target is None:
         return False
-    master_radius = ground_distance_m(target, master)
-    follower_radius = ground_distance_m(target, own)
-    desired_phase = (bearing_deg(target, master) + 180.0) % 360.0
-    phase_error = wrap180(desired_phase - bearing_deg(target, own))
-    return (abs(master_radius - radius_m) <= radius_tol_m
-            and abs(follower_radius - radius_m) <= radius_tol_m
-            and abs(phase_error) <= phase_tol_deg)
+    geometry = pair_phase_geometry(target, master, own)
+    return (abs(geometry["master_radius_m"] - radius_m) <= radius_tol_m
+            and abs(geometry["follower_radius_m"] - radius_m) <= radius_tol_m
+            and abs(geometry["phase_error_deg"]) <= phase_tol_deg)
 
 
 __all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
            "solve_ground_aim", "visual_waypoint", "wrap180", "orbit_point",
-           "orbit_short_waypoint", "master_orbit_guidance", "follower_orbit_guidance",
+           "orbit_short_waypoint", "master_orbit_guidance", "follower_capture_guidance",
+           "pair_phase_geometry", "phase_sync_speeds", "follower_orbit_guidance",
            "formation_ready"]
