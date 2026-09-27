@@ -1,4 +1,7 @@
 # 修改时间：2026-09-27。
+# 修改目的：验证从机槽位捕获及双机相位同步在连续运动中收敛。
+# 修改内容：增加正反限幅捕获、主机新鲜心跳变速和移动目标点质量测试。
+# 修改时间：2026-09-27。
 # 修改目的：验证双机协同从实际位置生成轨道航点和对置速度。
 # 修改内容：覆盖固定半径、前视角、主从相位、READY 几何和无时钟 START。
 """V4 双机轨道导航的聚焦测试。"""
@@ -7,13 +10,14 @@ import math
 import unittest
 from types import SimpleNamespace
 
-from personal_hf2026.v3_simple_control import bearing_deg, ground_distance_m
+from personal_hf2026.v3_simple_control import bearing_deg, ground_distance_m, offset_position
 from personal_hf2026 import v4_control
 from personal_hf2026.v4_control import V4Control
 from personal_hf2026.v4_coordination import V4Coordinator
-from personal_hf2026.v4_flight import (formation_ready, follower_orbit_guidance,
-                                       master_orbit_guidance, orbit_point,
-                                       orbit_short_waypoint, wrap180)
+from personal_hf2026.v4_flight import (formation_ready, follower_capture_guidance,
+                                       follower_orbit_guidance, master_orbit_guidance,
+                                       orbit_point, orbit_short_waypoint,
+                                       pair_phase_geometry, phase_sync_speeds, wrap180)
 
 
 TARGET = (27.025, 125.020)
@@ -28,6 +32,13 @@ def observation(position):
                           heading_deg=0.0, gimbal_pan=0.0, gimbal_tilt=-45.0,
                           gimbal_fov_deg=48.0)
     return SimpleNamespace(self=own, comm_inbox=[])
+
+
+def move_toward(position, waypoint, distance_m):
+    distance = ground_distance_m(position, waypoint)
+    heading = math.radians(bearing_deg(position, waypoint))
+    step = min(distance_m, distance)
+    return offset_position(position, step * math.sin(heading), step * math.cos(heading))
 
 
 class OrbitGuidanceTest(unittest.TestCase):
@@ -61,12 +72,32 @@ class OrbitGuidanceTest(unittest.TestCase):
                                0.0, delta=0.2)
         self.assertAlmostEqual(debug["radius_m_actual"], 130.0, delta=0.2)
 
-    def test_follower_long_slot_is_opposite_actual_master(self):
-        _, _, debug = follower_orbit_guidance(TARGET, at(40.0), at(190.0))
-        self.assertAlmostEqual(wrap180(debug["desired_follower_phase_deg"] - 220.0),
-                               0.0, delta=0.2)
-        self.assertAlmostEqual(wrap180(bearing_deg(TARGET, debug["long_slot"])
-                                       - 220.0), 0.0, delta=0.2)
+    def test_capture_uses_opposite_slot_in_both_directions(self):
+        for own_phase, expected_phase, expected_step in ((60.0, 90.0, 30.0),
+                                                           (260.0, 230.0, -30.0)):
+            destination, speed, debug = follower_capture_guidance(
+                TARGET, at(0.0), at(own_phase, 650.0))
+            self.assertEqual(speed, 35.0)
+            self.assertAlmostEqual(debug["capture_phase_step_deg"], expected_step,
+                                   delta=0.2)
+            self.assertAlmostEqual(wrap180(bearing_deg(TARGET, destination)
+                                           - expected_phase), 0.0, delta=0.2)
+            self.assertAlmostEqual(ground_distance_m(TARGET, destination), 130.0,
+                                   delta=0.2)
+            self.assertGreater(ground_distance_m(destination, debug["long_slot"]), 1.0)
+
+    def test_capture_waypoint_radius_for_different_starting_radii(self):
+        for radius in (100.0, 300.0, 800.0):
+            destination, _, _ = follower_capture_guidance(
+                TARGET, at(0.0), at(60.0, radius))
+            self.assertAlmostEqual(ground_distance_m(TARGET, destination), 130.0,
+                                   delta=0.2)
+
+    def test_phase_sync_speeds(self):
+        self.assertEqual(phase_sync_speeds(100.0), (15.0, 35.0))
+        self.assertEqual(phase_sync_speeds(-100.0), (35.0, 15.0))
+        self.assertEqual(phase_sync_speeds(10.0), (25.0, 25.0))
+        self.assertEqual(phase_sync_speeds(20.0), (25.0, 25.0))
 
     def test_follower_behind_accelerates(self):
         _, speed, debug = follower_orbit_guidance(TARGET, at(40.0), at(180.0))
@@ -84,12 +115,46 @@ class OrbitGuidanceTest(unittest.TestCase):
             self.assertLessEqual(abs(debug["phase_error_deg"]), 20.0)
             self.assertEqual(speed, 25.0)
 
-    def test_follower_short_waypoint_does_not_equal_long_slot(self):
+    def test_follower_sync_waypoint_uses_own_phase(self):
         destination, _, debug = follower_orbit_guidance(TARGET, at(40.0), at(180.0))
-        self.assertGreater(ground_distance_m(destination, debug["long_slot"]), 1.0)
         self.assertEqual(destination, debug["short_waypoint"])
         self.assertAlmostEqual(ground_distance_m(TARGET, destination), 130.0,
                                delta=0.2)
+        self.assertEqual(debug["master_command_speed_mps"], 15.0)
+
+    def test_continuous_capture_and_sync_moving_target(self):
+        target = TARGET
+        master = orbit_point(target, 0.0)
+        follower = orbit_point(target, 60.0, 650.0)
+        ready_at = None
+        for tick in range(900):
+            target = offset_position(target, 1.0, 0.0)
+            m_dest, m_speed, _ = master_orbit_guidance(target, master)
+            f_dest, f_speed, _ = follower_capture_guidance(target, master, follower)
+            master = move_toward(master, m_dest, m_speed * 0.1)
+            follower = move_toward(follower, f_dest, f_speed * 0.1)
+            if formation_ready(target, master, follower):
+                ready_at = tick * 0.1
+                break
+        self.assertIsNotNone(ready_at)
+        geometry = pair_phase_geometry(target, master, follower)
+        self.assertLess(abs(geometry["follower_radius_m"] - 130.0), 40.0)
+        self.assertLess(abs(geometry["phase_error_deg"]), 30.0)
+
+        # 入圆后人为制造大相位误差，观察双机共同调速后的整体趋势。
+        follower = orbit_point(target, (geometry["desired_phase_deg"] - 80.0) % 360.0)
+        initial_error = abs(pair_phase_geometry(target, master, follower)["phase_error_deg"])
+        for _ in range(900):
+            target = offset_position(target, 1.0, 0.0)
+            phase_error = pair_phase_geometry(target, master, follower)["phase_error_deg"]
+            m_speed, f_speed = phase_sync_speeds(phase_error)
+            m_dest, _, _ = master_orbit_guidance(target, master, speed_mps=m_speed)
+            f_dest, _, _ = follower_orbit_guidance(target, master, follower)
+            master = move_toward(master, m_dest, m_speed * 0.1)
+            follower = move_toward(follower, f_dest, f_speed * 0.1)
+        final_error = abs(pair_phase_geometry(target, master, follower)["phase_error_deg"])
+        self.assertGreater(initial_error, 75.0)
+        self.assertLess(final_error, 40.0)
 
     def test_ready_requires_radial_and_phase_geometry(self):
         master = at(40.0)
@@ -167,8 +232,33 @@ class OrbitGuidanceTest(unittest.TestCase):
             long_slot = control.coop_guidance["long_slot"]
             self.assertAlmostEqual(flight.params["latitude"], short[0])
             self.assertAlmostEqual(flight.params["longitude"], short[1])
-            self.assertGreater(ground_distance_m(short, long_slot), 1.0)
-            self.assertEqual(flight.params["speed"], 35.0)
+            if state == "FOLLOWER_APPROACH":
+                self.assertEqual(control.coop_guidance["guidance_mode"], "CAPTURE_SLOT")
+                self.assertAlmostEqual(wrap180(bearing_deg(TARGET, short) - 210.0),
+                                       0.0, delta=0.2)
+                self.assertGreater(ground_distance_m(short, long_slot), 1.0)
+                self.assertEqual(flight.params["speed"], 35.0)
+            else:
+                self.assertEqual(control.coop_guidance["guidance_mode"], "ORBIT_SYNC")
+                self.assertEqual(flight.params["speed"], 35.0)
+
+    def test_master_sync_uses_fresh_follower_heartbeat(self):
+        control = V4Control("20001")
+        control.state = "COOP_TRACK"
+        control.coord.session = "session"
+        control.coord.master_uid = "20001"
+        control.coord.partner_uid = "20002"
+        control.rough.points.append(TARGET)
+        control.coord.peers["20002"] = (at(100.0), 10.0, "COOP_TRACK_F")
+        commands = control.step(observation(at(0.0)), 10.0)
+        flight = next(item for item in commands if item.verb == "set_destination")
+        self.assertEqual(flight.params["speed"], 15.0)
+        self.assertEqual(control.coop_guidance["follower_command_speed_mps"], 35.0)
+        self.assertEqual(control.coop_guidance["guidance_mode"], "ORBIT_SYNC")
+        control.coord.peers["20002"] = (at(100.0), 4.0, "COOP_TRACK_F")
+        commands = control.step(observation(at(0.0)), 10.1)
+        flight = next(item for item in commands if item.verb == "set_destination")
+        self.assertEqual(flight.params["speed"], 25.0)
 
 
 if __name__ == "__main__":
