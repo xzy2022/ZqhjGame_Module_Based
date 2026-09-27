@@ -1,3 +1,6 @@
+# 修改时间：2026-09-27。
+# 修改目的：让 START 仅表示协同状态开始，不再同步理论轨道时钟。
+# 修改内容：移除相位和起始时间字段，并将 START 编码为三段消息。
 # 修改时间：2026-09-26。
 # 修改目的：使双机协作人选遵守三机搜索的空间分区。
 # 修改内容：在原有心跳时效与 SEARCH 状态过滤之后按可选 UID 集合筛选候选人。
@@ -62,8 +65,6 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
-        self.orbit_phase_deg = None
-        self.orbit_start_s = None
         self.last_master_message_s = -1e9
         self.accepted = False
         self.ready = False
@@ -81,8 +82,6 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
-        self.orbit_phase_deg = None
-        self.orbit_start_s = None
         self.accepted = False
         self.ready = False
         self.started = False
@@ -159,12 +158,7 @@ class V4Coordinator:
                         events.append("TARGET")
                     except ValueError:
                         pass
-                elif kind == "START" and len(parts) == 5:
-                    try:
-                        self.orbit_phase_deg = _from36(parts[3]) / 10.0
-                        self.orbit_start_s = _from36(parts[4]) / 1000.0
-                    except ValueError:
-                        continue
+                elif kind == "START" and len(parts) == 3:
                     self.started = True
                     events.append("START")
                 elif kind in ("DONE", "CANCEL"):
@@ -172,7 +166,7 @@ class V4Coordinator:
         return events
 
     def queue_message(self, kind, now, *, position=None, target=None, state=None,
-                      phase_deg=None, start_s=None, period_s=0.0):
+                      period_s=0.0):
         if kind not in KINDS:
             raise ValueError(kind)
         if kind not in ("H",) and self.session is None:
@@ -191,9 +185,6 @@ class V4Coordinator:
                 parts.extend((self.partner_uid, *_position(target)))
             elif kind == "TARGET" and target is not None and position is not None:
                 parts.extend((*_position(target), *_position(position)))
-            elif kind == "START" and phase_deg is not None and start_s is not None:
-                parts.extend((_base36(round(float(phase_deg) * 10.0)),
-                              _base36(round(float(start_s) * 1000.0))))
         payload = "|".join(parts)
         if len(payload.encode("utf-8")) > 50:
             raise ValueError("Agent4 通信载荷超过官方 50 字节上限")
