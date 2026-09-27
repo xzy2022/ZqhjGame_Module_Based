@@ -1,3 +1,6 @@
+# 修改时间：2026-09-27。
+# 修改目的：让双机实际轨道几何和短期航点可从详细日志复核。
+# 修改内容：控制采样新增每拍的协同导航、相位、半径、速度和实际机间距。
 # 修改时间：2026-09-26。
 # 修改目的：让三机搜索与接管航线可从 Agent 采样日志复核。
 # 修改内容：每个控制采样记录规划器状态和本机实际位置。
@@ -91,6 +94,7 @@ class V4Trace:
             "rough_position": control.rough.position,
             "search_plan": control.route.trace_state,
             "own_position": control.last_own_position,
+            "coop_guidance": control.coop_guidance,
             "flight_command": [dict(verb=command.verb, params=command.params)
                                for command in commands if command.verb == "set_destination"],
         })
