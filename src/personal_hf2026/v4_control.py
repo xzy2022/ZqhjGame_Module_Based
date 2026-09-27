@@ -1,3 +1,6 @@
+# 修改时间：2026-09-27。
+# 修改目的：让双机协同飞行由实际位置和实际相位闭环引导。
+# 修改内容：统一主从轨道导航、按编队几何判断 READY，并记录每拍导航几何。
 # 修改时间：2026-09-26。
 # 修改目的：将 V4 搜索与协同接入三机分区 Z 字规划器。
 # 修改内容：传递心跳位置与协作角色，处理等待同伴和规划事件，并按固定分区筛选协作无人机。
@@ -48,8 +51,9 @@ from competition.sdk.core.commands import fly_to, point_gimbal, report_target, s
 from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
 from .v4_entity import EntityManager
-from .v4_flight import (CoordinatedSweepRoute, follower_ready, orbit_waypoint,
-                        solve_ground_aim, visual_waypoint)
+from .v4_flight import (CoordinatedSweepRoute, follower_orbit_guidance,
+                        formation_ready, ground_distance_m, master_orbit_guidance,
+                        orbit_point, solve_ground_aim, visual_waypoint)
 from .v4_gimbal import VisualGimbal
 from .v4_motion import SingleEntityMotion
 from .v4_position import RoughPosition
@@ -59,9 +63,15 @@ from .v3_simple_control import bearing_deg
 STATES = ("SEARCH", "VERIFY", "CALLING", "FOLLOWER_APPROACH", "COOP_TRACK")
 MEMBERS = ("20001", "20002", "20003")
 COOP_ORBIT_RADIUS_M = 130.0
-FOLLOWER_ENTRY_RADIUS_M = 180.0
-COOP_ORBIT_PERIOD_S = 60.0
-COOP_SPEED_MPS = 35.0
+# 比赛协同几何固定半径，不允许调节。
+COOP_SLOW_SPEED_MPS = 15.0
+COOP_BASE_SPEED_MPS = 25.0
+COOP_FAST_SPEED_MPS = 35.0
+COOP_LOOKAHEAD_S = 1.5
+COOP_ORBIT_DIRECTION = 1
+COOP_PHASE_SPEED_THRESHOLD_DEG = 20.0
+COOP_READY_RADIUS_TOL_M = 40.0
+COOP_READY_PHASE_TOL_DEG = 30.0
 SEARCH_CONFIRM_FRAMES = 3
 VERIFY_TIMEOUT_S = 2.0
 
@@ -85,13 +95,11 @@ class V4Control:
         self.completed_sessions = 0
         self._last_coverage_s = -1e9
         self._last_report_s = -1e9
-        self._entry_phase_deg = None
-        self._orbit_phase_deg = None
-        self._orbit_start_s = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         self._verify_started_s = None
         self.last_own_position = None
+        self.coop_guidance = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -120,9 +128,7 @@ class V4Control:
         self.rough.reset()
         self.gimbal.reset()
         self.last_visual_box = None
-        self._entry_phase_deg = None
-        self._orbit_phase_deg = None
-        self._orbit_start_s = None
+        self.coop_guidance = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         if self.state != "VERIFY":
@@ -228,18 +234,40 @@ class V4Control:
             return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
         return self.state
 
-    def _orbit_waypoint(self, target, now, role):
-        if self._orbit_phase_deg is None or self._orbit_start_s is None:
-            return None
-        phase = (self._orbit_phase_deg
-                 + 360.0 * (now - self._orbit_start_s) / COOP_ORBIT_PERIOD_S)
-        return orbit_waypoint(target, phase, role, COOP_ORBIT_RADIUS_M)
+    def _record_coop_guidance(self, role, target, own, destination, speed, master=None,
+                              pair_position=None):
+        # 长期对置点只供相位分析；真正的飞行命令始终使用短期导航点。
+        own_phase = bearing_deg(target, own)
+        master_phase = bearing_deg(target, master) if master is not None else own_phase
+        desired_phase = ((master_phase + 180.0) % 360.0
+                         if role == "FOLLOWER" else None)
+        phase_error = ((desired_phase - own_phase + 180.0) % 360.0 - 180.0
+                       if desired_phase is not None else None)
+        self.coop_guidance = {
+            "role": role,
+            "target": target,
+            "master_phase_deg": master_phase,
+            "own_phase_deg": own_phase,
+            "desired_phase_deg": desired_phase,
+            "phase_error_deg": phase_error,
+            "master_radius_m": ground_distance_m(target, master if master is not None else own),
+            "own_radius_m": ground_distance_m(target, own),
+            "long_slot": (orbit_point(target, desired_phase, COOP_ORBIT_RADIUS_M)
+                          if desired_phase is not None else None),
+            "short_waypoint": destination,
+            "commanded_speed_mps": speed,
+            "lookahead_deg": math.degrees(speed / COOP_ORBIT_RADIUS_M * COOP_LOOKAHEAD_S),
+            "nominal_period_s": 2.0 * math.pi * COOP_ORBIT_RADIUS_M / speed,
+            "pair_distance_m": (ground_distance_m(own, pair_position)
+                                if pair_position is not None else None),
+        }
 
     def step(self, obs, now):
         """消息跨 tick 生效；每拍只从本机观测生成本机 commands。"""
         now = float(now)
         own = self._own_position(obs)
         self.last_own_position = own
+        self.coop_guidance = None
         pose = {key: float(getattr(obs.self, key)) for key in (
             "lat", "lon", "alt", "heading_deg", "gimbal_pan", "gimbal_tilt",
             "gimbal_fov_deg")}
@@ -252,15 +280,9 @@ class V4Control:
             elif kind == "READY" and self.state == "CALLING":
                 target = self.rough.position
                 if target is not None:
-                    self._orbit_phase_deg = bearing_deg(target, own)
-                    self._orbit_start_s = now
                     self._state("COOP_TRACK", now, "follower_ready")
-                    self.coord.queue_message("START", now,
-                                             phase_deg=self._orbit_phase_deg,
-                                             start_s=self._orbit_start_s)
+                    self.coord.queue_message("START", now)
             elif kind == "START" and self.state == "FOLLOWER_APPROACH":
-                self._orbit_phase_deg = self.coord.orbit_phase_deg
-                self._orbit_start_s = self.coord.orbit_start_s
                 self._state("COOP_TRACK", now, "start_received")
             elif kind in ("DONE", "CANCEL") and self.coord.master_uid != self.uid:
                 self._return_search(now, kind.lower())
@@ -304,20 +326,26 @@ class V4Control:
             self.route.pause()
             if self.state == "CALLING" or (
                     self.state == "COOP_TRACK" and self.coord.master_uid == self.uid):
-                if self.last_visual_box is not None and self.last_visual_size is not None:
-                    if self.state == "COOP_TRACK" and self.rough.position is not None:
-                        target = self._orbit_waypoint(self.rough.position, now, "MASTER")
-                    elif self.state == "CALLING" and self.rough.position is not None:
-                        if self._entry_phase_deg is None:
-                            self._entry_phase_deg = bearing_deg(self.rough.position, own)
-                        target = orbit_waypoint(self.rough.position, self._entry_phase_deg,
-                                                "MASTER", COOP_ORBIT_RADIUS_M)
-                    else:
-                        target = visual_waypoint(self.last_visual_pose, self.last_visual_box,
-                                                 self.last_visual_size, origin_position=own)
-                    if target is not None:
-                        speed = COOP_SPEED_MPS if self.state in ("CALLING", "COOP_TRACK") else 22.0
-                        commands.append(fly_to(*target, alt=500.0, speed=speed,
+                target = self.rough.position
+                if target is not None:
+                    destination, speed, _guidance = master_orbit_guidance(
+                        target, own, radius_m=COOP_ORBIT_RADIUS_M,
+                        speed_mps=COOP_BASE_SPEED_MPS,
+                        lookahead_s=COOP_LOOKAHEAD_S,
+                        direction=COOP_ORBIT_DIRECTION)
+                    commands.append(fly_to(*destination, alt=500.0, speed=speed,
+                                           loiter_radius=0.0))
+                    peer = self.coord.peers.get(self.coord.partner_uid)
+                    pair_position = (peer[0] if peer is not None and now - peer[1] <= 5.0
+                                     else None)
+                    self._record_coop_guidance("MASTER", target, own, destination, speed,
+                                               pair_position=pair_position)
+                elif self.last_visual_box is not None and self.last_visual_size is not None:
+                    destination = visual_waypoint(self.last_visual_pose, self.last_visual_box,
+                                                  self.last_visual_size, origin_position=own)
+                    if destination is not None:
+                        commands.append(fly_to(*destination, alt=500.0,
+                                               speed=COOP_BASE_SPEED_MPS,
                                                loiter_radius=0.0))
                 if self.gimbal.command_pending:
                     commands.append(point_gimbal(self.gimbal.pan, self.gimbal.tilt))
@@ -325,22 +353,28 @@ class V4Control:
             else:
                 target = self.coord.target
                 if target is not None:
-                    if self.state == "COOP_TRACK":
-                        destination = self._orbit_waypoint(target, now, "FOLLOWER")
-                    else:
-                        master = self.coord.master_position
-                        phase = bearing_deg(target, master) if master is not None else None
-                        destination = (orbit_waypoint(target, phase, "FOLLOWER",
-                                                      FOLLOWER_ENTRY_RADIUS_M)
-                                       if phase is not None else None)
-                    if destination is not None:
-                        commands.append(fly_to(*destination, alt=500.0, speed=COOP_SPEED_MPS,
+                    master = self.coord.master_position
+                    if master is not None:
+                        destination, speed, _guidance = follower_orbit_guidance(
+                            target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
+                            base_speed_mps=COOP_BASE_SPEED_MPS,
+                            slow_speed_mps=COOP_SLOW_SPEED_MPS,
+                            fast_speed_mps=COOP_FAST_SPEED_MPS,
+                            phase_threshold_deg=COOP_PHASE_SPEED_THRESHOLD_DEG,
+                            lookahead_s=COOP_LOOKAHEAD_S,
+                            direction=COOP_ORBIT_DIRECTION)
+                        commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                                loiter_radius=0.0))
+                        self._record_coop_guidance("FOLLOWER", target, own, destination,
+                                                   speed, master=master,
+                                                   pair_position=master)
+                        if self.state == "FOLLOWER_APPROACH" and formation_ready(
+                                target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
+                                radius_tol_m=COOP_READY_RADIUS_TOL_M,
+                                phase_tol_deg=COOP_READY_PHASE_TOL_DEG):
+                            self.coord.queue_message("READY", now, period_s=1.0)
                     aim = solve_ground_aim(own, pose["alt"], pose["heading_deg"], target)
                     commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
-                    if self.state == "FOLLOWER_APPROACH" and follower_ready(
-                            own, self.coord.master_position, destination):
-                        self.coord.queue_message("READY", now, period_s=1.0)
             commands.append(set_gimbal_fov(48.0))
         if self.state == "CALLING":
             peer = self.coord.peers.get(self.coord.partner_uid)
@@ -366,8 +400,7 @@ class V4Control:
                 if now - self._last_report_s >= 1.0:
                     commands.append(report_target(*target))
                     self._last_report_s = now
-            self.coord.queue_message("START", now, phase_deg=self._orbit_phase_deg,
-                                     start_s=self._orbit_start_s, period_s=1.0)
+            self.coord.queue_message("START", now, period_s=1.0)
         elif self.state == "FOLLOWER_APPROACH":
             self.coord.queue_message("ACCEPT", now, period_s=1.0)
         command, kind = self.coord.emit(now)
