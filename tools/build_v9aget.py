@@ -1,4 +1,7 @@
 # 修改时间：2026-09-27。
+# 修改目的：防止提交版感知异常触发官方默认识别器并引入 Runner 真值。
+# 修改内容：入口感知捕获异常后明确返回空检测，保持像素输入边界。
+# 修改时间：2026-09-27。
 # 修改目的：把当前 V4 控制模块整理为赛题二的单文件提交入口。
 # 修改内容：按固定顺序合并所需定义，并接入仅使用本机照片的推理适配层。
 """生成 v9aget 单文件提交版；运行时不需要本脚本。"""
@@ -19,6 +22,9 @@ MODULES = (
 )
 
 HEADER = '''# 修改时间：2026-09-27。
+# 修改目的：防止感知异常触发官方默认识别器并引入 Runner 真值。
+# 修改内容：入口感知捕获异常后明确返回空检测，保持像素输入边界。
+# 修改时间：2026-09-27。
 # 修改目的：基于 V4 生成符合赛题二提交规范的独立单文件 Agent。
 # 修改内容：整合控制与推理逻辑，只消费本机照片、姿态、通信和允许的仿真时间。
 """v9aget：赛题二正式提交入口，三架无人机各实例独立控制。"""
@@ -264,9 +270,18 @@ class V9aget(CoopAgent):
         self._vision_key = object()
         self._last_snapshot = None
         self._consumed_frame_id = None
+        self._sensor_error = None
         self._t = 0.0
 
     def sensor(self, obs, dt):
+        try:
+            return self._sensor_pixels(obs, dt)
+        except Exception as exc:
+            # 官方 resolver 在异常时会走默认识别器；必须明确返回空检测。
+            self._sensor_error = repr(exc)
+            return []
+
+    def _sensor_pixels(self, obs, dt):
         score = getattr(getattr(obs, "briefing", None), "score_view", None)
         now = float(score.sim_time) if score is not None else self._t + max(0.0, float(dt))
         photo = obs.self.photo
