@@ -1,3 +1,6 @@
+# 修改时间：2026-09-28。
+# 修改目的：用等速圆周航点前视角修正正式协同的对置相位。
+# 修改内容：增加主机相位模式及双机前视角偏置，保持从机槽位捕获逻辑不变。
 # 修改时间：2026-09-27。
 # 修改目的：让从机捕获真实对置槽位，并让双机共同修正入圆后的相位误差。
 # 修改内容：增加限幅相位捕获航点、统一相位几何及双机三档速度函数。
@@ -33,6 +36,10 @@ from .visual_geometry import pixel_ray
 from .v3_simple_control import (SimpleCoopControl, bearing_deg, ground_distance_m,
                                 offset_position, solve_ground_aim)
 
+COOP_SYNC_SPEED_MPS = 25.0
+COOP_PHASE_LOOKAHEAD_BIAS_DEG = 10.0
+COOP_PHASE_THRESHOLD_DEG = 20.0
+
 
 def visual_waypoint(pose, box, image_size, distance_m=180.0, origin_position=None):
     center = ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
@@ -57,24 +64,47 @@ def orbit_point(target, phase_deg, radius_m=130.0):
 
 
 def orbit_short_waypoint(target, own_position, speed_mps, *, radius_m=130.0,
-                         lookahead_s=1.5, direction=1):
+                         lookahead_s=1.5, direction=1, lookahead_bias_deg=0.0):
     """按飞机实际相位生成前方短期航点，不依赖仿真时间。"""
     theta = bearing_deg(target, own_position)
-    lookahead_deg = math.degrees(float(speed_mps) / radius_m * lookahead_s)
-    waypoint = orbit_point(target, theta + direction * lookahead_deg, radius_m)
-    return waypoint, theta, lookahead_deg
+    base_lookahead_deg = math.degrees(float(speed_mps) / radius_m * lookahead_s)
+    effective_lookahead_deg = max(1.0, base_lookahead_deg + lookahead_bias_deg)
+    waypoint = orbit_point(target, theta + direction * effective_lookahead_deg, radius_m)
+    return waypoint, theta, base_lookahead_deg, effective_lookahead_deg
+
+
+def phase_sync_mode(phase_error_deg):
+    """正误差表示从机落后，模式仅由主机选择。"""
+    if phase_error_deg > COOP_PHASE_THRESHOLD_DEG:
+        return "F"
+    if phase_error_deg < -COOP_PHASE_THRESHOLD_DEG:
+        return "M"
+    return "N"
+
+
+def phase_lookahead_bias(sync_mode, role):
+    if sync_mode == "F":
+        return (COOP_PHASE_LOOKAHEAD_BIAS_DEG if role == "MASTER"
+                else -COOP_PHASE_LOOKAHEAD_BIAS_DEG)
+    if sync_mode == "M":
+        return (-COOP_PHASE_LOOKAHEAD_BIAS_DEG if role == "MASTER"
+                else COOP_PHASE_LOOKAHEAD_BIAS_DEG)
+    return 0.0
 
 
 def master_orbit_guidance(target, own, *, radius_m=130.0, speed_mps=25.0,
-                          lookahead_s=1.5, direction=1):
+                          lookahead_s=1.5, direction=1, sync_mode="N"):
     """主机持续沿自身实际相位前进。"""
-    destination, theta, lookahead_deg = orbit_short_waypoint(
+    destination, theta, base_lookahead_deg, effective_lookahead_deg = orbit_short_waypoint(
         target, own, speed_mps, radius_m=radius_m,
-        lookahead_s=lookahead_s, direction=direction)
+        lookahead_s=lookahead_s, direction=direction,
+        lookahead_bias_deg=phase_lookahead_bias(sync_mode, "MASTER"))
     debug = {
         "own_phase_deg": theta,
         "radius_m_actual": ground_distance_m(target, own),
-        "lookahead_deg": lookahead_deg,
+        "lookahead_deg": effective_lookahead_deg,
+        "base_lookahead_deg": base_lookahead_deg,
+        "effective_lookahead_deg": effective_lookahead_deg,
         "short_waypoint": destination,
     }
     return destination, speed_mps, debug
@@ -117,40 +147,29 @@ def follower_capture_guidance(target, master, own, *, radius_m=130.0,
     return destination, speed_mps, debug
 
 
-def phase_sync_speeds(phase_error_deg, *, slow_speed_mps=15.0,
-                      base_speed_mps=25.0, fast_speed_mps=35.0,
-                      threshold_deg=20.0):
-    """由对置相位误差同时选取主从三档速度。"""
-    if phase_error_deg > threshold_deg:
-        return slow_speed_mps, fast_speed_mps
-    if phase_error_deg < -threshold_deg:
-        return fast_speed_mps, slow_speed_mps
-    return base_speed_mps, base_speed_mps
-
-
 def follower_orbit_guidance(
-        target, master, own, *, radius_m=130.0, base_speed_mps=25.0,
-        slow_speed_mps=15.0, fast_speed_mps=35.0,
-        phase_threshold_deg=20.0, lookahead_s=1.5, direction=1):
-    """从机按主机实际对置相位选择速度，按自身实际相位生成航点。"""
+        target, master, own, *, radius_m=130.0, speed_mps=COOP_SYNC_SPEED_MPS,
+        sync_mode="N", lookahead_s=1.5, direction=1):
+    """从机执行主机下发的模式，按自身实际相位生成等速航点。"""
     geometry = pair_phase_geometry(target, master, own)
-    master_speed, speed = phase_sync_speeds(
-        geometry["phase_error_deg"], slow_speed_mps=slow_speed_mps,
-        base_speed_mps=base_speed_mps, fast_speed_mps=fast_speed_mps,
-        threshold_deg=phase_threshold_deg)
-    destination, _, lookahead_deg = orbit_short_waypoint(
-        target, own, speed, radius_m=radius_m,
-        lookahead_s=lookahead_s, direction=direction)
+    destination, _, base_lookahead_deg, effective_lookahead_deg = orbit_short_waypoint(
+        target, own, speed_mps, radius_m=radius_m,
+        lookahead_s=lookahead_s, direction=direction,
+        lookahead_bias_deg=phase_lookahead_bias(sync_mode, "FOLLOWER"))
     debug = {
         **geometry,
         "desired_follower_phase_deg": geometry["desired_phase_deg"],
-        "master_command_speed_mps": master_speed,
-        "follower_command_speed_mps": speed,
+        "sync_mode": sync_mode,
+        "local_phase_error_deg": geometry["phase_error_deg"],
+        "master_command_speed_mps": speed_mps,
+        "follower_command_speed_mps": speed_mps,
         "short_waypoint": destination,
-        "commanded_speed_mps": speed,
-        "lookahead_deg": lookahead_deg,
+        "commanded_speed_mps": speed_mps,
+        "lookahead_deg": effective_lookahead_deg,
+        "base_lookahead_deg": base_lookahead_deg,
+        "effective_lookahead_deg": effective_lookahead_deg,
     }
-    return destination, speed, debug
+    return destination, speed_mps, debug
 
 
 def formation_ready(target, master, own, *, radius_m=130.0,
@@ -167,5 +186,6 @@ def formation_ready(target, master, own, *, radius_m=130.0,
 __all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
            "solve_ground_aim", "visual_waypoint", "wrap180", "orbit_point",
            "orbit_short_waypoint", "master_orbit_guidance", "follower_capture_guidance",
-           "pair_phase_geometry", "phase_sync_speeds", "follower_orbit_guidance",
+           "pair_phase_geometry", "phase_sync_mode", "phase_lookahead_bias",
+           "follower_orbit_guidance",
            "formation_ready"]
