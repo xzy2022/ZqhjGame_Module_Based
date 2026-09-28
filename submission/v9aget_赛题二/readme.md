@@ -26,17 +26,19 @@ V4 默认配置本来使用 PyTorch `.pt`。曾有开发用的 TensorRT FP16 后
 
 ```powershell
 Set-Location 'D:\Workspace\00_MyRepo\red_m_competiton\hf2026-sim-windows'
-$env:PYTHONPATH = (Resolve-Path '..\codex_worktrees\v9aget-submission\submission\v9aget_赛题二').Path
 $pythonExe = (Resolve-Path '.\ZqhjGame_Module_Based\.venv-vehicleprop-integration\Scripts\python.exe').Path
-& $pythonExe -B -X utf8 -m competition run `
+& $pythonExe -B -X utf8 '.\ZqhjGame_Module_Based\tools\run_v9aget.py' `
   --scenario coop_decoy `
   --agent 'v9aget:V9aget' `
   --mode eval `
-  --photo-mode on `
+  --photo `
+  --seed 0 `
   --duration 600 `
   --output "..\output\v9aget\run_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 ```
 
-`ZqhjGame_Module_Based\run.cmd` 是开发仓库内部任务启动器，不直接加载这个提交入口。提交到 Linux 集群时，由评测方在同目录提供 `yolo.pt`、安装依赖并加载 `v9aget:V9aget`。
+本地适配入口保留原版官方 CLI 的 `--scenario`、`--agent`、`--mode`、`--photo`、`--seed`、`--scenario-json`、`--duration`、`--output` 调用方式：仅把 `--photo` 映射为当前 SDK 的 `--photo-mode on`，不传 `--photo` 时映射为 `off`。v9 需要照片输入，正常评估应传 `--photo`；它在 `sensor()` 内自行加载同目录的 `yolo.pt`，`--mode eval` 只传给官方 Runner。`--seed 0` 表示真目标随机选路；正整数种子控制真目标选路，诱饵仍独立随机。原版没有独立的天气参数；未传 `--scenario-json` 时官方 Runner 使用赛题二默认场景，其当前 `weather.type` 为 `Rain`。要更换天气，由组织方或本地 Runner 通过 `--scenario-json` 指定场景文件，Agent 不读取场景 JSON。
+
+`tools/run_v9aget.py` 仅用于本地兼容当前 SDK，**不放进提交包**。提交到 Linux 集群时由评测方安装依赖并加载同目录中的 `v9aget:V9aget`；如果评测方使用原版 CLI，直接传 `--photo`，无需适配器。`ZqhjGame_Module_Based\run.cmd` 是其他开发任务的启动器，不直接加载这个提交入口。
 
 本版只完成静态与接口检查，尚未进行仿真测评；最终成绩和 Linux 集群运行情况待验证。
