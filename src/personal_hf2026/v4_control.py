@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：固定第三机搜索分区并保护从机入场与 READY 的双机距离。
+# 修改内容：移除接管速度，入场复用心跳避碰，READY 增加当前与预测距离门槛。
+# 修改时间：2026-09-28。
 # 修改目的：让双机入场前后基于新鲜心跳提前分离并持续靠近粗目标。
 # 修改内容：接入距离预测、邀请保护、对称避让、远半径回归和每拍日志。
 # 修改时间：2026-09-28。
@@ -70,7 +73,6 @@ from .v4_flight import (CoordinatedSweepRoute, follower_capture_guidance,
                         COOP_TARGET_SOFT_MAX_RADIUS_M, COOP_TARGET_HARD_MAX_RADIUS_M,
                         formation_ready, ground_distance_m, master_orbit_guidance,
                         solve_ground_aim, visual_waypoint)
-from .coordinated_search import THIRD_PAIR_FOLLOW_SPEED_MPS
 from .v4_gimbal import VisualGimbal
 from .v4_motion import SingleEntityMotion
 from .v4_position import RoughPosition
@@ -87,6 +89,8 @@ COOP_ORBIT_DIRECTION = 1
 COOP_CAPTURE_SPEED_MPS = 35.0
 COOP_CAPTURE_MAX_PHASE_STEP_DEG = 30.0
 COOP_READY_RADIUS_TOL_M = 40.0
+COOP_READY_PAIR_DISTANCE_M = 230.0
+COOP_READY_PREDICTED_DISTANCE_M = 220.0
 PAIR_INVITE_MIN_DISTANCE_M = 250.0
 SEARCH_CONFIRM_FRAMES = 3
 VERIFY_TIMEOUT_S = 2.0
@@ -120,6 +124,7 @@ class V4Control:
         self._pair_distance_sample = None
         self._pair_distance_rate_mps = None
         self._safety_mode = "NORMAL"
+        self._pair_safety_session = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -153,6 +158,7 @@ class V4Control:
         self._pair_distance_sample = None
         self._pair_distance_rate_mps = None
         self._safety_mode = "NORMAL"
+        self._pair_safety_session = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         if self.state != "VERIFY":
@@ -258,10 +264,17 @@ class V4Control:
             return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
         return self.state
 
-    def _safety_guidance(self, target, own, pose, now, destination, speed, guidance):
+    def _safety_guidance(self, target, own, pose, now, destination, speed, guidance,
+                         *, allow_radius_rejoin=True):
         """只使用五秒内同伴心跳，不以 TARGET 携带的旧机位触发避让。"""
         peer_uid = (self.coord.partner_uid if self.coord.master_uid == self.uid
                     else self.coord.master_uid)
+        session_key = (self.coord.session, peer_uid)
+        if session_key != self._pair_safety_session:
+            self._pair_distance_sample = None
+            self._pair_distance_rate_mps = None
+            self._safety_mode = "NORMAL"
+            self._pair_safety_session = session_key
         peer = self.coord.peers.get(peer_uid)
         peer_age = now - peer[1] if peer is not None else None
         radius = ground_distance_m(target, own)
@@ -308,7 +321,8 @@ class V4Control:
                          "pair_distance_m": distance,
                          "pair_distance_rate_mps": self._pair_distance_rate_mps,
                          "predicted_pair_distance_m": predicted})
-        if mode == "NORMAL" and radius > COOP_TARGET_SOFT_MAX_RADIUS_M:
+        if (mode == "NORMAL" and allow_radius_rejoin
+                and radius > COOP_TARGET_SOFT_MAX_RADIUS_M):
             destination, rejoin = radius_rejoin_guidance(
                 target, own, pose["heading_deg"], radius_m=COOP_ORBIT_RADIUS_M,
                 direction=COOP_ORBIT_DIRECTION)
@@ -431,8 +445,7 @@ class V4Control:
             if target is not None:
                 heading = bearing_deg(own, target)
                 delta = abs((heading - pose["heading_deg"] + 180.0) % 360.0 - 180.0)
-                speed = (THIRD_PAIR_FOLLOW_SPEED_MPS if self.route.mode == "TAKEOVER"
-                         else 15.0 if delta > 45.0 else 22.0)
+                speed = 15.0 if delta > 45.0 else 22.0
                 commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
             if self.state == "SEARCH":
                 pan, tilt = self.search_gimbal.scan(
@@ -500,7 +513,11 @@ class V4Control:
                                 speed_mps=COOP_CAPTURE_SPEED_MPS,
                                 max_phase_step_deg=COOP_CAPTURE_MAX_PHASE_STEP_DEG)
                             master_speed, follower_speed = None, speed
-                            mode = "CAPTURE_SLOT"
+                            destination, speed, guidance = self._safety_guidance(
+                                target, own, pose, now, destination, speed, guidance,
+                                allow_radius_rejoin=False)
+                            mode = ("CAPTURE_SLOT" if guidance["safety_mode"] == "NORMAL"
+                                    else "PRE_ENTRY_" + guidance["safety_mode"])
                         else:
                             destination, speed, guidance = follower_orbit_guidance(
                                 target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
@@ -521,15 +538,27 @@ class V4Control:
                             "FOLLOWER", mode, target, own, destination, speed,
                             master=master, follower=own, guidance=guidance,
                             master_speed=master_speed, follower_speed=follower_speed)
-                        if self.state == "FOLLOWER_APPROACH" and formation_ready(
-                                target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
-                                radius_tol_m=COOP_READY_RADIUS_TOL_M):
+                        peer = self.coord.peers.get(self.coord.master_uid)
+                        fresh_master = (peer[0] if peer is not None
+                                        and 0.0 <= now - peer[1] <= 5.0 else None)
+                        if (self.state == "FOLLOWER_APPROACH"
+                                and fresh_master is not None
+                                and formation_ready(
+                                    target, fresh_master, own,
+                                    radius_m=COOP_ORBIT_RADIUS_M,
+                                    radius_tol_m=COOP_READY_RADIUS_TOL_M,
+                                    pair_distance_min_m=COOP_READY_PAIR_DISTANCE_M)
+                                and guidance["predicted_pair_distance_m"] is not None
+                                and guidance["predicted_pair_distance_m"]
+                                    >= COOP_READY_PREDICTED_DISTANCE_M):
                             if self._ready_logged_session != self.coord.session:
-                                geometry = pair_phase_geometry(target, master, own)
+                                geometry = pair_phase_geometry(target, fresh_master, own)
                                 self._event("formation_ready", now, **{
                                     key: geometry[key] for key in (
                                         "master_radius_m", "follower_radius_m",
-                                        "pair_distance_m", "phase_error_deg")})
+                                        "pair_distance_m", "phase_error_deg")},
+                                            pair_distance_rate_mps=guidance["pair_distance_rate_mps"],
+                                            predicted_pair_distance_m=guidance["predicted_pair_distance_m"])
                                 self._ready_logged_session = self.coord.session
                             self.coord.queue_message("READY", now, period_s=1.0)
                     aim = solve_ground_aim(own, pose["alt"], pose["heading_deg"], target)

@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：验证从机入场避碰和有距离裕度的 READY 条件。
+# 修改内容：覆盖正常、分离、紧急、恢复、预测门槛及不同会话的距离历史。
+# 修改时间：2026-09-28。
 # 修改目的：验证双机入场前后的距离预测、分离方向、滞回及相位诊断隔离。
 # 修改内容：替换旧相位断言并覆盖邀请距离、入场保护、安全速度、远半径回归、心跳和既有状态链。
 # 修改时间：2026-09-28。
@@ -170,17 +173,19 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertIn(pair_safety_mode("NORMAL", geometry["pair_distance_m"], 0.0)[0],
                       ("NORMAL", "SEPARATE", "EMERGENCY"))
 
-    def test_ready_requires_radial_geometry_only(self):
+    def test_ready_requires_radial_and_pair_distance(self):
         master = at(40.0)
         follower = at(220.0)
-        for error in (0.0, 60.0, 120.0, 179.0, -60.0, -120.0):
-            self.assertTrue(formation_ready(TARGET, master, at(220.0 - error)))
-        self.assertFalse(formation_ready(TARGET, at(40.0, 180.0), follower))
+        self.assertTrue(formation_ready(TARGET, master, follower))
+        self.assertFalse(formation_ready(TARGET, master, at(100.0)))
+        self.assertFalse(formation_ready(TARGET, at(0.0), at(108.0)))
         self.assertFalse(formation_ready(TARGET, master, at(220.0, 180.0)))
+        self.assertTrue(formation_ready(TARGET, at(0.0, 170.0), at(130.0, 170.0)))
+        self.assertFalse(formation_ready(TARGET, at(40.0, 180.0), follower))
 
         for master_position, own_position, expected in (
                 (master, follower, True),
-                (master, at(100.0), True),
+                (master, at(100.0), False),
                 (at(40.0, 180.0), follower, False),
                 (master, at(220.0, 180.0), False)):
             control = V4Control("20002")
@@ -190,6 +195,7 @@ class OrbitGuidanceTest(unittest.TestCase):
             control.coord.target = TARGET
             control.coord.master_position = master_position
             control.coord.last_master_message_s = 10.0
+            control.coord.peers["20001"] = (master_position, 10.0, "CALLING")
             control.step(observation(own_position), 10.0)
             self.assertEqual("READY" in control.coord.last_queued, expected)
 
@@ -205,14 +211,15 @@ class OrbitGuidanceTest(unittest.TestCase):
         master.coord.accepted = True
         master.rough.points.append(TARGET)
         follower.coord.target = TARGET
-        follower.coord.master_position = at(40.0)
+        follower.coord.master_position = at(0.0, 170.0)
         follower.coord.last_master_message_s = 10.0
+        follower.coord.peers["20001"] = (at(0.0, 170.0), 10.0, "CALLING")
 
-        follower_obs = observation(at(100.0))
+        follower_obs = observation(at(130.0, 170.0))
         follower_commands = follower.step(follower_obs, 10.0)
         ready_event = next(event for event in follower.pop_events()
                            if event["event"] == "formation_ready")
-        self.assertAlmostEqual(ready_event["phase_error_deg"], 120.0, delta=0.2)
+        self.assertAlmostEqual(ready_event["phase_error_deg"], 50.0, delta=0.2)
         for key in ("master_radius_m", "follower_radius_m", "pair_distance_m"):
             self.assertIsNotNone(ready_event[key])
         self.assertEqual(follower.state, "FOLLOWER_APPROACH")
@@ -220,7 +227,7 @@ class OrbitGuidanceTest(unittest.TestCase):
                      if command.verb == "comm.broadcast")
         self.assertEqual(ready.params["payload"], "V4|READY|session")
 
-        master_obs = observation(at(40.0))
+        master_obs = observation(at(0.0, 170.0))
         master_obs.comm_inbox = [SimpleNamespace(
             sender_uid="20002", payload="V4|READY|session", recv_time=10.1)]
         master_commands = master.step(master_obs, 10.1)
@@ -494,6 +501,77 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertGreater(sum(a * b for a, b in zip(
             master.coop_guidance["desired_direction"],
             master.coop_guidance["away_from_peer"])), 0.0)
+
+    def test_follower_approach_safety_override_and_recovery(self):
+        follower = V4Control("20002")
+        follower.state = "FOLLOWER_APPROACH"
+        follower.coord.session = "session"
+        follower.coord.master_uid = "20001"
+        follower.coord.target = TARGET
+        follower.coord.master_position = at(180.0, 500.0)
+        follower.coord.last_master_message_s = 10.0
+        own = at(0.0)
+        for now, peer_radius, expected in (
+                (10.0, 170.0, "CAPTURE_SLOT"),
+                (20.0, 100.0, "PRE_ENTRY_SEPARATE"),
+                (21.0, 80.0, "PRE_ENTRY_EMERGENCY"),
+                (22.0, 130.0, "CAPTURE_SLOT")):
+            follower.coord.last_master_message_s = now
+            follower.coord.peers["20001"] = (at(180.0, peer_radius), now, "CALLING")
+            commands = follower.step(observation(own), now)
+            guidance = follower.coop_guidance
+            self.assertEqual(guidance["guidance_mode"], expected)
+            self.assertFalse(guidance["safety_peer_stale"])
+            self.assertIsNotNone(guidance["pair_distance_m"])
+            self.assertIsNotNone(guidance["predicted_pair_distance_m"])
+            self.assertIsNotNone(guidance["rough_radius_m"])
+            self.assertIsNotNone(guidance["desired_heading_deg"])
+            self.assertIsNotNone(guidance["heading_error_deg"])
+            flight = next(item for item in commands if item.verb == "set_destination")
+            self.assertEqual(flight.params["speed"], guidance["commanded_speed_mps"])
+            if expected == "CAPTURE_SLOT":
+                self.assertEqual(flight.params["speed"], 35.0)
+            else:
+                self.assertGreater(sum(a * b for a, b in zip(
+                    guidance["desired_direction"], guidance["away_from_peer"])), 0.0)
+
+    def test_ready_prediction_and_session_reset(self):
+        follower = V4Control("20002")
+        follower.state = "FOLLOWER_APPROACH"
+        follower.coord.session = "first"
+        follower.coord.master_uid = "20001"
+        follower.coord.target = TARGET
+        follower.coord.master_position = at(180.0)
+        follower.coord.last_master_message_s = 10.0
+        follower.coord.peers["20001"] = (at(180.0, 127.5), 9.0, "CALLING")
+        follower.step(observation(at(0.0)), 9.0)
+        follower.coord.peers["20001"] = (at(180.0, 110.0), 10.0, "CALLING")
+        follower.step(observation(at(0.0)), 10.0)
+        self.assertGreaterEqual(follower.coop_guidance["pair_distance_m"], 230.0)
+        self.assertLess(follower.coop_guidance["predicted_pair_distance_m"], 220.0)
+        self.assertEqual(follower.coord.last_queued.get("READY"), 9.0)
+        follower.coord.session = "second"
+        follower.coord.peers["20001"] = (at(180.0, 130.0), 11.0, "CALLING")
+        follower.step(observation(at(0.0)), 11.0)
+        self.assertIsNone(follower.coop_guidance["pair_distance_rate_mps"])
+        self.assertIn("READY", follower.coord.last_queued)
+
+    def test_follower_safety_ignores_old_target_position_without_heartbeat(self):
+        follower = V4Control("20002")
+        follower.state = "FOLLOWER_APPROACH"
+        follower.coord.session = "session"
+        follower.coord.master_uid = "20001"
+        follower.coord.target = TARGET
+        follower.coord.master_position = at(180.0, 80.0)
+        follower.coord.last_master_message_s = 10.0
+        follower.step(observation(at(0.0)), 10.0)
+        self.assertEqual(follower.coop_guidance["guidance_mode"], "CAPTURE_SLOT")
+        self.assertTrue(follower.coop_guidance["safety_peer_stale"])
+        self.assertNotIn("READY", follower.coord.last_queued)
+        follower.coord.peers["20001"] = (at(180.0, 80.0), 10.1, "CALLING")
+        follower.step(observation(at(0.0)), 10.1)
+        self.assertEqual(follower.coop_guidance["guidance_mode"],
+                         "PRE_ENTRY_EMERGENCY")
 
     def test_invite_excludes_near_search_partner(self):
         coordinator = V4Coordinator("20001")
