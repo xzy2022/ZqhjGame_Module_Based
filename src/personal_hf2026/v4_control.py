@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：让双机半径就位即可启动正式协同相位同步。
+# 修改内容：移除 READY 相位门槛，记录首次就位几何及双方前视角实际配置。
+# 修改时间：2026-09-28。
 # 修改目的：让第三机固定35米每秒跟随双机，并让正式轨道协同等速同步相位。
 # 修改内容：接入接管速度、主机相位模式、心跳带宽及 TARGET 模式传递和导引日志。
 # 修改时间：2026-09-27。
@@ -58,7 +61,8 @@ from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
 from .v4_entity import EntityManager
 from .v4_flight import (CoordinatedSweepRoute, follower_capture_guidance,
-                        follower_orbit_guidance, pair_phase_geometry, phase_sync_mode,
+                        follower_orbit_guidance, pair_phase_geometry, phase_lookahead_bias,
+                        phase_sync_mode,
                         formation_ready, ground_distance_m, master_orbit_guidance,
                         solve_ground_aim, visual_waypoint)
 from .coordinated_search import THIRD_PAIR_FOLLOW_SPEED_MPS
@@ -78,7 +82,6 @@ COOP_ORBIT_DIRECTION = 1
 COOP_CAPTURE_SPEED_MPS = 35.0
 COOP_CAPTURE_MAX_PHASE_STEP_DEG = 30.0
 COOP_READY_RADIUS_TOL_M = 40.0
-COOP_READY_PHASE_TOL_DEG = 30.0
 SEARCH_CONFIRM_FRAMES = 3
 VERIFY_TIMEOUT_S = 2.0
 
@@ -107,6 +110,7 @@ class V4Control:
         self._verify_started_s = None
         self.last_own_position = None
         self.coop_guidance = None
+        self._ready_logged_session = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -136,6 +140,7 @@ class V4Control:
         self.gimbal.reset()
         self.last_visual_box = None
         self.coop_guidance = None
+        self._ready_logged_session = None
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         if self.state != "VERIFY":
@@ -365,7 +370,7 @@ class V4Control:
                     guidance["master_effective_lookahead_deg"] = guidance["effective_lookahead_deg"]
                     guidance["follower_effective_lookahead_deg"] = (
                         math.degrees(COOP_SYNC_SPEED_MPS / COOP_ORBIT_RADIUS_M * COOP_LOOKAHEAD_S)
-                        - (guidance["effective_lookahead_deg"] - guidance["base_lookahead_deg"]))
+                        + phase_lookahead_bias(self.coord.sync_mode, "FOLLOWER"))
                     commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                            loiter_radius=0.0))
                     self._record_coop_guidance(
@@ -403,8 +408,8 @@ class V4Control:
                                 lookahead_s=COOP_LOOKAHEAD_S,
                                 direction=COOP_ORBIT_DIRECTION)
                             guidance["master_effective_lookahead_deg"] = (
-                                2 * guidance["base_lookahead_deg"]
-                                - guidance["effective_lookahead_deg"])
+                                guidance["base_lookahead_deg"]
+                                + phase_lookahead_bias(self.coord.sync_mode, "MASTER"))
                             guidance["follower_effective_lookahead_deg"] = guidance["effective_lookahead_deg"]
                             master_speed = guidance["master_command_speed_mps"]
                             follower_speed = guidance["follower_command_speed_mps"]
@@ -417,8 +422,14 @@ class V4Control:
                             master_speed=master_speed, follower_speed=follower_speed)
                         if self.state == "FOLLOWER_APPROACH" and formation_ready(
                                 target, master, own, radius_m=COOP_ORBIT_RADIUS_M,
-                                radius_tol_m=COOP_READY_RADIUS_TOL_M,
-                                phase_tol_deg=COOP_READY_PHASE_TOL_DEG):
+                                radius_tol_m=COOP_READY_RADIUS_TOL_M):
+                            if self._ready_logged_session != self.coord.session:
+                                geometry = pair_phase_geometry(target, master, own)
+                                self._event("formation_ready", now, **{
+                                    key: geometry[key] for key in (
+                                        "master_radius_m", "follower_radius_m",
+                                        "pair_distance_m", "phase_error_deg")})
+                                self._ready_logged_session = self.coord.session
                             self.coord.queue_message("READY", now, period_s=1.0)
                     aim = solve_ground_aim(own, pose["alt"], pose["heading_deg"], target)
                     commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))

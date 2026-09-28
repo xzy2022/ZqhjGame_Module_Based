@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：验证径向 READY 状态链和反向前视角相位候选。
+# 修改内容：覆盖就位与释放，并校验 B 方向的施加对象和等速命令。
+# 修改时间：2026-09-28。
 # 修改目的：验证主机模式广播和双机等速前视角相位同步。
 # 修改内容：覆盖 N/F/M 前视角、固定25米每秒、目标载荷及正反相位动态趋势。
 # 修改时间：2026-09-27。
@@ -109,21 +112,21 @@ class OrbitGuidanceTest(unittest.TestCase):
             m_angle = master["effective_lookahead_deg"]
             f_angle = follower["effective_lookahead_deg"]
             self.assertEqual((m_angle > f_angle) - (m_angle < f_angle),
-                             {"F": 1, "M": -1, "N": 0}[mode])
+                             {"F": -1, "M": 1, "N": 0}[mode])
 
-    def test_follower_behind_uses_smaller_lookahead(self):
+    def test_follower_behind_uses_larger_lookahead(self):
         _, speed, debug = follower_orbit_guidance(
             TARGET, at(40.0), at(180.0), sync_mode="F")
         self.assertGreater(debug["phase_error_deg"], 20.0)
         self.assertEqual(speed, 25.0)
-        self.assertLess(debug["effective_lookahead_deg"], debug["base_lookahead_deg"])
+        self.assertGreater(debug["effective_lookahead_deg"], debug["base_lookahead_deg"])
 
-    def test_follower_ahead_uses_larger_lookahead(self):
+    def test_follower_ahead_uses_smaller_lookahead(self):
         _, speed, debug = follower_orbit_guidance(
             TARGET, at(40.0), at(260.0), sync_mode="M")
         self.assertLess(debug["phase_error_deg"], -20.0)
         self.assertEqual(speed, 25.0)
-        self.assertGreater(debug["effective_lookahead_deg"], debug["base_lookahead_deg"])
+        self.assertLess(debug["effective_lookahead_deg"], debug["base_lookahead_deg"])
 
     def test_follower_near_opposite_uses_base_speed(self):
         for phase in (205.0, 220.0, 235.0):
@@ -155,10 +158,11 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertIsNotNone(ready_at)
         geometry = pair_phase_geometry(target, master, follower)
         self.assertLess(abs(geometry["follower_radius_m"] - 130.0), 40.0)
-        self.assertLess(abs(geometry["phase_error_deg"]), 30.0)
+        self.assertLess(abs(geometry["master_radius_m"] - 130.0), 40.0)
 
-        # 移动目标正反各60度，检查误差的整体趋势。
-        for signed_error in (60.0, -60.0):
+        # 移动目标正反多组初值，检查最终误差而不是一段均值。
+        for signed_error in (30.0, 60.0, 100.0, 120.0, 140.0,
+                             -30.0, -60.0, -100.0, -120.0, -140.0):
             moving_target = TARGET
             moving_master = at(0.0)
             moving_follower = orbit_point(
@@ -166,7 +170,7 @@ class OrbitGuidanceTest(unittest.TestCase):
             initial_error = abs(pair_phase_geometry(
                 moving_target, moving_master, moving_follower)["phase_error_deg"])
             errors = []
-            for _ in range(200):
+            for _ in range(1200):
                 moving_target = offset_position(moving_target, 1.0, 0.0)
                 phase_error = pair_phase_geometry(
                     moving_target, moving_master, moving_follower)["phase_error_deg"]
@@ -180,21 +184,22 @@ class OrbitGuidanceTest(unittest.TestCase):
                 moving_follower = move_toward(moving_follower, f_dest, 2.5)
                 errors.append(abs(pair_phase_geometry(
                     moving_target, moving_master, moving_follower)["phase_error_deg"]))
-            self.assertLess(sum(errors[-100:]) / 100.0, initial_error)
+            self.assertLess(errors[-1], initial_error)
+            self.assertLess(errors[-1], 35.0)
 
-    def test_ready_requires_radial_and_phase_geometry(self):
+    def test_ready_requires_radial_geometry_only(self):
         master = at(40.0)
         follower = at(220.0)
-        self.assertTrue(formation_ready(TARGET, master, follower))
+        for error in (0.0, 60.0, 120.0, 179.0, -60.0, -120.0):
+            self.assertTrue(formation_ready(TARGET, master, at(220.0 - error)))
         self.assertFalse(formation_ready(TARGET, at(40.0, 180.0), follower))
         self.assertFalse(formation_ready(TARGET, master, at(220.0, 180.0)))
-        self.assertFalse(formation_ready(TARGET, master, at(170.0)))
 
         for master_position, own_position, expected in (
                 (master, follower, True),
+                (master, at(100.0), True),
                 (at(40.0, 180.0), follower, False),
-                (master, at(220.0, 180.0), False),
-                (master, at(170.0), False)):
+                (master, at(220.0, 180.0), False)):
             control = V4Control("20002")
             control.state = "FOLLOWER_APPROACH"
             control.coord.session = "session"
@@ -204,6 +209,78 @@ class OrbitGuidanceTest(unittest.TestCase):
             control.coord.last_master_message_s = 10.0
             control.step(observation(own_position), 10.0)
             self.assertEqual("READY" in control.coord.last_queued, expected)
+
+    def test_large_phase_ready_starts_coop_and_report(self):
+        master = V4Control("20001")
+        follower = V4Control("20002")
+        master.state = "CALLING"
+        follower.state = "FOLLOWER_APPROACH"
+        for control in (master, follower):
+            control.coord.session = "session"
+            control.coord.master_uid = "20001"
+        master.coord.partner_uid = "20002"
+        master.coord.accepted = True
+        master.rough.points.append(TARGET)
+        follower.coord.target = TARGET
+        follower.coord.master_position = at(40.0)
+        follower.coord.last_master_message_s = 10.0
+
+        follower_obs = observation(at(100.0))
+        follower_commands = follower.step(follower_obs, 10.0)
+        ready_event = next(event for event in follower.pop_events()
+                           if event["event"] == "formation_ready")
+        self.assertAlmostEqual(ready_event["phase_error_deg"], 120.0, delta=0.2)
+        for key in ("master_radius_m", "follower_radius_m", "pair_distance_m"):
+            self.assertIsNotNone(ready_event[key])
+        self.assertEqual(follower.state, "FOLLOWER_APPROACH")
+        ready = next(command for command in follower_commands
+                     if command.verb == "comm.broadcast")
+        self.assertEqual(ready.params["payload"], "V4|READY|session")
+
+        master_obs = observation(at(40.0))
+        master_obs.comm_inbox = [SimpleNamespace(
+            sender_uid="20002", payload="V4|READY|session", recv_time=10.1)]
+        master_commands = master.step(master_obs, 10.1)
+        self.assertEqual(master.state, "COOP_TRACK")
+        self.assertTrue(any(command.verb == "agent.report" for command in master_commands))
+        self.assertTrue(any(command.verb == "comm.broadcast" and
+                            command.params["payload"] == "V4|START|session"
+                            for command in master_commands))
+
+        follower_obs.comm_inbox = [SimpleNamespace(
+            sender_uid="20001", payload="V4|START|session", recv_time=10.2)]
+        follower.step(follower_obs, 10.2)
+        self.assertEqual(follower.state, "COOP_TRACK")
+
+    def test_coop_track_static_completion_returns_to_search(self):
+        control = V4Control("20001")
+        control.state = "COOP_TRACK"
+        control.coord.session = "session"
+        control.coord.master_uid = "20001"
+        control.motion.decision = "MOVING"
+        entity = SimpleNamespace(entity_id="uav_20001_entity_1",
+                                 bbox_xyxy=(100, 100, 130, 130), visible=True,
+                                 missing_s=0.0, observed_frames=5)
+        control.entity.update = lambda objects, size, now: (entity, None)
+        control.gimbal.update = lambda *args: None
+        control.rough.update = lambda *args: None
+
+        def mark_static(*args):
+            control.motion.decision = "STATIC"
+            return {}
+
+        control.motion.update = mark_static
+        snapshot = SimpleNamespace(
+            source_sim_time=20.0, frame_id="static-frame", error=None,
+            effective_yolo_objects=[SimpleNamespace(bbox_xyxy=entity.bbox_xyxy)],
+            raw_yolo_objects=[], image_size=(640, 480), source_pose={}, image_bgr=None)
+        control.consume_visual(snapshot)
+        self.assertEqual(control.completed_sessions, 1)
+        self.assertEqual(control.state, "SEARCH")
+        self.assertIn("DONE", [kind for kind, _ in control.coord.queue])
+        self.assertTrue(any(event["event"] == "state_changed" and
+                            event["reason"] == "motion_static_completed"
+                            for event in control.pop_events()))
 
     def test_start_has_no_phase_clock(self):
         master = V4Coordinator("20001")
@@ -281,8 +358,8 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertEqual(flight.params["speed"], 25.0)
         self.assertEqual(control.coop_guidance["follower_command_speed_mps"], 25.0)
         self.assertEqual(control.coop_guidance["sync_mode"], "F")
-        self.assertGreater(control.coop_guidance["master_effective_lookahead_deg"],
-                           control.coop_guidance["follower_effective_lookahead_deg"])
+        self.assertLess(control.coop_guidance["master_effective_lookahead_deg"],
+                        control.coop_guidance["follower_effective_lookahead_deg"])
         self.assertEqual(control.coop_guidance["guidance_mode"], "ORBIT_SYNC")
         control.coord.peers["20002"] = (at(100.0), 4.0, "COOP_TRACK_F")
         commands = control.step(observation(at(0.0)), 10.1)
@@ -317,8 +394,8 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertEqual(flight.params["speed"], 25.0)
         self.assertEqual(control.coop_guidance["sync_mode"], "F")
         self.assertLess(control.coop_guidance["local_phase_error_deg"], -20.0)
-        self.assertLess(control.coop_guidance["follower_effective_lookahead_deg"],
-                        control.coop_guidance["master_effective_lookahead_deg"])
+        self.assertGreater(control.coop_guidance["follower_effective_lookahead_deg"],
+                           control.coop_guidance["master_effective_lookahead_deg"])
 
     def test_coop_track_keeps_master_heartbeats_available(self):
         control = V4Control("20001")
