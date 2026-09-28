@@ -1,9 +1,12 @@
 # 修改时间：2026-09-28。
+# 修改目的：分别审计从机入场安全距离和固定分区搜索。
+# 修改内容：增加入场安全模式及距离统计，删除废弃接管采样字段。
+# 修改时间：2026-09-28。
 # 修改目的：从正式协同逐拍日志量化安全间距、目标半径和视觉可见性。
 # 修改内容：汇总安全状态、同时和单侧入场距离、分离事件及云台角度范围。
 # 修改时间：2026-09-26。
 # 修改目的：从紧凑日志直接量化三机搜索及接管的出现次数。
-# 修改内容：按规划器模式统计控制采样并单列 TAKEOVER 采样数。
+# 修改内容：按规划器模式统计控制采样。
 # 修改时间：2026-09-24。
 # 修改目的：让 Agent4 的紧凑运行轨迹可直接离线复核。
 # 修改内容：按业务事件、状态和视觉诊断干预汇总审计结果。
@@ -47,6 +50,8 @@ def analyze_run(output):
     samples = 0
     safety_samples = {mode: [] for mode in ("NORMAL", "SEPARATE", "EMERGENCY")}
     safety_distances = []
+    approach_distances = []
+    approach_modes = Counter()
     safety_radii = []
     radius_rejoin_samples = 0
     safety_episodes = []
@@ -71,14 +76,21 @@ def analyze_run(output):
             if row.get("own_position") is not None:
                 all_positions.setdefault(row["uid"], []).append(
                     (row["time"], row["own_position"]))
+            if row.get("state") == "FOLLOWER_APPROACH":
+                guidance = row.get("coop_guidance") or {}
+                approach_modes[guidance.get("guidance_mode", "unknown")] += 1
+                distance = guidance.get("pair_distance_m")
+                if distance is not None and not guidance.get("safety_peer_stale"):
+                    approach_distances.append(distance)
             if row.get("state") != "COOP_TRACK" and row["uid"] in active_episode:
                 episode = active_episode.pop(row["uid"])
                 episode["exit_time_s"] = row["time"]
                 episode["duration_s"] = row["time"] - episode["entry_time_s"]
                 episode["ended_without_normal"] = True
                 safety_episodes.append(episode)
-            if row.get("state") == "COOP_TRACK":
+            if row.get("state") in ("CALLING", "FOLLOWER_APPROACH", "COOP_TRACK"):
                 track_rows.append(row)
+            if row.get("state") == "COOP_TRACK":
                 guidance = row.get("coop_guidance") or {}
                 radius_rejoin_samples += int(bool(guidance.get("radius_rejoin")))
                 mode = guidance.get("safety_mode")
@@ -153,10 +165,14 @@ def analyze_run(output):
     result = {"schema_version": 1, "event_counts": dict(events),
               "state_sample_counts": dict(states), "control_samples": samples,
               "search_mode_sample_counts": dict(search_modes),
-              "takeover_samples": search_modes["TAKEOVER"],
               "first_time_s": first_time, "last_time_s": last_time,
               "prediction_frames": predictions, "diagnostic_changed_frames": changed}
     result["pair_safety"] = {
+        "follower_approach_distance_m": {
+            "minimum": min(approach_distances, default=None),
+            "p10": _percentile(approach_distances, 0.1),
+            "below_200_samples": sum(value < 200.0 for value in approach_distances),
+            "guidance_mode_sample_counts": dict(approach_modes)},
         "pair_distance_m": {"minimum": min(safety_distances, default=None),
                             "p10": _percentile(safety_distances, 0.1),
                             "median": _percentile(safety_distances, 0.5),

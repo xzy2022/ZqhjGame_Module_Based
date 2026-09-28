@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：避免双机径向就位但间距不足时提前进入正式协同。
+# 修改内容：READY 几何增加230米当前双机距离门槛，仍不检查相位。
+# 修改时间：2026-09-28。
 # 修改目的：让正式双机绕飞按距离风险临时分离而不再追逐相位。
 # 修改内容：增加距离状态、避让方向、远半径回归方向与按转向角选择速度的纯几何导引。
 # 修改时间：2026-09-28。
@@ -285,13 +288,14 @@ def radius_rejoin_guidance(target, own, heading_deg, *, radius_m=130.0,
 
 
 def formation_ready(target, master, own, *, radius_m=130.0,
-                    radius_tol_m=40.0):
-    """双机均已进入正式协同轨道允许的径向范围。"""
+                    radius_tol_m=40.0, pair_distance_min_m=230.0):
+    """双机径向就位且当前距离留有安全裕度。"""
     if master is None or own is None or target is None:
         return False
     geometry = pair_phase_geometry(target, master, own)
     return (abs(geometry["master_radius_m"] - radius_m) <= radius_tol_m
-            and abs(geometry["follower_radius_m"] - radius_m) <= radius_tol_m)
+            and abs(geometry["follower_radius_m"] - radius_m) <= radius_tol_m
+            and geometry["pair_distance_m"] >= pair_distance_min_m)
 
 
 __all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
