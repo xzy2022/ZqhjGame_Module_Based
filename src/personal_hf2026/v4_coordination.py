@@ -1,3 +1,6 @@
+# 修改时间：2026-09-28。
+# 修改目的：让主机通过现有目标消息统一决定双机相位同步模式。
+# 修改内容：在 TARGET 末尾传送单字符 N、F 或 M，并保存从机收到的模式。
 # 修改时间：2026-09-27。
 # 修改目的：让 START 仅表示协同状态开始，不再同步理论轨道时钟。
 # 修改内容：移除相位和起始时间字段，并将 START 编码为三段消息。
@@ -65,6 +68,7 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
+        self.sync_mode = "N"
         self.last_master_message_s = -1e9
         self.accepted = False
         self.ready = False
@@ -82,6 +86,7 @@ class V4Coordinator:
         self.partner_uid = None
         self.master_position = None
         self.target = None
+        self.sync_mode = "N"
         self.accepted = False
         self.ready = False
         self.started = False
@@ -151,10 +156,11 @@ class V4Coordinator:
                     events.append("READY")
             elif sender == self.master_uid:
                 self.last_master_message_s = now
-                if kind == "TARGET" and len(parts) == 7:
+                if kind == "TARGET" and len(parts) == 8 and parts[7] in ("N", "F", "M"):
                     try:
                         self.target = _decode_position(parts[3], parts[4])
                         self.master_position = _decode_position(parts[5], parts[6])
+                        self.sync_mode = parts[7]
                         events.append("TARGET")
                     except ValueError:
                         pass
@@ -166,7 +172,7 @@ class V4Coordinator:
         return events
 
     def queue_message(self, kind, now, *, position=None, target=None, state=None,
-                      period_s=0.0):
+                      period_s=0.0, sync_mode="N"):
         if kind not in KINDS:
             raise ValueError(kind)
         if kind not in ("H",) and self.session is None:
@@ -184,7 +190,7 @@ class V4Coordinator:
             if kind == "INVITE" and target is not None and self.partner_uid is not None:
                 parts.extend((self.partner_uid, *_position(target)))
             elif kind == "TARGET" and target is not None and position is not None:
-                parts.extend((*_position(target), *_position(position)))
+                parts.extend((*_position(target), *_position(position), sync_mode))
         payload = "|".join(parts)
         if len(payload.encode("utf-8")) > 50:
             raise ValueError("Agent4 通信载荷超过官方 50 字节上限")
