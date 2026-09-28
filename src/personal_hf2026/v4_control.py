@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：让主机锁定最近合法协作机，等待其空闲且距离安全后再邀请。
+# 修改内容：拆分预约与邀请条件，并记录预约距离、状态、时效和等待原因。
+# 修改时间：2026-09-28。
 # 修改目的：限制三机同时发起的正式协同任务数量。
 # 修改内容：按业务阶段、运行时中间分区和 UID 仲裁 MASTER，补足 CALLING 静止退出与冲突日志。
 # 修改时间：2026-09-28。
@@ -154,6 +157,8 @@ class V4Control:
         self._pair_safety_session = None
         self._master_conflicts_seen = set()
         self._last_heartbeat_state = None
+        self.partner_reservation = None
+        self._last_partner_waiting = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -177,6 +182,8 @@ class V4Control:
         if terminal:
             self.coord.queue_message(terminal, now)
         self.coord.clear_session()
+        self.partner_reservation = None
+        self._last_partner_waiting = None
         self.entity.clear()
         self.motion.reset()
         self.rough.reset()
@@ -312,6 +319,9 @@ class V4Control:
                  if item.bbox_xyxy != entity.bbox_xyxy]
         previous_motion = self.motion.decision
         motion = self.motion.update(snapshot.image_bgr, entity.bbox_xyxy, other, now)
+        if (previous_motion == "MOVING" and motion.get("raw_decision") == "STATIC"):
+            self._event("motion_static_streak", now, entity_id=entity.entity_id,
+                        motion_evidence=motion)
         if self.motion.decision != previous_motion:
             self._event("motion_changed", now, entity_id=entity.entity_id,
                         motion_decision=self.motion.decision, motion_evidence=motion)
@@ -351,6 +361,57 @@ class V4Control:
         if self.state == "COOP_TRACK":
             return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
         return self.state
+
+    def _reserve_partner(self, own, now):
+        allowed = self.route.preferred_partner_uids()
+        previous = self.coord.partner_uid
+        peer = self.coord.peers.get(previous)
+        stale = (peer is None or not 0.0 <= now - peer[1] <= 5.0)
+        illegal = (previous is not None and allowed is not None
+                   and previous not in allowed)
+        if not self.coord.accepted and previous is not None and (stale or illegal):
+            self.coord.partner_uid = None
+            self.coord.queue = type(self.coord.queue)(
+                item for item in self.coord.queue if item[0] != "INVITE")
+            self.coord.last_queued.pop("INVITE", None)
+        if not self.coord.accepted and self.coord.partner_uid is None:
+            self.coord.partner_uid = self.coord.select_partner(own, now, allowed)
+            if self.coord.partner_uid is not None:
+                name = "partner_reselected" if previous is not None else "partner_reserved"
+                selected = self.coord.peers[self.coord.partner_uid]
+                self._event(name, now, master_uid=self.uid,
+                            partner_uid=self.coord.partner_uid,
+                            distance_m=ground_distance_m(own, selected[0]),
+                            partner_state=selected[2],
+                            reason=("stale" if stale else "illegal") if previous else None)
+        peer = self.coord.peers.get(self.coord.partner_uid)
+        distance = ground_distance_m(own, peer[0]) if peer is not None else None
+        age = now - peer[1] if peer is not None else None
+        if self.coord.partner_uid is None:
+            reason = "STALE" if previous is not None and stale else "NO_FRESH_PARTNER"
+        elif self.coord.accepted:
+            reason = "ACCEPTED"
+        elif peer[2] != "SEARCH":
+            reason = "BUSY"
+        elif distance < PAIR_INVITE_MIN_DISTANCE_M:
+            reason = "TOO_CLOSE"
+        else:
+            reason = "READY_TO_INVITE"
+        self.partner_reservation = {
+            "reserved_partner_uid": self.coord.partner_uid,
+            "reserved_partner_distance_m": distance,
+            "reserved_partner_state": peer[2] if peer is not None else None,
+            "reserved_partner_age_s": age,
+            "reserved_partner_waiting_reason": reason,
+        }
+        waiting = (self.coord.partner_uid, reason)
+        if waiting != self._last_partner_waiting:
+            self._event("partner_waiting", now, **self.partner_reservation)
+            self._last_partner_waiting = waiting
+        if reason != "READY_TO_INVITE":
+            self.coord.queue = type(self.coord.queue)(
+                item for item in self.coord.queue if item[0] != "INVITE")
+        return reason == "READY_TO_INVITE"
 
     def _safety_guidance(self, target, own, pose, now, destination, speed, guidance,
                          *, allow_radius_rejoin=True):
@@ -657,19 +718,13 @@ class V4Control:
                     commands.append(point_gimbal(aim.pan_deg, aim.tilt_deg))
             commands.append(set_gimbal_fov(48.0))
         if self.state == "CALLING":
-            peer = self.coord.peers.get(self.coord.partner_uid)
-            if (not self.coord.accepted and self.coord.partner_uid is not None
-                    and (peer is None or now - peer[1] > 5.0
-                         or peer[2] not in ("SEARCH", "FOLLOWER_APPROACH"))):
-                self.coord.partner_uid = None
-            if self.coord.partner_uid is None:
-                self.coord.partner_uid = self.coord.select_partner(
-                    own, now, allowed_uids=self.route.preferred_partner_uids(),
-                    min_distance_m=PAIR_INVITE_MIN_DISTANCE_M)
-            if (not self.coord.accepted and self.coord.partner_uid is not None
-                    and self.rough.position is not None):
+            invite_ready = self._reserve_partner(own, now)
+            if invite_ready and self.rough.position is not None:
+                previous_invite_s = self.coord.last_queued.get("INVITE")
                 self.coord.queue_message("INVITE", now, target=self.rough.position,
                                          period_s=1.0)
+                if self.coord.last_queued.get("INVITE") != previous_invite_s:
+                    self._event("partner_invited", now, **self.partner_reservation)
             if self.coord.accepted and self.rough.position is not None:
                 self.coord.queue_message("TARGET", now, target=self.rough.position,
                                          position=own, period_s=0.5,

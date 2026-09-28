@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：使主机等待最近合法协作机的原因可从控制采样直接复核。
+# 修改内容：在现有紧凑采样中加入预约对象状态、距离、心跳时效及等待原因。
+# 修改时间：2026-09-28。
 # 修改目的：让每拍协同避让和目标可见性能够按安全状态统计。
 # 修改内容：正式协同逐拍记录安全导引、本机云台实测角和视觉实体可见标记。
 # 修改时间：2026-09-27。
@@ -95,6 +98,7 @@ class V4Trace:
             "entity_lost": entity.lost if entity else None,
             "entity_observed_frames": entity.observed_frames if entity else None,
             "motion_decision": control.motion.decision,
+            "partner_reservation": control.partner_reservation,
             "gimbal_pixel_error_x": control.gimbal.last_error[0],
             "gimbal_pixel_error_y": control.gimbal.last_error[1],
             "gimbal_command_pan": control.gimbal.pan,

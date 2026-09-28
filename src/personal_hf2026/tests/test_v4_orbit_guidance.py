@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：验证近距离合法同伴被预约但在达到安全距离前不会收到邀请。
+# 修改内容：将旧的近机排除断言改为预约与邀请分离断言。
+# 修改时间：2026-09-28。
 # 修改目的：验证从机入场避碰和有距离裕度的 READY 条件。
 # 修改内容：覆盖正常、分离、紧急、恢复、预测门槛及不同会话的距离历史。
 # 修改时间：2026-09-28。
@@ -573,13 +576,11 @@ class OrbitGuidanceTest(unittest.TestCase):
         self.assertEqual(follower.coop_guidance["guidance_mode"],
                          "PRE_ENTRY_EMERGENCY")
 
-    def test_invite_excludes_near_search_partner(self):
+    def test_invite_waits_for_near_search_partner(self):
         coordinator = V4Coordinator("20001")
         coordinator.peers["20002"] = (at(90.0), 10.0, "SEARCH")
         coordinator.peers["20003"] = (at(180.0), 10.0, "SEARCH")
         self.assertEqual(coordinator.select_partner(at(0.0), 10.0), "20002")
-        self.assertEqual(coordinator.select_partner(at(0.0), 10.0,
-                                                    min_distance_m=250.0), "20003")
         master = V4Control("20001")
         master.state = "CALLING"
         master.coord.session = "session"
@@ -587,7 +588,10 @@ class OrbitGuidanceTest(unittest.TestCase):
         master.rough.points.append(TARGET)
         master.coord.peers["20002"] = (at(90.0), 10.0, "SEARCH")
         master.step(observation(at(0.0)), 10.0)
-        self.assertIsNone(master.coord.partner_uid)
+        self.assertEqual(master.coord.partner_uid, "20002")
+        self.assertEqual(master.partner_reservation["reserved_partner_waiting_reason"],
+                         "TOO_CLOSE")
+        self.assertNotIn("INVITE", master.coord.last_queued)
 
     def test_normal_far_radius_rejoins_with_tangent_and_inward_direction(self):
         for radius in (210.0, 280.0):
