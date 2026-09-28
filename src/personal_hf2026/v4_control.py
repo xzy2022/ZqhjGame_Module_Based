@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：限制三机同时发起的正式协同任务数量。
+# 修改内容：按业务阶段、运行时中间分区和 UID 仲裁 MASTER，补足 CALLING 静止退出与冲突日志。
+# 修改时间：2026-09-28。
 # 修改目的：固定第三机搜索分区并保护从机入场与 READY 的双机距离。
 # 修改内容：移除接管速度，入场复用心跳避碰，READY 增加当前与预测距离门槛。
 # 修改时间：2026-09-28。
@@ -94,6 +97,30 @@ COOP_READY_PREDICTED_DISTANCE_M = 220.0
 PAIR_INVITE_MIN_DISTANCE_M = 250.0
 SEARCH_CONFIRM_FRAMES = 3
 VERIFY_TIMEOUT_S = 2.0
+MASTER_STATES = ("CALLING", "COOP_TRACK_M")
+
+
+def master_priority(uid, state, home_sector):
+    """阶段先于分区；分区未知时双方均只按 UID 决胜。"""
+    return (1 if state == "COOP_TRACK_M" else 0,
+            1 if home_sector == 1 else 0, -int(uid))
+
+
+def master_verdict(own_uid, own_state, own_sector,
+                   peer_uid, peer_state, peer_sector):
+    if own_state != peer_state:
+        reason = ("peer_already_coop_track" if peer_state == "COOP_TRACK_M"
+                  else "own_already_coop_track")
+    elif own_sector is None or peer_sector is None:
+        reason = "uid_fallback_before_sector_init"
+        own_sector = peer_sector = None
+    elif (own_sector == 1) != (peer_sector == 1):
+        reason = "middle_priority"
+    else:
+        reason = "edge_uid_tiebreak" if own_sector != 1 else "middle_uid_tiebreak"
+    own_rank = master_priority(own_uid, own_state, own_sector)
+    peer_rank = master_priority(peer_uid, peer_state, peer_sector)
+    return (str(own_uid) if own_rank > peer_rank else str(peer_uid)), reason
 
 
 class V4Control:
@@ -125,6 +152,8 @@ class V4Control:
         self._pair_distance_rate_mps = None
         self._safety_mode = "NORMAL"
         self._pair_safety_session = None
+        self._master_conflicts_seen = set()
+        self._last_heartbeat_state = None
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -164,6 +193,49 @@ class V4Control:
         if self.state != "VERIFY":
             self.route.pause()
         self._state("SEARCH", now, reason)
+
+    def _fresh_masters(self, now):
+        return [(uid, state, now - seen) for uid, (_, seen, state) in self.coord.peers.items()
+                if uid != self.uid and state in MASTER_STATES
+                and 0.0 <= now - seen <= 5.0]
+
+    def _master_details(self, own_state, peer_uid, peer_state, peer_age_s, winner_uid, reason):
+        sectors = self.route.sector_by_uid if self.route.initialized else {}
+        return {"own_uid": self.uid, "own_state": own_state,
+                "own_sector": sectors.get(self.uid), "peer_uid": peer_uid,
+                "peer_state": peer_state, "peer_sector": sectors.get(peer_uid),
+                "winner_uid": winner_uid, "reason": reason,
+                "peer_master_age_s": peer_age_s}
+
+    def _master_conflicts(self, now, own_state):
+        sectors = self.route.sector_by_uid if self.route.initialized else {}
+        for peer_uid, peer_state, age in self._fresh_masters(now):
+            winner, reason = master_verdict(
+                self.uid, own_state, sectors.get(self.uid),
+                peer_uid, peer_state, sectors.get(peer_uid))
+            yield peer_uid, peer_state, age, winner, reason
+
+    def _arbitrate_master(self, now):
+        own_state = self._heartbeat_state()
+        if own_state not in MASTER_STATES:
+            self._master_conflicts_seen.clear()
+            return
+        conflicts = list(self._master_conflicts(now, own_state))
+        current = {(uid, state) for uid, state, _, _, _ in conflicts}
+        self._master_conflicts_seen.intersection_update(current)
+        for peer_uid, peer_state, age, winner, reason in conflicts:
+            key = (peer_uid, peer_state)
+            details = self._master_details(own_state, peer_uid, peer_state,
+                                           age, winner, reason)
+            if key not in self._master_conflicts_seen:
+                self._event("master_conflict_detected", now, **details)
+                self._event("master_conflict_won" if winner == self.uid
+                            else "master_conflict_yielded", now, **details)
+                self._master_conflicts_seen.add(key)
+            if winner != self.uid:
+                self._return_search(now, "yield_to_active_master", "CANCEL")
+                self._master_conflicts_seen.clear()
+                return
 
     def _update_search_candidate(self, objects, image_size):
         real = [item for item in objects if item.class_name == "real_vehicle"]
@@ -248,13 +320,29 @@ class V4Control:
                 self._return_search(now, "motion_static")
                 return
             if entity.observed_frames >= 3 and self.motion.decision == "MOVING":
+                blocked = next((conflict for conflict in
+                                self._master_conflicts(now, "CALLING")
+                                if conflict[3] != self.uid), None)
+                if blocked is not None:
+                    peer_uid, peer_state, age, winner, reason = blocked
+                    details = self._master_details("CALLING", peer_uid, peer_state,
+                                                   age, winner, reason)
+                    self._event("master_candidate_blocked", now, **details,
+                                blocking_master_uid=peer_uid,
+                                blocking_master_state=peer_state,
+                                blocking_sector=details["peer_sector"])
+                    self._return_search(now, "foreign_master_active")
+                    return
                 self._state("CALLING", now, "motion_moving")
                 self.coord.set_master(entity.entity_id)
         if self.state in ("CALLING", "COOP_TRACK"):
             self.rough.update(entity.bbox_xyxy, snapshot.image_size, snapshot.source_pose)
-            if self.state == "COOP_TRACK" and self.motion.decision == "STATIC":
-                self.completed_sessions += 1
-                self._return_search(now, "motion_static_completed", "DONE")
+            if self.motion.decision == "STATIC":
+                if self.state == "COOP_TRACK":
+                    self.completed_sessions += 1
+                    self._return_search(now, "motion_static_completed", "DONE")
+                else:
+                    self._return_search(now, "motion_static_while_calling", "CANCEL")
 
     def _own_position(self, obs):
         return float(obs.self.lat), float(obs.self.lon)
@@ -419,6 +507,7 @@ class V4Control:
                 self._state("COOP_TRACK", now, "start_received")
             elif kind in ("DONE", "CANCEL") and self.coord.master_uid != self.uid:
                 self._return_search(now, kind.lower())
+        self._arbitrate_master(now)
         if (self.state in ("FOLLOWER_APPROACH", "COOP_TRACK")
                 and self.coord.master_uid != self.uid
                 and now - self.coord.last_master_message_s > 5.0):
@@ -428,8 +517,11 @@ class V4Control:
                 self._verify_started_s = now
             elif now - self._verify_started_s >= VERIFY_TIMEOUT_S:
                 self._return_search(now, "verify_timeout")
-        self.coord.queue_message("H", now, position=own,
-                                 state=self._heartbeat_state(), period_s=1.0)
+        heartbeat_state = self._heartbeat_state()
+        self.coord.queue_message("H", now, position=own, state=heartbeat_state,
+                                 period_s=(0.0 if heartbeat_state != self._last_heartbeat_state
+                                           else 1.0))
+        self._last_heartbeat_state = heartbeat_state
         commands = []
         if self.state in ("SEARCH", "VERIFY"):
             self.route.observe_search_position(own)
