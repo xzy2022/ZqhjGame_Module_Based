@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：解除 READY 相位死锁并对照实际仿真检验相位控制方向。
+# 修改内容：就位仅检查双机半径，保留反向双边前视角偏置作为待验证候选。
+# 修改时间：2026-09-28。
 # 修改目的：用等速圆周航点前视角修正正式协同的对置相位。
 # 修改内容：增加主机相位模式及双机前视角偏置，保持从机槽位捕获逻辑不变。
 # 修改时间：2026-09-27。
@@ -84,11 +87,11 @@ def phase_sync_mode(phase_error_deg):
 
 def phase_lookahead_bias(sync_mode, role):
     if sync_mode == "F":
-        return (COOP_PHASE_LOOKAHEAD_BIAS_DEG if role == "MASTER"
-                else -COOP_PHASE_LOOKAHEAD_BIAS_DEG)
-    if sync_mode == "M":
         return (-COOP_PHASE_LOOKAHEAD_BIAS_DEG if role == "MASTER"
                 else COOP_PHASE_LOOKAHEAD_BIAS_DEG)
+    if sync_mode == "M":
+        return (COOP_PHASE_LOOKAHEAD_BIAS_DEG if role == "MASTER"
+                else -COOP_PHASE_LOOKAHEAD_BIAS_DEG)
     return 0.0
 
 
@@ -173,14 +176,13 @@ def follower_orbit_guidance(
 
 
 def formation_ready(target, master, own, *, radius_m=130.0,
-                    radius_tol_m=40.0, phase_tol_deg=30.0):
-    """双机都在指定圆环内且实际相位大体对置时就位。"""
+                    radius_tol_m=40.0):
+    """双机均已进入正式协同轨道允许的径向范围。"""
     if master is None or own is None or target is None:
         return False
     geometry = pair_phase_geometry(target, master, own)
     return (abs(geometry["master_radius_m"] - radius_m) <= radius_tol_m
-            and abs(geometry["follower_radius_m"] - radius_m) <= radius_tol_m
-            and abs(geometry["phase_error_deg"]) <= phase_tol_deg)
+            and abs(geometry["follower_radius_m"] - radius_m) <= radius_tol_m)
 
 
 __all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "ground_distance_m",
