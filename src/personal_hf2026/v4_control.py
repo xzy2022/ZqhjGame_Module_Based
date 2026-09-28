@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：让双机入场前后基于新鲜心跳提前分离并持续靠近粗目标。
+# 修改内容：接入距离预测、邀请保护、对称避让、远半径回归和每拍日志。
+# 修改时间：2026-09-28。
 # 修改目的：让双机半径就位即可启动正式协同相位同步。
 # 修改内容：移除 READY 相位门槛，记录首次就位几何及双方前视角实际配置。
 # 修改时间：2026-09-28。
@@ -61,8 +64,10 @@ from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
 from .v4_entity import EntityManager
 from .v4_flight import (CoordinatedSweepRoute, follower_capture_guidance,
-                        follower_orbit_guidance, pair_phase_geometry, phase_lookahead_bias,
-                        phase_sync_mode,
+                        follower_orbit_guidance, pair_phase_geometry,
+                        pair_safety_guidance, pair_safety_mode, phase_sync_mode,
+                        radius_rejoin_guidance,
+                        COOP_TARGET_SOFT_MAX_RADIUS_M, COOP_TARGET_HARD_MAX_RADIUS_M,
                         formation_ready, ground_distance_m, master_orbit_guidance,
                         solve_ground_aim, visual_waypoint)
 from .coordinated_search import THIRD_PAIR_FOLLOW_SPEED_MPS
@@ -75,13 +80,14 @@ from .v3_simple_control import bearing_deg
 STATES = ("SEARCH", "VERIFY", "CALLING", "FOLLOWER_APPROACH", "COOP_TRACK")
 MEMBERS = ("20001", "20002", "20003")
 COOP_ORBIT_RADIUS_M = 130.0
-# 比赛协同几何固定半径，不允许调节。
+# 正常轨道名义半径固定为130米，紧急避让允许暂时偏离。
 COOP_SYNC_SPEED_MPS = 25.0
 COOP_LOOKAHEAD_S = 1.5
 COOP_ORBIT_DIRECTION = 1
 COOP_CAPTURE_SPEED_MPS = 35.0
 COOP_CAPTURE_MAX_PHASE_STEP_DEG = 30.0
 COOP_READY_RADIUS_TOL_M = 40.0
+PAIR_INVITE_MIN_DISTANCE_M = 250.0
 SEARCH_CONFIRM_FRAMES = 3
 VERIFY_TIMEOUT_S = 2.0
 
@@ -111,6 +117,9 @@ class V4Control:
         self.last_own_position = None
         self.coop_guidance = None
         self._ready_logged_session = None
+        self._pair_distance_sample = None
+        self._pair_distance_rate_mps = None
+        self._safety_mode = "NORMAL"
 
     def _event(self, name, now, **details):
         self.events.append({"event": name, "time": float(now), "uid": self.uid,
@@ -141,6 +150,9 @@ class V4Control:
         self.last_visual_box = None
         self.coop_guidance = None
         self._ready_logged_session = None
+        self._pair_distance_sample = None
+        self._pair_distance_rate_mps = None
+        self._safety_mode = "NORMAL"
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         if self.state != "VERIFY":
@@ -246,6 +258,68 @@ class V4Control:
             return "COOP_TRACK_M" if self.coord.master_uid == self.uid else "COOP_TRACK_F"
         return self.state
 
+    def _safety_guidance(self, target, own, pose, now, destination, speed, guidance):
+        """只使用五秒内同伴心跳，不以 TARGET 携带的旧机位触发避让。"""
+        peer_uid = (self.coord.partner_uid if self.coord.master_uid == self.uid
+                    else self.coord.master_uid)
+        peer = self.coord.peers.get(peer_uid)
+        peer_age = now - peer[1] if peer is not None else None
+        radius = ground_distance_m(target, own)
+        guidance.update({"peer_age_s": peer_age, "safety_peer_stale": True,
+                         "safety_mode": "NORMAL", "pair_distance_rate_mps": None,
+                         "pair_distance_m": None,
+                         "predicted_pair_distance_m": None,
+                         "rough_radius_m": radius,
+                         "radius_error_m": COOP_ORBIT_RADIUS_M - radius,
+                         "orbit_tangent": None, "away_from_peer": None,
+                         "radial_weight": max(-1.0, min(1.0,
+                             (COOP_ORBIT_RADIUS_M - radius) / 80.0)),
+                         "desired_direction": None,
+                         "desired_heading_deg": bearing_deg(own, destination),
+                         "heading_error_deg": abs((bearing_deg(own, destination)
+                             - pose["heading_deg"] + 180.0) % 360.0 - 180.0),
+                         "target_soft_max_radius_m": COOP_TARGET_SOFT_MAX_RADIUS_M,
+                         "target_hard_max_radius_m": COOP_TARGET_HARD_MAX_RADIUS_M})
+        if peer is None or peer_age > 5.0 or peer_age < 0.0:
+            self._pair_distance_sample = None
+            self._pair_distance_rate_mps = None
+            self._safety_mode = "NORMAL"
+            return destination, speed, guidance
+        peer_position, seen_time, _ = peer
+        distance = ground_distance_m(own, peer_position)
+        radial_angle = math.radians(bearing_deg(target, own))
+        away_angle = math.radians(bearing_deg(peer_position, own))
+        guidance.update({
+            "orbit_tangent": (COOP_ORBIT_DIRECTION * math.cos(radial_angle),
+                              -COOP_ORBIT_DIRECTION * math.sin(radial_angle)),
+            "away_from_peer": (math.sin(away_angle), math.cos(away_angle)),
+            "desired_direction": (math.sin(math.radians(guidance["desired_heading_deg"])),
+                                  math.cos(math.radians(guidance["desired_heading_deg"]))),
+        })
+        previous = self._pair_distance_sample
+        if previous is None or seen_time > previous[0]:
+            self._pair_distance_rate_mps = (None if previous is None else
+                (distance - previous[1]) / (seen_time - previous[0]))
+            self._pair_distance_sample = (seen_time, distance)
+        mode, predicted = pair_safety_mode(
+            self._safety_mode, distance, self._pair_distance_rate_mps)
+        self._safety_mode = mode
+        guidance.update({"safety_peer_stale": False, "safety_mode": mode,
+                         "pair_distance_m": distance,
+                         "pair_distance_rate_mps": self._pair_distance_rate_mps,
+                         "predicted_pair_distance_m": predicted})
+        if mode == "NORMAL" and radius > COOP_TARGET_SOFT_MAX_RADIUS_M:
+            destination, rejoin = radius_rejoin_guidance(
+                target, own, pose["heading_deg"], radius_m=COOP_ORBIT_RADIUS_M,
+                direction=COOP_ORBIT_DIRECTION)
+            guidance.update(rejoin)
+        elif mode != "NORMAL":
+            destination, speed, safety = pair_safety_guidance(
+                target, own, peer_position, pose["heading_deg"], mode, distance,
+                radius_m=COOP_ORBIT_RADIUS_M, direction=COOP_ORBIT_DIRECTION)
+            guidance.update(safety)
+        return destination, speed, guidance
+
     def _record_coop_guidance(self, role, mode, target, own, destination, speed,
                               *, master=None, follower=None, guidance=None,
                               master_speed=None, follower_speed=None):
@@ -263,7 +337,27 @@ class V4Control:
                                              ground_distance_m(target, own)),
             "follower_radius_m": geometry.get("follower_radius_m"),
             "own_radius_m": ground_distance_m(target, own),
-            "pair_distance_m": geometry.get("pair_distance_m"),
+            "pair_distance_m": (guidance.get("pair_distance_m") if guidance and
+                                "pair_distance_m" in guidance else geometry.get("pair_distance_m")),
+            "safety_mode": guidance.get("safety_mode") if guidance else None,
+            "safety_peer_stale": guidance.get("safety_peer_stale") if guidance else None,
+            "pair_distance_rate_mps": guidance.get("pair_distance_rate_mps") if guidance else None,
+            "predicted_pair_distance_m": (guidance.get("predicted_pair_distance_m")
+                                          if guidance else None),
+            "peer_age_s": guidance.get("peer_age_s") if guidance else None,
+            "rough_radius_m": guidance.get("rough_radius_m") if guidance else None,
+            "radius_error_m": guidance.get("radius_error_m") if guidance else None,
+            "radius_rejoin": guidance.get("radius_rejoin", False) if guidance else False,
+            "orbit_tangent": guidance.get("orbit_tangent") if guidance else None,
+            "away_from_peer": guidance.get("away_from_peer") if guidance else None,
+            "radial_weight": guidance.get("radial_weight") if guidance else None,
+            "desired_direction": guidance.get("desired_direction") if guidance else None,
+            "desired_heading_deg": guidance.get("desired_heading_deg") if guidance else None,
+            "heading_error_deg": guidance.get("heading_error_deg") if guidance else None,
+            "target_soft_max_radius_m": (guidance.get("target_soft_max_radius_m")
+                                          if guidance else None),
+            "target_hard_max_radius_m": (guidance.get("target_hard_max_radius_m")
+                                          if guidance else None),
             "long_slot": guidance.get("long_slot") if guidance else None,
             "capture_phase_step_deg": (guidance.get("capture_phase_step_deg")
                                        if guidance else None),
@@ -295,6 +389,7 @@ class V4Control:
         pose = {key: float(getattr(obs.self, key)) for key in (
             "lat", "lon", "alt", "heading_deg", "gimbal_pan", "gimbal_tilt",
             "gimbal_fov_deg")}
+        self.last_pose = pose
         incoming = self.coord.ingest(obs.comm_inbox, now, self.state)
         for kind in incoming:
             self._event("comm_in", now, message_kind=kind, session=self.coord.session)
@@ -354,7 +449,7 @@ class V4Control:
                 target = self.rough.position
                 if target is not None:
                     peer = self.coord.peers.get(self.coord.partner_uid)
-                    follower = (peer[0] if self.state == "COOP_TRACK" and peer is not None
+                    follower = (peer[0] if peer is not None
                                 and now - peer[1] <= 5.0 else None)
                     master_speed = follower_speed = COOP_SYNC_SPEED_MPS
                     self.coord.sync_mode = "N"
@@ -368,13 +463,19 @@ class V4Control:
                         direction=COOP_ORBIT_DIRECTION, sync_mode=self.coord.sync_mode)
                     guidance["sync_mode"] = self.coord.sync_mode
                     guidance["master_effective_lookahead_deg"] = guidance["effective_lookahead_deg"]
-                    guidance["follower_effective_lookahead_deg"] = (
-                        math.degrees(COOP_SYNC_SPEED_MPS / COOP_ORBIT_RADIUS_M * COOP_LOOKAHEAD_S)
-                        + phase_lookahead_bias(self.coord.sync_mode, "FOLLOWER"))
+                    guidance["follower_effective_lookahead_deg"] = guidance["base_lookahead_deg"]
+                    mode = "ORBIT_WAIT"
+                    if (self.state == "COOP_TRACK" or
+                            (self.state == "CALLING" and self.coord.accepted
+                             and self.coord.partner_uid is not None)):
+                        destination, speed, guidance = self._safety_guidance(
+                            target, own, pose, now, destination, speed, guidance)
+                        mode = (guidance["safety_mode"] if self.state == "COOP_TRACK" else
+                                "PRE_ENTRY_" + guidance["safety_mode"])
                     commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                            loiter_radius=0.0))
                     self._record_coop_guidance(
-                        "MASTER", "ORBIT_SYNC" if self.state == "COOP_TRACK" else "ORBIT_WAIT",
+                        "MASTER", mode,
                         target, own, destination, speed, master=own, follower=follower,
                         guidance=guidance, master_speed=master_speed,
                         follower_speed=follower_speed)
@@ -407,13 +508,13 @@ class V4Control:
                                 sync_mode=self.coord.sync_mode,
                                 lookahead_s=COOP_LOOKAHEAD_S,
                                 direction=COOP_ORBIT_DIRECTION)
-                            guidance["master_effective_lookahead_deg"] = (
-                                guidance["base_lookahead_deg"]
-                                + phase_lookahead_bias(self.coord.sync_mode, "MASTER"))
+                            guidance["master_effective_lookahead_deg"] = guidance["base_lookahead_deg"]
                             guidance["follower_effective_lookahead_deg"] = guidance["effective_lookahead_deg"]
                             master_speed = guidance["master_command_speed_mps"]
                             follower_speed = guidance["follower_command_speed_mps"]
-                            mode = "ORBIT_SYNC"
+                            destination, speed, guidance = self._safety_guidance(
+                                target, own, pose, now, destination, speed, guidance)
+                            mode = guidance["safety_mode"]
                         commands.append(fly_to(*destination, alt=500.0, speed=speed,
                                                loiter_radius=0.0))
                         self._record_coop_guidance(
@@ -442,7 +543,8 @@ class V4Control:
                 self.coord.partner_uid = None
             if self.coord.partner_uid is None:
                 self.coord.partner_uid = self.coord.select_partner(
-                    own, now, allowed_uids=self.route.preferred_partner_uids())
+                    own, now, allowed_uids=self.route.preferred_partner_uids(),
+                    min_distance_m=PAIR_INVITE_MIN_DISTANCE_M)
             if (not self.coord.accepted and self.coord.partner_uid is not None
                     and self.rough.position is not None):
                 self.coord.queue_message("INVITE", now, target=self.rough.position,

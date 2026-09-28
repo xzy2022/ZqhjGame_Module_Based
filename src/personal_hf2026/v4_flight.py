@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：让正式双机绕飞按距离风险临时分离而不再追逐相位。
+# 修改内容：增加距离状态、避让方向、远半径回归方向与按转向角选择速度的纯几何导引。
+# 修改时间：2026-09-28。
 # 修改目的：解除 READY 相位死锁并对照实际仿真检验相位控制方向。
 # 修改内容：就位仅检查双机半径，保留反向双边前视角偏置作为待验证候选。
 # 修改时间：2026-09-28。
@@ -42,6 +45,15 @@ from .v3_simple_control import (SimpleCoopControl, bearing_deg, ground_distance_
 COOP_SYNC_SPEED_MPS = 25.0
 COOP_PHASE_LOOKAHEAD_BIAS_DEG = 10.0
 COOP_PHASE_THRESHOLD_DEG = 20.0
+PAIR_DISTANCE_PREDICT_S = 2.0
+PAIR_SEPARATE_ENTER_M = 240.0
+PAIR_SEPARATE_EXIT_M = 250.0
+PAIR_EMERGENCY_M = 220.0
+PAIR_PREDICT_WARN_M = 220.0
+PAIR_PREDICT_EMERGENCY_M = 205.0
+COOP_TARGET_SOFT_MAX_RADIUS_M = 200.0
+COOP_TARGET_HARD_MAX_RADIUS_M = 260.0
+COOP_SEPARATE_LOOKAHEAD_M = 120.0
 
 
 def visual_waypoint(pose, box, image_size, distance_m=180.0, origin_position=None):
@@ -101,7 +113,7 @@ def master_orbit_guidance(target, own, *, radius_m=130.0, speed_mps=25.0,
     destination, theta, base_lookahead_deg, effective_lookahead_deg = orbit_short_waypoint(
         target, own, speed_mps, radius_m=radius_m,
         lookahead_s=lookahead_s, direction=direction,
-        lookahead_bias_deg=phase_lookahead_bias(sync_mode, "MASTER"))
+        lookahead_bias_deg=0.0)
     debug = {
         "own_phase_deg": theta,
         "radius_m_actual": ground_distance_m(target, own),
@@ -153,12 +165,12 @@ def follower_capture_guidance(target, master, own, *, radius_m=130.0,
 def follower_orbit_guidance(
         target, master, own, *, radius_m=130.0, speed_mps=COOP_SYNC_SPEED_MPS,
         sync_mode="N", lookahead_s=1.5, direction=1):
-    """从机执行主机下发的模式，按自身实际相位生成等速航点。"""
+    """从机按自身实际相位生成等速航点，模式仅供日志使用。"""
     geometry = pair_phase_geometry(target, master, own)
     destination, _, base_lookahead_deg, effective_lookahead_deg = orbit_short_waypoint(
         target, own, speed_mps, radius_m=radius_m,
         lookahead_s=lookahead_s, direction=direction,
-        lookahead_bias_deg=phase_lookahead_bias(sync_mode, "FOLLOWER"))
+        lookahead_bias_deg=0.0)
     debug = {
         **geometry,
         "desired_follower_phase_deg": geometry["desired_phase_deg"],
@@ -173,6 +185,103 @@ def follower_orbit_guidance(
         "effective_lookahead_deg": effective_lookahead_deg,
     }
     return destination, speed_mps, debug
+
+
+def pair_safety_mode(previous, distance_m, distance_rate_mps):
+    """按实测距离和两秒线性预测切换内部安全模式。"""
+    predicted = (distance_m if distance_rate_mps is None else
+                 distance_m + distance_rate_mps * PAIR_DISTANCE_PREDICT_S)
+    if distance_m <= PAIR_EMERGENCY_M or predicted <= PAIR_PREDICT_EMERGENCY_M:
+        return "EMERGENCY", predicted
+    if previous != "NORMAL" and (distance_m < PAIR_SEPARATE_EXIT_M or
+                                  distance_rate_mps is None or distance_rate_mps < 0):
+        return "SEPARATE", predicted
+    if distance_m < PAIR_SEPARATE_ENTER_M or predicted < PAIR_PREDICT_WARN_M:
+        return "SEPARATE", predicted
+    return "NORMAL", predicted
+
+
+def pair_safety_guidance(target, own, peer, heading_deg, mode, distance_m, *,
+                         radius_m=130.0, direction=1):
+    """风险期间同时保留绕飞、远离同伴和回到目标附近的方向。"""
+    radius = ground_distance_m(target, own)
+    radius_error = radius_m - radius
+    radial_weight = max(-1.0, min(1.0, radius_error / 80.0))
+    radial_bearing = math.radians(bearing_deg(target, own))
+    away_bearing = math.radians(bearing_deg(peer, own))
+    radial = (math.sin(radial_bearing), math.cos(radial_bearing))
+    tangent = (direction * radial[1], -direction * radial[0])
+    away = (math.sin(away_bearing), math.cos(away_bearing))
+    if mode == "EMERGENCY":
+        tangent_weight, away_weight, radius_weight = 0.3, 1.5, 0.5
+    else:
+        tangent_weight, away_weight, radius_weight = 1.0, 0.8, 0.6
+        if radius > COOP_TARGET_SOFT_MAX_RADIUS_M:
+            # 非紧急分离时移除继续增大粗目标半径的避让分量。
+            outward = max(0.0, away[0] * radial[0] + away[1] * radial[1])
+            away = (away[0] - outward * radial[0],
+                    away[1] - outward * radial[1])
+        if radius > COOP_TARGET_HARD_MAX_RADIUS_M:
+            tangent_weight, radius_weight = 0.6, 1.2
+    east = (tangent_weight * tangent[0] + away_weight * away[0]
+            + radius_weight * radial_weight * radial[0])
+    north = (tangent_weight * tangent[1] + away_weight * away[1]
+             + radius_weight * radial_weight * radial[1])
+    # 限制合成后反向飞向同伴；紧急模式始终优先远离。
+    true_away = (math.sin(away_bearing), math.cos(away_bearing))
+    away_projection = east * true_away[0] + north * true_away[1]
+    minimum_away = (0.2 if mode == "EMERGENCY" or
+                    radius <= COOP_TARGET_SOFT_MAX_RADIUS_M else 0.05)
+    if away_projection < minimum_away:
+        east += (minimum_away - away_projection) * true_away[0]
+        north += (minimum_away - away_projection) * true_away[1]
+    norm = math.hypot(east, north)
+    east, north = east / norm, north / norm
+    desired_heading = (math.degrees(math.atan2(east, north)) + 360.0) % 360.0
+    heading_error = abs(wrap180(desired_heading - heading_deg))
+    if heading_error > 70.0:
+        speed = 15.0
+    elif heading_error > 45.0:
+        speed = 18.0
+    elif mode == "EMERGENCY":
+        speed = (40.0 if distance_m < 210.0 and heading_error <= 15.0 else
+                 35.0 if heading_error <= 20.0 else 25.0)
+    else:
+        speed = 30.0 if heading_error <= 30.0 else 25.0
+    destination = offset_position(own, COOP_SEPARATE_LOOKAHEAD_M * east,
+                                  COOP_SEPARATE_LOOKAHEAD_M * north)
+    return destination, speed, {
+        "rough_radius_m": radius, "radius_error_m": radius_error,
+        "radial_weight": radial_weight, "orbit_tangent": tangent,
+        "away_from_peer": true_away, "desired_direction": (east, north),
+        "desired_heading_deg": desired_heading, "heading_error_deg": heading_error,
+        "target_soft_max_radius_m": COOP_TARGET_SOFT_MAX_RADIUS_M,
+        "target_hard_max_radius_m": COOP_TARGET_HARD_MAX_RADIUS_M,
+    }
+
+
+def radius_rejoin_guidance(target, own, heading_deg, *, radius_m=130.0,
+                           direction=1):
+    """安全距离已恢复但偏离目标时，以切向加向心方向返回绕飞圈。"""
+    radius = ground_distance_m(target, own)
+    radial_weight = max(-1.0, min(1.0, (radius_m - radius) / 80.0))
+    angle = math.radians(bearing_deg(target, own))
+    radial = (math.sin(angle), math.cos(angle))
+    tangent = (direction * radial[1], -direction * radial[0])
+    tangent_weight = 0.3 if radius > COOP_TARGET_HARD_MAX_RADIUS_M else 1.0
+    east = tangent_weight * tangent[0] + radial_weight * radial[0]
+    north = tangent_weight * tangent[1] + radial_weight * radial[1]
+    length = math.hypot(east, north)
+    east, north = east / length, north / length
+    heading = (math.degrees(math.atan2(east, north)) + 360.0) % 360.0
+    destination = offset_position(own, COOP_SEPARATE_LOOKAHEAD_M * east,
+                                  COOP_SEPARATE_LOOKAHEAD_M * north)
+    return destination, {
+        "radius_rejoin": True, "orbit_tangent": tangent,
+        "radial_weight": radial_weight, "desired_direction": (east, north),
+        "desired_heading_deg": heading,
+        "heading_error_deg": abs(wrap180(heading - heading_deg)),
+    }
 
 
 def formation_ready(target, master, own, *, radius_m=130.0,
@@ -190,4 +299,5 @@ __all__ = ["CoordinatedSweepRoute", "SurveySearchRoute", "SimpleCoopControl", "g
            "orbit_short_waypoint", "master_orbit_guidance", "follower_capture_guidance",
            "pair_phase_geometry", "phase_sync_mode", "phase_lookahead_bias",
            "follower_orbit_guidance",
-           "formation_ready"]
+           "formation_ready", "pair_safety_mode", "pair_safety_guidance",
+           "radius_rejoin_guidance"]

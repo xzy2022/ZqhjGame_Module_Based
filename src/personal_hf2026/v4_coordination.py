@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：防止近距离搜索同伴在径向就位后立即触发危险协同入场。
+# 修改内容：为邀请前同伴选择增加可选的最低机间距过滤，不改变消息协议和 READY 判据。
+# 修改时间：2026-09-28。
 # 修改目的：让主机通过现有目标消息统一决定双机相位同步模式。
 # 修改内容：在 TARGET 末尾传送单字符 N、F 或 M，并保存从机收到的模式。
 # 修改时间：2026-09-27。
@@ -97,13 +100,14 @@ class V4Coordinator:
         self.session = str(entity_id).removeprefix("uav_").replace("_entity_", ".")
         self.master_uid = self.uid
 
-    def select_partner(self, own_position, now, allowed_uids=None):
+    def select_partner(self, own_position, now, allowed_uids=None, min_distance_m=0.0):
+        from .v3_simple_control import ground_distance_m
         candidates = [(position, uid) for uid, (position, seen, state) in self.peers.items()
                       if now - seen <= 5.0 and state == "SEARCH"
-                      and (allowed_uids is None or uid in allowed_uids)]
+                      and (allowed_uids is None or uid in allowed_uids)
+                      and ground_distance_m(own_position, position) >= min_distance_m]
         if not candidates:
             return None
-        from .v3_simple_control import ground_distance_m
         return min(candidates, key=lambda item: ground_distance_m(own_position, item[0]))[1]
 
     def ingest(self, inbox, now, state):

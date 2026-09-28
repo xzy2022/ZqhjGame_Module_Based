@@ -1,3 +1,6 @@
+# 修改时间：2026-09-28。
+# 修改目的：让每拍协同避让和目标可见性能够按安全状态统计。
+# 修改内容：正式协同逐拍记录安全导引、本机云台实测角和视觉实体可见标记。
 # 修改时间：2026-09-27。
 # 修改目的：让双机实际轨道几何和短期航点可从详细日志复核。
 # 修改内容：控制采样新增每拍的协同导航、相位、半径、速度和实际机间距。
@@ -72,7 +75,8 @@ class V4Trace:
             return
         for event in control.pop_events():
             self._write({"kind": "event", **event})
-        if now - self.last_sample.get(str(uid), -1e9) < 0.5:
+        if (control.state != "COOP_TRACK" and
+                now - self.last_sample.get(str(uid), -1e9) < 0.5):
             return
         self.last_sample[str(uid)] = now
         entity = control.entity.current
@@ -81,6 +85,11 @@ class V4Trace:
             "state": control.state, "frame_id": control.last_frame_id,
             "entity_id": entity.entity_id if entity else None,
             "entity_visible": entity.visible if entity else False,
+            "visual_target_available": bool(entity and entity.visible),
+            "gimbal_actual_pan": (control.last_pose.get("gimbal_pan")
+                                  if hasattr(control, "last_pose") else None),
+            "gimbal_actual_tilt": (control.last_pose.get("gimbal_tilt")
+                                   if hasattr(control, "last_pose") else None),
             "entity_bbox": entity.bbox_xyxy if entity else None,
             "entity_missing_s": entity.missing_s if entity else None,
             "entity_lost": entity.lost if entity else None,
