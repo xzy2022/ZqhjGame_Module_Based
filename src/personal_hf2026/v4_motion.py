@@ -1,3 +1,6 @@
+# 修改时间：2026-09-28。
+# 修改目的：避免已确认运动的目标被短暂静止误判提前结束。
+# 修改内容：仅将 MOVING 到 STATIC 改为四次连续原始静止判定并记录连续次数。
 # 修改时间：2026-09-24。
 # 修改目的：将局部背景光流判定绑定到本机唯一 Entity 并保留短暂缺帧证据。
 # 修改内容：复用 KLT 与仿射判定数学，移除按轨迹编号存储的窗口。
@@ -14,6 +17,8 @@ from .local_motion_flow import LocalMotionDetector, LocalMotionParameters, _anch
 
 
 class SingleEntityMotion:
+    MOVING_TO_STATIC_CONFIRMATIONS = 4
+
     def __init__(self, parameters=None):
         self.parameters = parameters or LocalMotionParameters()
         self.reset()
@@ -25,8 +30,23 @@ class SingleEntityMotion:
         self._prev_time = None
         self._transitions = deque(maxlen=self.parameters.window_transitions)
         self._last_raw = "UNKNOWN"
+        self._static_raw_streak = 0
         self.decision = "UNKNOWN"
         self.evidence = {"decision": self.decision, "reason": "reset"}
+
+    def _confirm_raw(self, raw):
+        if raw == "STATIC":
+            self._static_raw_streak += 1
+        else:
+            self._static_raw_streak = 0
+        confirmed = raw if raw != "UNKNOWN" and raw == self._last_raw else "UNKNOWN"
+        if (self.decision == "MOVING" and raw == "STATIC"
+                and self._static_raw_streak < self.MOVING_TO_STATIC_CONFIRMATIONS):
+            confirmed = "UNKNOWN"
+        self._last_raw = raw
+        if confirmed != "UNKNOWN":
+            self.decision = confirmed
+        return confirmed
 
     def _flow(self, gray, all_boxes):
         previous_mask = LocalMotionDetector._background_mask(
@@ -105,12 +125,12 @@ class SingleEntityMotion:
         moving_limit = max(0.18 * height, 6.0, 4.0 * sigma)
         raw = ("STATIC" if error < static_limit else
                "MOVING" if error > moving_limit else "UNKNOWN")
-        confirmed = raw if raw != "UNKNOWN" and raw == self._last_raw else "UNKNOWN"
-        self._last_raw = raw
-        if confirmed != "UNKNOWN":
-            self.decision = confirmed
+        confirmed = self._confirm_raw(raw)
         evidence.update({"decision": self.decision, "raw_decision": raw,
-                         "confirmed_decision": confirmed, "endpoint_error_px": error,
+                         "confirmed_decision": confirmed,
+                         "static_raw_streak": self._static_raw_streak,
+                         "moving_to_static_confirmations": self.MOVING_TO_STATIC_CONFIRMATIONS,
+                         "endpoint_error_px": error,
                          "bbox_height_px": height, "T_static": static_limit,
                          "T_moving": moving_limit, "reason": "confirmed" if confirmed != "UNKNOWN"
                          else "awaiting_confirmation"})

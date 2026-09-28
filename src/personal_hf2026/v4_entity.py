@@ -1,3 +1,6 @@
+# 修改时间：2026-09-28。
+# 修改目的：截断已建立实体在相邻识别框之间的大步串接。
+# 修改内容：仅将实体中心匹配最低距离门设为可调的180像素。
 # 修改时间：2026-09-24。
 # 修改目的：避免云台快速转动时速度外推放大框中心跳变并误判实体丢失。
 # 修改内容：以最近有效框中心匹配并把单帧距离门放宽到 220 像素。
@@ -12,6 +15,7 @@ import math
 
 
 ENTITY_LOST_S = 5.0
+ENTITY_MATCH_MIN_GATE_PX = 180.0
 
 
 def _center(box):
@@ -60,7 +64,7 @@ class EntityManager:
         prediction = _center(entity.last_box)
         diagonal = math.hypot(entity.last_box[2] - entity.last_box[0],
                               entity.last_box[3] - entity.last_box[1])
-        gate = max(220.0, 1.5 * diagonal)
+        gate = max(ENTITY_MATCH_MIN_GATE_PX, 1.5 * diagonal)
         nearest = min(real, key=lambda obj: math.dist(_center(obj.bbox_xyxy), prediction),
                       default=None)
         if nearest is not None and math.dist(_center(nearest.bbox_xyxy), prediction) <= gate:

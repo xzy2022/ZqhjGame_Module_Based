@@ -1,4 +1,7 @@
 # 修改时间：2026-09-28。
+# 修改目的：使主机预约最近的合法飞机并等待其释放。
+# 修改内容：同伴选择只按合法身份、新鲜心跳和物理距离排序。
+# 修改时间：2026-09-28。
 # 修改目的：防止近距离搜索同伴在径向就位后立即触发危险协同入场。
 # 修改内容：为邀请前同伴选择增加可选的最低机间距过滤，不改变消息协议和 READY 判据。
 # 修改时间：2026-09-28。
@@ -100,12 +103,11 @@ class V4Coordinator:
         self.session = str(entity_id).removeprefix("uav_").replace("_entity_", ".")
         self.master_uid = self.uid
 
-    def select_partner(self, own_position, now, allowed_uids=None, min_distance_m=0.0):
+    def select_partner(self, own_position, now, allowed_uids=None):
         from .v3_simple_control import ground_distance_m
-        candidates = [(position, uid) for uid, (position, seen, state) in self.peers.items()
-                      if now - seen <= 5.0 and state == "SEARCH"
-                      and (allowed_uids is None or uid in allowed_uids)
-                      and ground_distance_m(own_position, position) >= min_distance_m]
+        candidates = [(position, uid) for uid, (position, seen, _) in self.peers.items()
+                      if 0.0 <= now - seen <= 5.0
+                      and (allowed_uids is None or uid in allowed_uids)]
         if not candidates:
             return None
         return min(candidates, key=lambda item: ground_distance_m(own_position, item[0]))[1]
