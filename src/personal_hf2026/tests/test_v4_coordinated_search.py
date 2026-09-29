@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：验证空闲第三机只在原分区同步双机长轴位置和速度。
+# 修改内容：覆盖速度变化、重复心跳、边界翻转、固定分区与协同退出后的恢复。
 # 修改时间：2026-09-28。
 # 修改目的：验证双机协同时第三机始终保持原分区和普通搜索速度。
 # 修改内容：删除接管测试，覆盖三种空闲机组合、车道推进与搜索恢复。
@@ -12,6 +15,7 @@
 # 修改内容：新增局部坐标、对齐、双机中点倒退与搜索恢复的聚焦测试。
 """三机协同 Z 字搜索的主流程测试。"""
 
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -118,29 +122,85 @@ class CoordinatedSweepRouteTest(unittest.TestCase):
         route._advance_frontier()
         self.assertAlmostEqual(route.frontier_v, route.long_length_m - 700.0)
 
-    def test_idle_uav_stays_in_home_sector_and_advances(self):
+    def test_idle_uav_follows_pair_without_sector_expansion_or_lane_advance(self):
         for idle_uid in ("20001", "20002", "20003"):
-            route, own, _ = self.start_sweep(idle_uid)
+            route, _, _ = self.start_sweep(idle_uid)
             pair_uids = [uid for uid in ("20001", "20002", "20003")
                          if uid != idle_uid]
-            states = {pair_uids[0]: "CALLING", pair_uids[1]: "FOLLOWER_APPROACH"}
-            pair_positions = {uid: self.positions[uid] for uid in pair_uids}
-            frontier = route.frontier_v
-            target = route.target(own, 11.0, peers(pair_positions, states, 11.0))
-            self.assertEqual(route.mode, "SWEEP")
-            sector = route.home_sector
-            self.assertEqual(route.trace_state["active_sector"], [sector, sector])
-            self.assertAlmostEqual(route._uv(target)[1], frontier)
-            route.target(target, 11.1, peers(pair_positions, states, 11.1))
-            self.assertAlmostEqual(route.frontier_v,
-                                   frontier + route.lane_spacing_m)
-            self.assertEqual(route.trace_state["active_sector"], [sector, sector])
-            route.target(route.last_target, 11.2, peers(
-                pair_positions, {pair_uids[0]: "COOP_TRACK_M",
-                                 pair_uids[1]: "COOP_TRACK_F"}, 11.2))
-            self.assertEqual(route.mode, "SWEEP")
-            self.assertEqual(route.trace_state["active_sector"], [sector, sector])
+            for master_uid, follower_uid in (pair_uids, pair_uids[::-1]):
+                state = {master_uid: "CALLING", follower_uid: "FOLLOWER_APPROACH"}
+                pair_positions = {
+                    master_uid: point(route._uv(self.positions[master_uid])[0], 1200.0),
+                    follower_uid: point(route._uv(self.positions[follower_uid])[0], 1200.0),
+                }
+                own = point(route._uv(self.positions[idle_uid])[0], 1200.0)
+                route.target(own, 11.0, peers(pair_positions, state, 11.0))
+                pair_positions[master_uid] = point(route._uv(pair_positions[master_uid])[0], 1206.0)
+                pair_positions[follower_uid] = point(route._uv(pair_positions[follower_uid])[0], 1210.0)
+                pair_mid_v = 1208.0
+                route.target(point(route._uv(own)[0], pair_mid_v), 12.0,
+                             peers(pair_positions, state, 12.0))
+                trace = route.trace_state
+                self.assertEqual(route.mode, "PAIR_PROGRESS_SYNC")
+                self.assertEqual(trace["active_sector"], [route.home_sector] * 2)
+                self.assertAlmostEqual(trace["pair_mid_v_m"], pair_mid_v)
+                self.assertAlmostEqual(trace["pair_long_speed_mps"], 8.0)
+                self.assertAlmostEqual(trace["command_long_speed_mps"], 8.0)
+                self.assertAlmostEqual(trace["search_total_speed_mps"], 22.0)
+                end_u = route._active_bounds()[1 if route.cross_direction > 0 else 0]
+                old_turns = route.turn_count
+                route.target(point(end_u, pair_mid_v), 12.1,
+                             peers(pair_positions, state, 12.0))
+                self.assertEqual(route.turn_count, old_turns + 1)
+                self.assertAlmostEqual(route.frontier_v, pair_mid_v)
+                self.assertEqual(route.trace_state["active_sector"], [route.home_sector] * 2)
 
+    def test_pair_progress_speed_error_and_heartbeat_timing(self):
+        route, _, _ = self.start_sweep()
+        state = {"20001": "COOP_TRACK_M", "20002": "COOP_TRACK_F"}
+        pair_positions = {"20001": point(500.0, 1200.0),
+                          "20002": point(1400.0, 1200.0)}
+        route.target(point(2500.0, 1200.0), 11.0,
+                     peers(pair_positions, state, 11.0))
+        pair_positions = {"20001": point(500.0, 1206.0),
+                          "20002": point(1400.0, 1210.0)}
+        heartbeat = peers(pair_positions, state, 12.0)
+        route.target(point(2500.0, 1148.0), 12.0, heartbeat)
+        trace = route.trace_state
+        self.assertAlmostEqual(trace["long_error_m"], 60.0)
+        self.assertAlmostEqual(trace["align_long_speed_mps"], 10.0)
+        self.assertAlmostEqual(trace["command_long_speed_mps"], 18.0)
+        self.assertAlmostEqual(trace["command_short_speed_mps"] ** 2 +
+                               trace["command_long_speed_mps"] ** 2, 22.0 ** 2)
+        route.target(point(2500.0, 1268.0), 12.1, heartbeat)
+        self.assertAlmostEqual(route.trace_state["align_long_speed_mps"], -10.0)
+        self.assertAlmostEqual(route.trace_state["command_long_speed_mps"], -2.0)
+        repeated = peers({"20001": point(500.0, 1400.0),
+                          "20002": point(1400.0, 1400.0)}, state, 12.0)
+        route.target(point(2500.0, 1400.0), 12.2, repeated)
+        self.assertAlmostEqual(route.trace_state["pair_long_speed_mps"], 8.0)
+        self.assertAlmostEqual(route._peer_long_samples["20001"][1], 1206.0)
+
+    def test_pair_speed_changes_and_restore_from_current_position(self):
+        route, _, _ = self.start_sweep()
+        state = {"20001": "COOP_TRACK_M", "20002": "COOP_TRACK_F"}
+        u = {"20001": 500.0, "20002": 1400.0}
+        v = 1200.0
+        for now, delta in ((11.0, 0.0), (12.0, 4.0),
+                           (13.0, 8.0), (14.0, -3.0)):
+            v += delta
+            positions = {uid: point(u[uid], v) for uid in u}
+            route.target(point(2500.0, v), now, peers(positions, state, now))
+            if now > 11.0:
+                self.assertAlmostEqual(route.trace_state["pair_long_speed_mps"], delta)
+                self.assertAlmostEqual(route.trace_state["command_long_speed_mps"], delta)
+        route.target(point(2500.0, 2300.0), 15.0,
+                     peers(positions, now=15.0))
+        self.assertEqual(route.mode, "SWEEP")
+        self.assertAlmostEqual(route.frontier_v, 2300.0)
+        self.assertFalse(route.trace_state["pair_progress_sync"])
+        route.target(route.last_target, 15.1, peers(positions, now=15.1))
+        self.assertAlmostEqual(route.frontier_v, 3000.0)
     def test_search_speed_and_resume_from_current_position(self):
         route, own, _ = self.start_sweep()
         control = V4Control("20003")
@@ -154,6 +214,11 @@ class CoordinatedSweepRouteTest(unittest.TestCase):
         commands = control.step(SimpleNamespace(self=self_obs, comm_inbox=[]), 11.0)
         flight = next(item for item in commands if item.verb == "set_destination")
         self.assertIn(flight.params["speed"], (15.0, 22.0))
+        trace = route.trace_state
+        self.assertTrue(trace["pair_progress_sync"])
+        self.assertAlmostEqual(math.hypot(trace["command_long_speed_mps"],
+                                      trace["command_short_speed_mps"]),
+                               flight.params["speed"])
         route.pause()
         resumed = point(2350.0, 2300.0)
         route.target(resumed, 12.0, control.coord.peers)

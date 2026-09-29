@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：让协同期间的空闲机只在原分区内跟随双机长轴进度。
+# 修改内容：恢复新心跳速度估计与中点速度分解，并禁止同步期间自主推进车道。
 # 修改时间：2026-09-28。
 # 修改目的：三机始终只在各自初始分区独立搜索。
 # 修改内容：删除第三机接管、双机中点跟随及长短轴速度分解。
@@ -14,6 +17,10 @@ from __future__ import annotations
 import math
 
 from .survey_search import SearchCoverageGrid
+
+THIRD_PAIR_ALIGN_TIME_S = 6.0
+THIRD_LONG_ONLY_LOOKAHEAD_S = 4.0
+SEARCH_TOTAL_SPEED_MPS = 22.0
 
 class CoordinatedSweepRoute:
     def __init__(self, bounds, uid, members, lane_spacing_m=700.0,
@@ -47,6 +54,9 @@ class CoordinatedSweepRoute:
         self.advance_direction = 1
         self._align_direction = 1
         self._resume_pending = False
+        self._peer_long_samples = {}
+        self._peer_long_velocity = {}
+        self._pair_progress_trace = {}
         self.last_target = None
         self.turn_count = 0
         self._events = []
@@ -115,7 +125,40 @@ class CoordinatedSweepRoute:
         return (self.sector_bounds[self.active_sector_low][0],
                 self.sector_bounds[self.active_sector_high][1])
 
+    def _pair(self, now, peers):
+        masters = []
+        followers = []
+        for uid in self.members:
+            if uid == self.uid or uid not in peers:
+                continue
+            position, seen, state = peers[uid]
+            if now - seen > 5.0:
+                continue
+            if state in ("CALLING", "COOP_TRACK_M"):
+                masters.append((uid, position))
+            elif state in ("FOLLOWER_APPROACH", "COOP_TRACK_F"):
+                followers.append((uid, position))
+        if len(masters) != 1 or len(followers) != 1:
+            return None
+        return (*masters[0], *followers[0])
+
+    def _update_peer_long_velocity(self, now, peers):
+        for uid in self.members:
+            if uid == self.uid or uid not in peers:
+                continue
+            position, seen, _ = peers[uid]
+            if now - seen > 5.0:
+                continue
+            previous = self._peer_long_samples.get(uid)
+            if previous is not None and seen <= previous[0]:
+                continue
+            v = self._uv(position)[1]
+            if previous is not None:
+                self._peer_long_velocity[uid] = (v - previous[1]) / (seen - previous[0])
+            self._peer_long_samples[uid] = (seen, v)
+
     def _restore_sweep(self, own_v):
+        self._pair_progress_trace = {}
         self.frontier_v = own_v
         self._set_mode("SWEEP")
 
@@ -131,6 +174,7 @@ class CoordinatedSweepRoute:
             self.frontier_v = next_v
 
     def target(self, position, now, peers):
+        self._update_peer_long_velocity(now, peers)
         positions = self._fresh_positions(position, now, peers)
         newly_initialized = False
         if not self.initialized:
@@ -164,15 +208,82 @@ class CoordinatedSweepRoute:
                 self.last_target = self._position(end_u, self.align_v)
                 return self.last_target
 
+        pair = None if resumed else self._pair(now, peers)
+        if pair is not None:
+            master_uid, master_position, follower_uid, follower_position = pair
+            master_u, master_v = self._uv(master_position)
+            follower_u, follower_v = self._uv(follower_position)
+            pair_mid_v = (master_v + follower_v) / 2.0
+            self.frontier_v = pair_mid_v
+            self._set_mode("PAIR_PROGRESS_SYNC")
+            speeds = (self._peer_long_velocity.get(master_uid),
+                      self._peer_long_velocity.get(follower_uid))
+            available = [speed for speed in speeds if speed is not None]
+            pair_speed = sum(available) / len(available) if available else 0.0
+            long_error = pair_mid_v - own_v
+            align_speed = long_error / THIRD_PAIR_ALIGN_TIME_S
+            desired_long_speed = pair_speed + align_speed
+            long_speed = max(-SEARCH_TOTAL_SPEED_MPS,
+                             min(SEARCH_TOTAL_SPEED_MPS, desired_long_speed))
+            short_abs = math.sqrt(max(0.0, SEARCH_TOTAL_SPEED_MPS ** 2
+                                      - long_speed ** 2))
+        elif self.mode == "PAIR_PROGRESS_SYNC":
+            self._restore_sweep(own_v)
+
         low, high = self._active_bounds()
         end_u = high if self.cross_direction > 0 else low
-        if math.hypot(own_u - end_u, own_v - self.frontier_v) <= self.arrival_radius_m:
+        at_edge = (abs(own_u - end_u) <= self.arrival_radius_m
+                   if pair is not None else
+                   math.hypot(own_u - end_u, own_v - self.frontier_v)
+                   <= self.arrival_radius_m)
+        if at_edge and (pair is None or short_abs > 1.0):
             self.cross_direction *= -1
             self.turn_count += 1
-            self._advance_frontier()
+            if pair is None:
+                self._advance_frontier()
             end_u = high if self.cross_direction > 0 else low
-        self.last_target = self._position(end_u, self.frontier_v)
+        if pair is not None:
+            short_speed = short_abs if self.cross_direction > 0 else -short_abs
+            if short_abs <= 1.0:
+                target_u = own_u
+                target_v = own_v + long_speed * THIRD_LONG_ONLY_LOOKAHEAD_S
+            else:
+                target_u = end_u
+                target_v = own_v + long_speed * abs(end_u - own_u) / short_abs
+            self.last_target = self._position(
+                target_u, max(0.0, min(self.long_length_m, target_v)))
+            self._pair_progress_trace = {
+                "pair_progress_sync": True,
+                "master_uid": master_uid,
+                "follower_uid": follower_uid,
+                "pair_midpoint": self._position(
+                    (master_u + follower_u) / 2.0, pair_mid_v),
+                "pair_mid_v_m": pair_mid_v,
+                "master_long_speed_mps": speeds[0],
+                "follower_long_speed_mps": speeds[1],
+                "pair_long_speed_mps": pair_speed,
+                "own_long_v_m": own_v,
+                "long_error_m": long_error,
+                "align_long_speed_mps": align_speed,
+                "planned_long_speed_mps": long_speed,
+                "planned_short_speed_mps": short_speed,
+                "command_long_speed_mps": long_speed,
+                "command_short_speed_mps": short_speed,
+                "search_total_speed_mps": SEARCH_TOTAL_SPEED_MPS,
+            }
+        else:
+            self.last_target = self._position(end_u, self.frontier_v)
         return self.last_target
+
+    def set_search_command_speed(self, speed):
+        if self.mode != "PAIR_PROGRESS_SYNC":
+            return
+        ratio = speed / SEARCH_TOTAL_SPEED_MPS
+        self._pair_progress_trace["command_long_speed_mps"] = (
+            self._pair_progress_trace["planned_long_speed_mps"] * ratio)
+        self._pair_progress_trace["command_short_speed_mps"] = (
+            self._pair_progress_trace["planned_short_speed_mps"] * ratio)
+        self._pair_progress_trace["search_total_speed_mps"] = speed
 
     def observe_search_position(self, position):
         self.last_search_position = position
@@ -203,6 +314,8 @@ class CoordinatedSweepRoute:
             "cross_direction": self.cross_direction,
             "advance_direction": self.advance_direction,
             "target": self.last_target,
+            "pair_progress_sync": self.mode == "PAIR_PROGRESS_SYNC",
+            **self._pair_progress_trace,
         }
 
     @property
