@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：允许 V4 复用共享视觉队列时单独定义可接收的实测视野。
+# 修改内容：把原有 V3 固定48度提交门封装成可覆盖的小方法，默认行为不变。
 # 修改时间：2026-09-23。
 # 修改目的：让本机连续像素帧的动静判定结果随同一张感知快照进入控制层。
 # 修改内容：在共享视觉 worker 内按无人机维护局部光流判定器，仅传递各轨迹证据而不保存原图。
@@ -330,6 +333,10 @@ class V3PerceptionWorker:
                     "worker_error": self._worker_error,
                     "pending_uavs": len(self._pending)}
 
+    def _accept_fov(self, fov_deg: float) -> bool:
+        """V3 默认只处理48度相机帧。"""
+        return abs(float(fov_deg) - FOV_DEG) <= FOV_TOLERANCE_DEG
+
     def submit(
         self,
         uid: str,
@@ -355,7 +362,7 @@ class V3PerceptionWorker:
             with self._condition:
                 self._stats["rejected_time"] += 1
             return None
-        if abs(float(fov_deg) - FOV_DEG) > FOV_TOLERANCE_DEG:
+        if not self._accept_fov(fov_deg):
             with self._condition:
                 self._stats["rejected_non_fov48"] += 1
             return None

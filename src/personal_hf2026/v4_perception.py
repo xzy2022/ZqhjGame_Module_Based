@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：让 V4 VERIFY 的30度及变焦过渡图片真正进入共享 YOLO 推理队列。
+# 修改内容：仅对 V4 放行比赛允许的5至50度实测视野，保留 V3 原有48度限制。
 # 修改时间：2026-09-24。
 # 修改目的：让 Agent4 只从本机像素取得单帧 YOLO 结果并隔离开发诊断真值。
 # 修改内容：复用最新帧调度和实时模型后端，保存诊断前后对象及合法提交姿态。
@@ -139,6 +142,11 @@ class V4PerceptionWorker(V3PerceptionWorker):
     def __init__(self, *, device="0", config=None, weights=None, diagnostic=None):
         self.diagnostic = diagnostic or VisionDiagnosticV4()
         super().__init__(detector_kwargs={"device": device, "config": config, "weights": weights})
+
+    def _accept_fov(self, fov_deg: float) -> bool:
+        """V4 同时消费宽视野、窄视野及两者之间的有效过渡帧。"""
+        fov = float(fov_deg)
+        return math.isfinite(fov) and 5.0 <= fov <= 50.0
 
     def _create_detector(self):
         from .vehicle_prop_v2.realtime_backend import RealtimeDetector

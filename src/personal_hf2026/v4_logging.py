@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：让详细日志能够复核 VERIFY 变焦和 SEARCH 宽视野恢复全过程。
+# 修改内容：控制采样增加内部阶段、实际 FOV、连续帧计数及邻近对象分类和距离。
 # 修改时间：2026-09-28。
 # 修改目的：使主机等待最近合法协作机的原因可从控制采样直接复核。
 # 修改内容：在现有紧凑采样中加入预约对象状态、距离、心跳时效及等待原因。
@@ -93,6 +96,17 @@ class V4Trace:
                                   if hasattr(control, "last_pose") else None),
             "gimbal_actual_tilt": (control.last_pose.get("gimbal_tilt")
                                    if hasattr(control, "last_pose") else None),
+            "actual_gimbal_fov_deg": (control.last_pose.get("gimbal_fov_deg")
+                                      if hasattr(control, "last_pose") else None),
+            "verify_phase": control._verify_phase,
+            "verify_zoom_safe": control._verify_zoom_safe,
+            "verify_zoom_safe_streak": control._verify_zoom_safe_frames,
+            "verify_fov30_ready_streak": control._verify_fov30_ready_frames,
+            "verify_confirm30_frames": control._verify_confirm30_frames,
+            "verify_nearest_object_class": control._verify_nearest_object_class,
+            "verify_nearest_object_distance_px": control._verify_nearest_object_distance_px,
+            "search_wait_wide_fov": control._search_wait_wide_fov,
+            "search_wide_ready_streak": control._search_wide_ready_frames,
             "entity_bbox": entity.bbox_xyxy if entity else None,
             "entity_missing_s": entity.missing_s if entity else None,
             "entity_lost": entity.lost if entity else None,

@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：让已有 MASTER 仲裁测试从完成 FOV30 确认后的合法 VERIFY 条件出发。
+# 修改内容：测试快照补齐当前实体、类别和源 FOV，并设置新视觉资格计数。
 # 修改时间：2026-09-28。
 # 修改目的：验证三机仅保留一个有效 MASTER 的关键状态转移。
 # 修改内容：覆盖运行时分区优先级、候选预检查、双 CALLING 仲裁和静止取消。
@@ -39,9 +42,14 @@ def heartbeat(uid, state, now):
 
 def visual_motion(item, decision, now=10.0):
     item.state = "VERIFY" if item.state == "SEARCH" else item.state
+    item._verify_phase = "CONFIRM_30"
+    item._verify_confirm30_frames = 2
     entity = SimpleNamespace(entity_id=f"uav_{item.uid}_entity_1",
                              bbox_xyxy=(100, 100, 130, 130), visible=True,
-                             missing_s=0.0, observed_frames=5)
+                             missing_s=0.0, observed_frames=5,
+                             last_box=(100, 100, 130, 130),
+                             class_name="real_vehicle")
+    item.entity.current = entity
     item.entity.update = lambda *args: (entity, None)
     item.gimbal.update = lambda *args: None
     item.rough.update = lambda *args: None
@@ -54,7 +62,7 @@ def visual_motion(item, decision, now=10.0):
     snapshot = SimpleNamespace(source_sim_time=now, frame_id=f"frame-{now}",
                                error=None, effective_yolo_objects=[entity],
                                raw_yolo_objects=[], image_size=(640, 480),
-                               source_pose={}, image_bgr=None)
+                               source_pose={"gimbal_fov_deg": 30.0}, image_bgr=None)
     item.consume_visual(snapshot)
 
 
