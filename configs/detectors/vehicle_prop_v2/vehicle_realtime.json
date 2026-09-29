@@ -7,7 +7,7 @@
       1536
     ],
     "half": true,
-    "confidence": 0.05,
+    "confidence": 0.85,
     "iou": 0.5,
     "expected_sha256": "a30c839d72a6d996eac62b0ab15a147ee03d3c28c0a3853bb25b16c04445cfc2"
   },

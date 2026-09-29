@@ -1,3 +1,6 @@
+# 修改时间：2026-09-29。
+# 修改目的：让第三机同步日志反映当前实际下达的搜索速度。
+# 修改内容：在保持原有转弯降速规则时同步记录长短轴指令分量。
 # 修改时间：2026-09-28。
 # 修改目的：让主机锁定最近合法协作机，等待其空闲且距离安全后再邀请。
 # 修改内容：拆分预约与邀请条件，并记录预约距离、状态、时效和等待原因。
@@ -599,6 +602,7 @@ class V4Control:
                 heading = bearing_deg(own, target)
                 delta = abs((heading - pose["heading_deg"] + 180.0) % 360.0 - 180.0)
                 speed = 15.0 if delta > 45.0 else 22.0
+                self.route.set_search_command_speed(speed)
                 commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
             if self.state == "SEARCH":
                 pan, tilt = self.search_gimbal.scan(
