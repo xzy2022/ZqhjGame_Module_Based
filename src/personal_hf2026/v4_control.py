@@ -1,4 +1,7 @@
 # 修改时间：2026-09-29。
+# 修改目的：在 VERIFY 中安全放大候选并保留放大后的诱饵分类证据。
+# 修改内容：增加宽视野居中、按实测 FOV 确认变焦、邻近对象拒绝及 SEARCH 宽视野恢复。
+# 修改时间：2026-09-29。
 # 修改目的：让第三机同步日志反映当前实际下达的搜索速度。
 # 修改内容：在保持原有转弯降速规则时同步记录长短轴指令分量。
 # 修改时间：2026-09-28。
@@ -74,7 +77,7 @@ from competition.sdk.core.commands import fly_to, point_gimbal, report_target, s
 
 from .search_gimbal import SearchGimbalController
 from .v4_coordination import V4Coordinator
-from .v4_entity import EntityManager
+from .v4_entity import ENTITY_MATCH_MIN_GATE_PX, EntityManager
 from .v4_flight import (CoordinatedSweepRoute, follower_capture_guidance,
                         follower_orbit_guidance, pair_phase_geometry,
                         pair_safety_guidance, pair_safety_mode, phase_sync_mode,
@@ -102,7 +105,17 @@ COOP_READY_PAIR_DISTANCE_M = 230.0
 COOP_READY_PREDICTED_DISTANCE_M = 220.0
 PAIR_INVITE_MIN_DISTANCE_M = 250.0
 SEARCH_CONFIRM_FRAMES = 3
-VERIFY_TIMEOUT_S = 2.0
+VERIFY_TIMEOUT_S = 6.0
+VERIFY_CENTER_TIMEOUT_S = 1.5
+VERIFY_FOV_SEARCH_DEG = 48.0
+VERIFY_FOV_CLOSE_DEG = 30.0
+VERIFY_ZOOM_READY_FOV_DEG = 32.0
+SEARCH_WIDE_READY_FOV_DEG = 46.0
+FOV_READY_CONFIRM_FRAMES = 2
+ZOOM_SAFE_CONFIRM_FRAMES = 2
+VERIFY_MODEL_PROP_CONFIRM_FRAMES = 2
+VERIFY_CONFIRM30_FRAMES = 3
+VERIFY_ZOOM_SAFE_MARGIN = 0.90
 MASTER_STATES = ("CALLING", "COOP_TRACK_M")
 
 
@@ -129,6 +142,43 @@ def master_verdict(own_uid, own_state, own_sector,
     return (str(own_uid) if own_rank > peer_rank else str(peer_uid)), reason
 
 
+def _verify_zoom_safe(box, image_size):
+    """按针孔视野比例判断当前框在30度视野内是否完整可见。"""
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return False
+    x1, y1, x2, y2 = box
+    ratio = (math.tan(math.radians(VERIFY_FOV_CLOSE_DEG / 2.0)) /
+             math.tan(math.radians(VERIFY_FOV_SEARCH_DEG / 2.0)))
+    cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+    return (abs(cx - width * 0.5) + (x2 - x1) * 0.5
+            <= width * 0.5 * ratio * VERIFY_ZOOM_SAFE_MARGIN and
+            abs(cy - height * 0.5) + (y2 - y1) * 0.5
+            <= height * 0.5 * ratio * VERIFY_ZOOM_SAFE_MARGIN)
+
+
+def _nearest_verify_object(objects, entity):
+    """只在已有实体的中心距离门内关联正式消费的 YOLO 对象。"""
+    box = entity.last_box
+    center = ((box[0] + box[2]) * 0.5, (box[1] + box[3]) * 0.5)
+    gate = max(ENTITY_MATCH_MIN_GATE_PX,
+               1.5 * math.hypot(box[2] - box[0], box[3] - box[1]))
+    choices = []
+    for item in objects:
+        if item.class_name not in ("real_vehicle", "model_prop", "uncertain"):
+            continue
+        candidate = item.bbox_xyxy
+        if len(candidate) != 4 or not all(math.isfinite(value) for value in candidate):
+            continue
+        if candidate[0] >= candidate[2] or candidate[1] >= candidate[3]:
+            continue
+        distance = math.dist(center, ((candidate[0] + candidate[2]) * 0.5,
+                                      (candidate[1] + candidate[3]) * 0.5))
+        if distance <= gate:
+            choices.append((distance, item))
+    return min(choices, key=lambda pair: pair[0]) if choices else (None, None)
+
+
 class V4Control:
     def __init__(self, uid):
         self.uid = str(uid)
@@ -151,6 +201,17 @@ class V4Control:
         self._search_candidate_box = None
         self._search_candidate_frames = 0
         self._verify_started_s = None
+        self._verify_phase = None
+        self._verify_phase_started_s = None
+        self._verify_zoom_safe = False
+        self._verify_zoom_safe_frames = 0
+        self._verify_fov30_ready_frames = 0
+        self._verify_confirm30_frames = 0
+        self._verify_model_prop_frames = 0
+        self._verify_nearest_object_class = None
+        self._verify_nearest_object_distance_px = None
+        self._search_wait_wide_fov = False
+        self._search_wide_ready_frames = 0
         self.last_own_position = None
         self.coop_guidance = None
         self._ready_logged_session = None
@@ -176,10 +237,83 @@ class V4Control:
             old = self.state
             self.state = state
             self._verify_started_s = None
+            self._verify_phase = None
+            self._verify_phase_started_s = None
+            self._verify_zoom_safe = False
+            self._verify_zoom_safe_frames = 0
+            self._verify_fov30_ready_frames = 0
+            self._verify_confirm30_frames = 0
+            self._verify_model_prop_frames = 0
+            self._verify_nearest_object_class = None
+            self._verify_nearest_object_distance_px = None
             if old == "SEARCH":
                 self._search_candidate_box = None
                 self._search_candidate_frames = 0
+                self._search_wait_wide_fov = False
+                self._search_wide_ready_frames = 0
+            if state == "VERIFY":
+                self._verify_started_s = now
+                self._verify_phase = "CENTER_48"
+                self._verify_phase_started_s = now
+                self._event("verify_center_started", now, actual_gimbal_fov_deg=(
+                    self.last_visual_pose.get("gimbal_fov_deg") if self.last_visual_pose else None),
+                    entity_bbox=(self.entity.current.last_box if self.entity.current else None))
+            elif state == "SEARCH":
+                self._search_wait_wide_fov = True
+                self._search_wide_ready_frames = 0
+                self._event("search_widen_started", now, previous=old)
             self._event("state_changed", now, previous=old, reason=reason)
+
+    def _advance_verify_phase(self, snapshot, nearest, now):
+        """仅按当前有效视觉帧及源姿态推进内部变焦阶段。"""
+        source_fov = snapshot.source_pose.get("gimbal_fov_deg")
+        valid = nearest is not None
+        self._verify_zoom_safe = False
+        if self._verify_phase == "CENTER_48":
+            box = (self.entity.current.bbox_xyxy if self.entity.current and
+                   self.entity.current.visible and nearest is not None and
+                   nearest.class_name == "real_vehicle" else None)
+            self._verify_zoom_safe = bool(box and _verify_zoom_safe(box, snapshot.image_size))
+            self._verify_zoom_safe_frames = (self._verify_zoom_safe_frames + 1
+                                             if self._verify_zoom_safe else 0)
+            if self._verify_zoom_safe_frames >= ZOOM_SAFE_CONFIRM_FRAMES:
+                self._event("verify_zoom_safe", now, entity_bbox=box,
+                            image_size=snapshot.image_size,
+                            zoom_safe_streak=self._verify_zoom_safe_frames,
+                            actual_gimbal_fov_deg=source_fov)
+                self._verify_phase = "ZOOMING_30"
+                self._verify_phase_started_s = now
+                self._verify_fov30_ready_frames = 0
+                self._event("verify_zoom_requested", now, actual_gimbal_fov_deg=source_fov)
+        elif self._verify_phase == "ZOOMING_30":
+            ready = (valid and source_fov is not None and
+                     float(source_fov) <= VERIFY_ZOOM_READY_FOV_DEG)
+            self._verify_fov30_ready_frames = (self._verify_fov30_ready_frames + 1
+                                               if ready else 0)
+            if self._verify_fov30_ready_frames >= FOV_READY_CONFIRM_FRAMES:
+                self._event("verify_zoom_ready", now, actual_gimbal_fov_deg=source_fov,
+                            ready_streak=self._verify_fov30_ready_frames)
+                self._verify_phase = "CONFIRM_30"
+                self._verify_phase_started_s = now
+                self._verify_confirm30_frames = 0
+                self._verify_model_prop_frames = 0
+                self._event("verify_confirm30_started", now,
+                            actual_gimbal_fov_deg=source_fov)
+        elif self._verify_phase == "CONFIRM_30":
+            valid30 = (valid and source_fov is not None and
+                       float(source_fov) <= VERIFY_ZOOM_READY_FOV_DEG)
+            self._verify_confirm30_frames = (self._verify_confirm30_frames + 1
+                                             if valid30 and nearest.class_name == "real_vehicle"
+                                             and self.entity.current.visible else 0)
+            self._verify_model_prop_frames = (self._verify_model_prop_frames + 1
+                                              if valid30 and nearest.class_name == "model_prop" else 0)
+            if self._verify_model_prop_frames >= VERIFY_MODEL_PROP_CONFIRM_FRAMES:
+                self._event("verify_model_prop_rejected", now,
+                            entity_bbox=self.entity.current.last_box,
+                            nearest_bbox=nearest.bbox_xyxy,
+                            nearest_distance_px=self._verify_nearest_object_distance_px,
+                            actual_gimbal_fov_deg=source_fov)
+                self._return_search(now, "verify_model_prop")
 
     def _return_search(self, now, reason, terminal=None):
         if terminal:
@@ -287,11 +421,19 @@ class V4Control:
             if self.state == "SEARCH":
                 self._search_candidate_box = None
                 self._search_candidate_frames = 0
+            elif self.state == "VERIFY":
+                self._verify_zoom_safe = False
+                self._verify_zoom_safe_frames = 0
+                self._verify_fov30_ready_frames = 0
+                self._verify_confirm30_frames = 0
+                self._verify_model_prop_frames = 0
             return
         if self.state == "FOLLOWER_APPROACH" or (
                 self.state == "COOP_TRACK" and self.coord.master_uid != self.uid):
             return
         if self.state == "SEARCH":
+            if self._search_wait_wide_fov:
+                return
             candidate = self._update_search_candidate(snapshot.effective_yolo_objects,
                                                       snapshot.image_size)
             if candidate is None:
@@ -299,7 +441,27 @@ class V4Control:
             entity, event = self.entity.update((candidate,), snapshot.image_size, now)
             self.motion.reset()
             self.rough.reset()
+            self.last_visual_pose = dict(snapshot.source_pose)
             self._state("VERIFY", now, "real_vehicle_three_frames")
+            self._event("verify_candidate", now, frame_id=snapshot.frame_id,
+                        entity_bbox=entity.bbox_xyxy, image_size=snapshot.image_size,
+                        actual_gimbal_fov_deg=snapshot.source_pose.get("gimbal_fov_deg"))
+        elif self.state == "VERIFY":
+            current = self.entity.current
+            distance, nearest = (_nearest_verify_object(snapshot.effective_yolo_objects, current)
+                                 if current else (None, None))
+            self._verify_nearest_object_class = nearest.class_name if nearest else None
+            self._verify_nearest_object_distance_px = distance
+            entity, event = self.entity.update(
+                (nearest,) if nearest and nearest.class_name == "real_vehicle" else (),
+                snapshot.image_size, now)
+            if entity is not None:
+                self._advance_verify_phase(snapshot, nearest, now)
+                if self.state != "VERIFY":
+                    return
+            if nearest is not None and (entity is None or not entity.visible):
+                self.gimbal.update(nearest.bbox_xyxy, snapshot.image_size,
+                                   snapshot.source_pose, now)
         else:
             entity, event = self.entity.update(snapshot.effective_yolo_objects,
                                                snapshot.image_size, now)
@@ -332,7 +494,14 @@ class V4Control:
             if self.motion.decision == "STATIC":
                 self._return_search(now, "motion_static")
                 return
-            if entity.observed_frames >= 3 and self.motion.decision == "MOVING":
+            if (self._verify_phase == "CONFIRM_30" and
+                    self._verify_confirm30_frames >= VERIFY_CONFIRM30_FRAMES and
+                    entity.observed_frames >= 3 and self.motion.decision == "MOVING"):
+                self._event("verify_confirm30_ready", now,
+                            frame_id=snapshot.frame_id,
+                            entity_bbox=entity.bbox_xyxy,
+                            confirm30_frames=self._verify_confirm30_frames,
+                            actual_gimbal_fov_deg=snapshot.source_pose.get("gimbal_fov_deg"))
                 blocked = next((conflict for conflict in
                                 self._master_conflicts(now, "CALLING")
                                 if conflict[3] != self.uid), None)
@@ -579,8 +748,20 @@ class V4Control:
         if self.state == "VERIFY":
             if self._verify_started_s is None:
                 self._verify_started_s = now
+            if (self._verify_phase == "CENTER_48" and
+                    now - self._verify_phase_started_s >= VERIFY_CENTER_TIMEOUT_S):
+                self._return_search(now, "verify_center_timeout")
             elif now - self._verify_started_s >= VERIFY_TIMEOUT_S:
                 self._return_search(now, "verify_timeout")
+        if self.state == "SEARCH" and self._search_wait_wide_fov:
+            self._search_wide_ready_frames = (self._search_wide_ready_frames + 1
+                                              if pose["gimbal_fov_deg"] >= SEARCH_WIDE_READY_FOV_DEG
+                                              else 0)
+            if self._search_wide_ready_frames >= FOV_READY_CONFIRM_FRAMES:
+                self._search_wait_wide_fov = False
+                self._event("search_widen_ready", now,
+                            actual_gimbal_fov_deg=pose["gimbal_fov_deg"],
+                            ready_streak=self._search_wide_ready_frames)
         heartbeat_state = self._heartbeat_state()
         self.coord.queue_message("H", now, position=own, state=heartbeat_state,
                                  period_s=(0.0 if heartbeat_state != self._last_heartbeat_state
@@ -604,14 +785,17 @@ class V4Control:
                 speed = 15.0 if delta > 45.0 else 22.0
                 self.route.set_search_command_speed(speed)
                 commands.append(fly_to(*target, alt=500.0, speed=speed, loiter_radius=0.0))
-            if self.state == "SEARCH":
+            if self.state == "SEARCH" and not self._search_wait_wide_fov:
                 pan, tilt = self.search_gimbal.scan(
                     now, heading, pose["heading_deg"], pose["gimbal_pan"], pose["gimbal_tilt"])
                 commands.append(point_gimbal(pan, tilt))
-            elif self.gimbal.command_pending:
+            elif self.state == "VERIFY" and self.gimbal.command_pending:
                 commands.append(point_gimbal(self.gimbal.pan, self.gimbal.tilt))
                 self.gimbal.command_pending = False
-            commands.append(set_gimbal_fov(48.0))
+            commands.append(set_gimbal_fov(
+                VERIFY_FOV_CLOSE_DEG if self.state == "VERIFY" and
+                self._verify_phase in ("ZOOMING_30", "CONFIRM_30")
+                else VERIFY_FOV_SEARCH_DEG))
         else:
             self.route.pause()
             if self.state == "CALLING" or (
